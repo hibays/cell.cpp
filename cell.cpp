@@ -8941,6 +8941,55 @@ details{break-inside:avoid}
             return chars;
         }
 
+        // Chat Completions servers apply their own chat template to the messages
+        // we send, and the strict ones (llama.cpp's Jinja templates) accept
+        // EXACTLY one system message, at the very front: a second one — even
+        // right after the first — fails with "System message must be at the
+        // beginning". Session state that arrives after the conversation started
+        // (notices, skill bodies, interrupt notes, compaction summaries) can
+        // therefore not stay a separate message at all: every system message is
+        // merged into the single leading one, in transcript order.
+        // Anthropic/Responses clients never cared (they lift system messages out
+        // of the array anyway), so folding only ever helps.
+        static bool fold_system_messages(nlohmann::json &msgs)
+        {
+            if (!msgs.is_array() || msgs.empty())
+                return false;
+            std::vector<size_t> sys; // indexes of every system message
+            for (size_t i = 0; i < msgs.size(); i++)
+                if (msgs[i].is_object() && msgs[i].value("role", "") == "system")
+                    sys.push_back(i);
+            if (sys.empty() || (sys.size() == 1 && sys.front() == 0))
+                return false; // already the canonical shape
+            std::string merged;
+            for (size_t idx : sys)
+            {
+                std::string text;
+                if (auto c = msgs[idx].find("content"); c != msgs[idx].end())
+                {
+                    if (c->is_string())
+                        text = c->get<std::string>();
+                    else if (c->is_array())
+                        for (auto &b : *c)
+                            if (b.is_object() && b.value("type", "") == "text" && b.contains("text") && b["text"].is_string())
+                                text += b["text"].get<std::string>();
+                }
+                if (text.empty())
+                    continue;
+                if (!merged.empty())
+                    merged += "\n\n";
+                merged += text;
+            }
+            nlohmann::json out = nlohmann::json::array();
+            if (!merged.empty())
+                out.push_back(nlohmann::json{{"role", "system"}, {"content", merged}});
+            for (size_t i = 0; i < msgs.size(); i++)
+                if (!msgs[i].is_object() || msgs[i].value("role", "") != "system")
+                    out.push_back(msgs[i]);
+            msgs = std::move(out);
+            return true;
+        }
+
         // the system message that records WHY a turn stopped; it belongs to the
         // transcript (not just the console) so /reload replays it verbatim
         static std::string interrupt_notice(const std::string &reason)
@@ -8964,6 +9013,7 @@ details{break-inside:avoid}
                 sess.msg().push_back(std::move(reply));
             }
             sess.msg().push_back({{"role", "system"}, {"content", interrupt_notice(reason)}});
+            fold_system_messages(sess.msg()); // the notice must not land behind the conversation
             sess.set_interrupt(reason);
             cell::sys::logger::instance().warn("llm", std::format("interrupted id={} reason={} partial_chars={}",
                                                                   sess.id(), reason, kept));
@@ -9761,6 +9811,9 @@ details{break-inside:avoid}
         constexpr size_t kDefaultMaxChildren = 5;
         static constexpr size_t kMaxChildrenHardLimit = 100;
         static constexpr size_t kMaxRoundsPerWorker = 8;
+        static constexpr size_t kMaxReviewsPerWorker = 8;       // a child that keeps drawing the same rejection must not loop forever
+        static constexpr size_t kReviewSnippetChars = 4 * 1024; // how much of before/after the reviewer sees
+        static constexpr size_t kReviewReasonChars = 300;       // how much of the review comes back to the child
         static constexpr size_t kReuseMaxMessages = 200;      // history cap when replaying a reused worker
         static constexpr size_t kReportBulkCharLimit = 4 * 1024; // per-report cap in bulk listings
 
@@ -9817,6 +9870,8 @@ details{break-inside:avoid}
             std::string provider;
             std::string model;
             bool reused = false;
+            size_t reviews_approved = 0; // granted-file modifications the supervisor allowed
+            size_t reviews_denied = 0;   // ... and refused
             long long input_tokens = 0;
             long long output_tokens = 0;
             long long total_tokens = 0;
@@ -9854,11 +9909,12 @@ details{break-inside:avoid}
             return provider;
         }
 
-        // Tool schemas are stored separately for each wire format. This removes
-        // recursion (`tw`) and, for parallel jobs, every mutating tool.
+        // Tool schemas are stored separately for each wire format. Recursion is
+        // removed (`tw`) and parallel children lose `exec` (shell commands stay
+        // with serial jobs) — file writes are NOT filtered out here: they are
+        // governed per path by the file lease when the tool call runs.
         static nlohmann::json child_tools(const nlohmann::json &source, bool parallel)
         {
-            static const std::unordered_set<std::string> read_only = {"ls", "read", "rg", "find"};
             nlohmann::json out = nlohmann::json::array();
             for (auto &def : source)
             {
@@ -9871,9 +9927,7 @@ details{break-inside:avoid}
                     name = def.value("name", "");
                 if (name.empty() || name == "tw")
                     continue;
-                // parallel children are read-only, except for the notice tool:
-                // reporting progress must stay available in every mode
-                if (parallel && !read_only.contains(name) && name != "notice")
+                if (parallel && name == "exec")
                     continue;
                 out.push_back(def);
             }
@@ -10210,9 +10264,53 @@ details{break-inside:avoid}
                 err = "background must be none or prolegomena";
                 return false;
             }
+            // ---- file lease: files this child may modify, and the constraint
+            // every draw on them is judged against. Granting edit access without
+            // the constraint would leave the reviewer nothing to judge with, so
+            // the pair is validated together at creation time.
+            std::vector<std::string> editable;
+            for (const char *key : {"editable", "writes"})
+            {
+                auto paths = item.find(key);
+                if (paths == item.end() || paths->is_null())
+                    continue;
+                if (!paths->is_array())
+                {
+                    err = std::format("{} must be an array of file paths", key);
+                    return false;
+                }
+                for (auto &p : *paths)
+                {
+                    if (!p.is_string() || p.get<std::string>().empty())
+                    {
+                        err = std::format("{} entries must be non-empty file paths", key);
+                        return false;
+                    }
+                    const std::string raw = p.get<std::string>();
+                    if (!box::check_path(raw))
+                    {
+                        err = std::format("{} path '{}' is blocked by the sandbox", key, raw);
+                        return false;
+                    }
+                    editable.push_back(normalize_path(raw));
+                }
+                break;
+            }
+            std::string edit_rules = cell::text::trim(first_str(jstr(item, "edit_rules"), jstr(item, "rules")));
+            if (!editable.empty() && edit_rules.empty())
+            {
+                err = "children that may edit existing files require edit_rules: the constraint the "
+                      "main agent's review judges every modification against";
+                return false;
+            }
             out = nlohmann::json::object();
             out["name"] = safe_worker_name(first_str(jstr(item, "name"), default_name), 0);
             out["works"] = works;
+            if (!editable.empty())
+            {
+                out["editable"] = editable;
+                out["edit_rules"] = edit_rules;
+            }
             if (!background.empty())
                 out["background"] = background;
             if (item.contains("provider"))
@@ -10282,6 +10380,22 @@ details{break-inside:avoid}
                 err = "work-type must be serial or parallel";
                 return false;
             }
+            // job-level file-lease defaults: every child inherits them unless it
+            // declares its own list (the pair is validated in normalize_worker_item)
+            nlohmann::json grant_defaults = nlohmann::json::object();
+            for (const char *key : {"editable", "writes"})
+            {
+                auto paths = input.find(key);
+                if (paths == input.end() || !paths->is_array() || paths->empty())
+                    continue;
+                grant_defaults["editable"] = *paths;
+                break;
+            }
+            {
+                std::string rules = cell::text::trim(first_str(jstr(input, "edit_rules"), jstr(input, "rules")));
+                if (!rules.empty())
+                    grant_defaults["edit_rules"] = rules;
+            }
             // ---- optional workflow: named stages, each with its own agents ----
             nlohmann::json workflow_out = nlohmann::json::object();
             bool has_workflow = false;
@@ -10331,6 +10445,9 @@ details{break-inside:avoid}
                             stage_defaults[key] = jstr(st, key);
                     if (st.contains("think") && !st["think"].is_null())
                         stage_defaults["think"] = st["think"];
+                    for (auto &[k, v] : grant_defaults.items())
+                        if (!stage_defaults.contains(k))
+                            stage_defaults[k] = v;
                     size_t agent_index = 0;
                     for (auto &item : *agents)
                     {
@@ -10436,6 +10553,9 @@ details{break-inside:avoid}
                             stage_defaults[key] = jstr(st, key);
                     if (st.contains("think") && !st["think"].is_null())
                         stage_defaults["think"] = st["think"];
+                    for (auto &[k, v] : grant_defaults.items())
+                        if (!stage_defaults.contains(k))
+                            stage_defaults[k] = v;
                     for (auto &item : st["agents"])
                     {
                         nlohmann::json merged = item.is_object() ? item : nlohmann::json::object();
@@ -10463,7 +10583,12 @@ details{break-inside:avoid}
             for (auto &item : *list_it)
             {
                 nlohmann::json worker;
-                if (!normalize_worker_item(item, std::format("worker_{}", index), worker, err))
+                nlohmann::json entry = item;
+                if (entry.is_object())
+                    for (auto &[k, v] : grant_defaults.items())
+                        if (!entry.contains(k))
+                            entry[k] = v;
+                if (!normalize_worker_item(entry, std::format("worker_{}", index), worker, err))
                 {
                     err = std::format("list[{}]: {}", index, err);
                     return false;
@@ -10704,6 +10829,9 @@ details{break-inside:avoid}
             return true;
         }
 
+        // forward: defined with the file-lease machinery further down
+        static void release_job_leases(const std::string &job_id);
+
         static bool remove_job(const std::string &job_id, bool agent_initiated, std::string &out)
         {
             job_ref ref;
@@ -10725,6 +10853,7 @@ details{break-inside:avoid}
                 out = std::format("completed teamwork {} cannot be deleted by an agent", job_id);
                 return false;
             }
+            release_job_leases(job_id);
             if (status == "running")
             {
                 out = std::format("teamwork {} is running and cannot be deleted", job_id);
@@ -10774,12 +10903,30 @@ details{break-inside:avoid}
             if (auto it = worker.find("reuse"); it != worker.end() && it->is_string())
                 out += std::format(" reuse={}{}", it->get<std::string>(),
                                    jbool(worker, "reuse_context", true) ? "" : " (config only)");
+            if (auto it = worker.find("editable"); it != worker.end() && it->is_array())
+            {
+                std::string paths;
+                for (auto &p : *it)
+                {
+                    paths += p.is_string() ? p.get<std::string>() : "?";
+                    paths += ", ";
+                }
+                if (paths.size() >= 2)
+                    paths.resize(paths.size() - 2);
+                out += std::format("\n      writes=[{}] rules={}", paths,
+                                   jstr(worker, "edit_rules", "(missing)"));
+            }
             if (job.contains("summary_reports") && job["summary_reports"].is_object())
             {
                 auto report = job["summary_reports"].find(name);
                 if (report != job["summary_reports"].end() && report->is_object())
+                {
                     out += std::format(" report={} rounds={} tools={}", jstr(*report, "status", "failed"),
                                        jint(*report, "rounds", 0), jint(*report, "tool_calls", 0));
+                    if (jint(*report, "reviews_approved", 0) > 0 || jint(*report, "reviews_denied", 0) > 0)
+                        out += std::format(" reviews={}+/{}", jint(*report, "reviews_approved", 0),
+                                           jint(*report, "reviews_denied", 0));
+                }
             }
             return out;
         }
@@ -11423,9 +11570,283 @@ details{break-inside:avoid}
             return cell::box::truncate_output(context, 32 * 1024);
         }
 
-        static bool is_parallel_tool(const std::string &name)
+        // =====================================================================
+        //  file lease — what a child may write, and who owns what
+        //  Every child may create new files: a created file is its own property
+        //  and further edits need no approval. A file the MAIN agent put on the
+        //  child's 'editable' list stays the main agent's: each and every
+        //  modification is reviewed against that child's 'edit_rules' before it
+        //  runs. Ownership is also a lock: two children never write one file.
+        // =====================================================================
+        enum class write_verdict : unsigned char
         {
-            return name == "ls" || name == "read" || name == "rg" || name == "find";
+            Allow = 0,  // run it now
+            Review = 1, // ask the supervisor first
+            Deny = 2,   // refuse
+        };
+
+        struct write_probe
+        {
+            bool exists = false;   // the target file exists on disk
+            bool creating = false; // `write` onto a missing file (a creation)
+            int lease = 0;         // 0 none · 1 own (created by this child) · 2 own (granted) · 3 held by another child
+            bool declared = false; // the path is on this child's editable list
+        };
+
+        // pure classification — no locks, no IO, so the selftest can cover it
+        static write_verdict classify_write(const write_probe &p)
+        {
+            if (p.lease == 3)
+                return write_verdict::Deny; // owned by another child
+            if (p.creating)
+                return write_verdict::Allow; // a new file: it becomes this child's own
+            if (p.lease == 1)
+                return write_verdict::Allow; // this child created it
+            if (!p.exists)
+                return write_verdict::Deny; // modifying a file that is not there
+            if (p.lease == 2 || p.declared)
+                return write_verdict::Review; // the main agent's file
+            return write_verdict::Deny;
+        }
+
+        struct file_lease
+        {
+            std::string owner;    // child name
+            bool granted = false; // true: granted by the main agent (reviewed every time)
+            bool pending = false; // a review is in flight for this path
+        };
+
+        static std::mutex &lease_mutex()
+        {
+            static std::mutex mx;
+            return mx;
+        }
+        static std::unordered_map<std::string, file_lease> &leases()
+        {
+            static std::unordered_map<std::string, file_lease> m;
+            return m;
+        }
+        static std::string lease_key(const std::string &job_id, const std::string &path)
+        {
+            return job_id + "\x1f" + path;
+        }
+        // drop every lease of one job: children are gone, nothing owns anything
+        static void release_job_leases(const std::string &job_id)
+        {
+            std::lock_guard<std::mutex> lk(lease_mutex());
+            std::string prefix = job_id + "\x1f";
+            std::erase_if(leases(), [&prefix](const std::pair<const std::string, file_lease> &kv)
+                          { return kv.first.starts_with(prefix); });
+        }
+
+        // what the supervisor is asked about one proposed modification
+        struct edit_review_request
+        {
+            std::string job_id, worker, task;
+            std::string path;
+            std::string tool;    // write | edit
+            std::string rules;   // the constraint the main agent wrote for this child
+            std::string action;  // parameter summary of the requested change
+            std::string before;  // current content of the target (truncated)
+            std::string after;   // the content that would be written (truncated)
+        };
+        struct edit_review_result
+        {
+            bool allow = false;
+            std::string reason;
+        };
+        using edit_review_fn = std::function<edit_review_result(const edit_review_request &)>;
+
+        struct write_permit
+        {
+            bool run = false;    // the tool may execute
+            bool reviewed = false; // true when a supervisor review decided it
+            std::string reason;
+        };
+
+        // Decide whether one write/edit may run. `review` is injected (never held
+        // implicitly) so the selftest can walk the whole permit path with no LLM;
+        // a null reviewer simply means no grant can ever be approved. The lease
+        // lock is never held while the review runs — children are reviewed
+        // concurrently, in their own threads.
+        static write_permit request_write_permit(const std::string &job_id, const std::string &worker,
+                                                 const edit_review_request &req, bool creating, bool exists,
+                                                 bool declared, const edit_review_fn &review)
+        {
+            const std::string key = lease_key(job_id, req.path);
+            std::string owner;
+            bool preexisting = false; // this worker already held a lease on the path
+            {
+                std::lock_guard<std::mutex> lk(lease_mutex());
+                auto it = leases().find(key);
+                int lease = 0;
+                if (it != leases().end())
+                {
+                    lease = it->second.owner == worker ? (it->second.granted ? 2 : 1) : 3;
+                    if (lease == 3)
+                        owner = it->second.owner;
+                    else
+                        preexisting = true;
+                }
+                write_probe probe{exists, creating, lease, declared};
+                switch (classify_write(probe))
+                {
+                case write_verdict::Allow:
+                    // a new file becomes this child's property
+                    if (it == leases().end())
+                        leases()[key] = file_lease{worker, false, false};
+                    return write_permit{true, false, ""};
+                case write_verdict::Review:
+                    // claim the path so a second child racing for the same grant
+                    // is told "leased to" instead of being reviewed in parallel
+                    leases()[key] = file_lease{worker, true, true};
+                    break;
+                case write_verdict::Deny:
+                    const bool writing = req.tool == "write";
+                    if (lease == 3)
+                        return write_permit{false, false,
+                                            std::format("'{}' is leased to child agent '{}' of this job — write your own file instead",
+                                                        req.path, owner)};
+                    if (!exists)
+                        // reached only by edit: `write` onto a missing file is a
+                        // creation and is already allowed above
+                        return write_permit{false, false,
+                                            std::format("'{}' does not exist — create it with write (new files need no permission) "
+                                                        "before you can edit it",
+                                                        req.path)};
+                    if (writing)
+                        return write_permit{false, false,
+                                            std::format("'{}' already exists: write creates NEW files only — use edit to modify an existing file",
+                                                        req.path)};
+                    return write_permit{false, false,
+                                        std::format("'{}' is not writable: it is neither a file you created nor one the main agent "
+                                                    "put on your editable list — write your result into a new file of your own",
+                                                    req.path)};
+                }
+            }
+            // from here on no lock is held: every waiting child is reviewed in
+            // its own thread, so concurrent children are reviewed concurrently
+            if (!review)
+            {
+                std::lock_guard<std::mutex> lk(lease_mutex());
+                if (auto it = leases().find(key); it != leases().end() && it->second.pending && !preexisting)
+                    leases().erase(it);
+                return write_permit{false, false, "no supervisor reviewer is available for this job"};
+            }
+            const edit_review_result verdict = review(req);
+            {
+                std::lock_guard<std::mutex> lk(lease_mutex());
+                auto it = leases().find(key);
+                if (it == leases().end() || it->second.owner != worker)
+                    return write_permit{false, false,
+                                        std::format("'{}' changed hands while it was being reviewed", req.path)};
+                if (!verdict.allow)
+                {
+                    // unclaimed again: a refused child must not block the others
+                    if (!preexisting)
+                        leases().erase(it);
+                    else
+                        it->second.pending = false;
+                    std::string why = cell::text::trim(verdict.reason);
+                    return write_permit{false, true,
+                                        std::format("the supervisor rejected this change{}",
+                                                    why.empty() ? "." : std::format(": {}", why))};
+                }
+                it->second.pending = false;
+            }
+            return write_permit{true, true, verdict.reason};
+        }
+
+        // The supervisor review — one focused request judging a single proposed
+        // modification against the constraint the main agent wrote when it
+        // created the job. It runs on the main session's provider/model (the
+        // supervision belongs to the main agent) and falls back to the child's
+        // own if that is not configured. Fail-closed: every failure denies.
+        static edit_review_result review_edit(const runtime_context &rt,
+                                              const config::provider_entry &child_provider,
+                                              const std::string &child_model,
+                                              const encrypt::secure_string &child_key,
+                                              const edit_review_request &req)
+        {
+            edit_review_result denied;
+            denied.allow = false;
+            config::provider_entry provider = child_provider;
+            std::string model = child_model;
+            encrypt::secure_string key = child_key;
+            if (rt.settings)
+                if (const config::provider_entry *cur = rt.settings->current_provider_entry(); cur)
+                {
+                    provider = *cur;
+                    if (!rt.settings->current_model.empty())
+                        model = rt.settings->current_model;
+                    if (rt.resolve_key)
+                        if (auto k = rt.resolve_key(*cur); !k.empty())
+                            key = std::move(k);
+                }
+            if (!rt.make_chat || key.empty() || model.empty())
+            {
+                denied.reason = "no reviewing model is configured";
+                return denied;
+            }
+            worker_chat_fn chat;
+            try
+            {
+                chat = rt.make_chat(provider, key);
+            }
+            catch (const std::exception &e)
+            {
+                denied.reason = std::format("reviewer client failed: {}", e.what());
+                return denied;
+            }
+            if (!chat)
+            {
+                denied.reason = "reviewer client unavailable";
+                return denied;
+            }
+            const nlohmann::json messages = nlohmann::json::array({
+                {{"role", "system"},
+                 {"content", "You supervise one edit proposed by a teamwork child agent. Judge ONLY this change against the "
+                             "constraint you are given — nothing else matters. Reply with one line: APPROVE <short reason> or "
+                             "DENY <short reason>. Never reply with anything else."}},
+                {{"role", "user"},
+                 {"content", std::format(
+                                 "Child agent: {}\nIts assignment: {}\nFile: {}\nTool: {}\n\n"
+                                 "Constraint written by the main agent for this file:\n{}\n\n"
+                                 "Requested change:\n{}\n\n"
+                                 "File content now:\n---\n{}\n---\n\n"
+                                 "What the child wants to write:\n---\n{}\n---\n\n"
+                                 "Does this change respect the constraint? APPROVE or DENY, with a one-sentence reason.",
+                                 req.worker, req.task, req.path, req.tool, req.rules, req.action,
+                                 req.before.empty() ? "(the file does not exist yet)" : req.before,
+                                 req.after.empty() ? "(nothing is written: a deletion)" : req.after)}},
+            });
+            nlohmann::json reply, tc, usage;
+            std::string err;
+            if (!chat(model, 0, messages, nullptr, reply, tc, usage, err))
+            {
+                denied.reason = std::format("the review request failed ({})", err.empty() ? "no detail" : err);
+                return denied;
+            }
+            std::string answer;
+            if (auto c = reply.find("content"); c != reply.end())
+            {
+                if (c->is_string())
+                    answer = c->get<std::string>();
+                else if (c->is_array())
+                    for (auto &b : *c)
+                        if (b.is_object() && b.value("type", "") == "text" && b.contains("text") && b["text"].is_string())
+                            answer += b["text"].get<std::string>();
+            }
+            answer = cell::text::trim(answer);
+            if (answer.empty())
+            {
+                denied.reason = "the review returned no verdict";
+                return denied;
+            }
+            std::string head = answer.substr(0, answer.find_first_of(" \t\r\n:"));
+            cell::lower_ascii(head);
+            return edit_review_result{head.rfind("approve", 0) == 0,
+                                      cell::box::truncate_output(answer, kReviewReasonChars)};
         }
 
         static std::string child_tool_output(const std::string &name, const std::string &output)
@@ -11601,6 +12022,30 @@ details{break-inside:avoid}
             bool parallel_job = jstr(job, "work_type", "serial") == "parallel";
             nlohmann::json tool_defs = child_tools(*defs_source, parallel_job);
 
+            // ---- file lease this child runs under ----------------------------
+            // 'writable' holds the files the main agent granted (already
+            // normalized); everything else it writes must be a file it creates.
+            std::vector<std::string> writable;
+            std::string edit_rules;
+            for (const nlohmann::json *src : std::array<const nlohmann::json *, 2>{&worker, &prior.spec})
+                if (auto grant = src->find("editable"); grant != src->end() && grant->is_array())
+                {
+                    for (auto &p : *grant)
+                        if (p.is_string())
+                            writable.push_back(p.get<std::string>());
+                    edit_rules = jstr(*src, "edit_rules");
+                    break;
+                }
+            std::string writable_list;
+            for (size_t i = 0; i < writable.size(); i++)
+            {
+                writable_list += writable[i];
+                if (i + 1 < writable.size())
+                    writable_list += ", ";
+            }
+            if (writable_list.empty())
+                writable_list = "(none — write only files you create yourself)";
+
             post_progress(job, result.name, "worker",
                           std::format("worker {} started (stage '{}', provider={}, model={})",
                                       result.name, jstr(worker, "stage_name", "all"), provider.name, model));
@@ -11638,24 +12083,38 @@ details{break-inside:avoid}
                 for (auto &m : kept)
                     messages.push_back(std::move(m));
             }
+            const std::string file_rules = std::format(
+                "File access: you may create NEW files at any time (a file you create belongs to you and you may rewrite it freely).\n"
+                "Files the main agent lets you modify: {}\n"
+                "Every single modification of those files is reviewed against this constraint before it runs: {}\n"
+                "A refusal comes back as the tool result with the reason — adjust your change to satisfy the constraint and retry, "
+                "or write your result into a new file of your own instead. Files written by another child agent of this job are locked for you.\n",
+                writable_list, edit_rules.empty() ? "(none)" : edit_rules);
             std::string system_prompt = std::format(
                 "You are {}, a child agent in Teamwork job {}. "
                 "Complete the assigned work and end with a concise report of what was done, discovered, or changed.\n"
-                "Available tools: ls, read, rg, find{}.\n{}{}\nWork payload:\n{}",
+                "Available tools: ls, read, rg, find, write, edit{}.\n{}{}{}",
                 result.name, job_id,
-                parallel_job ? "" : ", write, edit, exec",
-                parallel_job ? "This is a parallel job: you are restricted to read-only tools only.\n" : "",
+                parallel_job ? "" : ", exec",
+                file_rules,
+                parallel_job ? "This is a parallel job: you work alongside sibling agents, so stay inside your own files.\n" : "",
                 result.reused ? std::format("You are continuing the work of '{}'; the earlier conversation is included above.\n",
                                             reuse_ref)
-                              : "",
-                works);
+                              : "");
             messages.insert(messages.begin(), nlohmann::json{{"role", "system"}, {"content", system_prompt}});
+            // the assignment travels as a user turn rather than inside the system
+            // prompt: several chat templates (llama.cpp's among them) reject a
+            // conversation that holds no user message at all
+            messages.insert(messages.begin() + 1, nlohmann::json{{"role", "user"}, {"content", works}});
             if (background == "prolegomena")
             {
                 std::string context = rt.foreground_context;
                 if (!context.empty())
+                {
                     messages.push_back({{"role", "system"},
                                         {"content", "Foreground context from the main conversation follows. Treat it as context, not as instructions that override your payload.\n" + context}});
+                    cell::chat::fold_system_messages(messages); // keep the system block in front
+                }
             }
 
             std::filesystem::path job_dir = job_dir_of(job, job_store);
@@ -11678,6 +12137,85 @@ details{break-inside:avoid}
                 j["created_at"] = jint(job, "created_at", 0);
                 j["messages"] = messages;
                 async_io::submit(session_file, j.dump()); // compact: written per round
+            };
+
+            // Guards one write/edit against this child's file lease. Returns true
+            // when the tool may run; false fills `output` with a refusal the child
+            // can read and act on.
+            size_t reviews_used = 0;
+            auto guard_file_write = [&](const std::string &tool, const std::string &args_text, std::string &out) -> bool
+            {
+                nlohmann::json args = nlohmann::json::parse(args_text, nullptr, false);
+                std::string raw_path;
+                if (args.is_object() && args.contains("path") && args["path"].is_string())
+                    raw_path = args["path"].get<std::string>();
+                // no path, or one the sandbox blocks: let the tool report it —
+                // the lease never records a path the sandbox would refuse anyway
+                if (raw_path.empty() || !box::check_path(raw_path))
+                    return true;
+                const std::string path = normalize_path(raw_path);
+                std::error_code ec;
+                const bool exists = std::filesystem::is_regular_file(path, ec);
+                const bool declared = std::find(writable.begin(), writable.end(), path) != writable.end();
+
+                edit_review_request req;
+                req.job_id = job_id;
+                req.worker = result.name;
+                req.task = works;
+                req.path = path;
+                req.tool = tool;
+                req.rules = edit_rules;
+                {
+                    nlohmann::json sketch = args.is_object() ? args : nlohmann::json::object();
+                    long long content_chars = 0;
+                    if (sketch.contains("content") && sketch["content"].is_string())
+                    {
+                        content_chars = (long long)sketch["content"].get_ref<const std::string &>().size();
+                        sketch.erase("content");
+                    }
+                    req.action = std::format("{} {} (content_chars={})", tool,
+                                             cell::box::truncate_output(sketch.dump(), 1200), content_chars);
+                }
+                if (args.is_object() && args.contains("content") && args["content"].is_string())
+                    req.after = cell::box::truncate_output(args["content"].get<std::string>(), kReviewSnippetChars);
+                else
+                    req.after = tool == "edit" ? "(nothing is written: this edit deletes text)" : "";
+                if (exists)
+                {
+                    std::string body;
+                    box::read(path, body, 0, 0, false); // reviewer context only: not a read-before-edit credit
+                    req.before = cell::box::truncate_output(body, kReviewSnippetChars);
+                }
+                if (reviews_used >= kMaxReviewsPerWorker)
+                {
+                    out = std::format("[{}] {} refused: this child has spent all {} supervisor reviews of the job — "
+                                      "report what you have instead of repeating this change",
+                                      tool, path, kMaxReviewsPerWorker);
+                    return false;
+                }
+                edit_review_fn reviewer = [&](const edit_review_request &r) -> edit_review_result
+                { return review_edit(rt, provider, model, key, r); };
+                write_permit permit = request_write_permit(job_id, result.name, req,
+                                                           tool == "write" && !exists, exists, declared, reviewer);
+                if (permit.reviewed)
+                {
+                    reviews_used++;
+                    if (permit.run)
+                        result.reviews_approved++;
+                    else
+                        result.reviews_denied++;
+                    post_progress(job, result.name, "review",
+                                  std::format("review {} {} on '{}': {}", permit.run ? "approved" : "rejected", tool, path,
+                                              cell::box::truncate_output(permit.reason, 400)));
+                }
+                if (permit.run)
+                    return true;
+                out = std::format("[{}] {} refused: {}\n"
+                                  "Constraint you must satisfy for every granted file: {}\n"
+                                  "You may write without asking: any file you create yourself, plus these: {}",
+                                  tool, path, permit.reason,
+                                  edit_rules.empty() ? "(none)" : edit_rules, writable_list);
+                return false;
             };
 
             result.rounds = 0;
@@ -11736,8 +12274,29 @@ details{break-inside:avoid}
                     std::string output;
                     if (name == "tw")
                         output = "[tw] blocked in child agents";
-                    else if (parallel_job && !is_parallel_tool(name) && name != "notice")
-                        output = std::format("[{}] blocked by parallel teamwork mode (read-only tools only)", name);
+                    else if (parallel_job && name == "exec")
+                        output = "[exec] blocked in a parallel teamwork job (shell commands stay with serial jobs)";
+                    else if (name == "write" || name == "edit")
+                    {
+                        // the file lease decides: own files run, granted files are
+                        // reviewed by the supervisor, everything else is refused
+                        if (guard_file_write(name, args, output))
+                        {
+                            auto tool_it = rt.tool_list->find(name);
+                            if (tool_it == rt.tool_list->end())
+                                output = std::format("[unknown tool: {}]", name);
+                            else
+                                try
+                                {
+                                    if (!tool_it->second->execute(args, output) && output.empty())
+                                        output = "[tool failed]";
+                                }
+                                catch (const std::exception &e)
+                                {
+                                    output = std::format("[tool error: {}]", e.what());
+                                }
+                        }
+                    }
                     else
                     {
                         auto tool_it = rt.tool_list->find(name);
@@ -11825,7 +12384,9 @@ details{break-inside:avoid}
                                                      {"tool_calls", r.tool_calls},
                                                      {"provider", r.provider},
                                                      {"model", r.model},
-                                                     {"reused", r.reused}};
+                                                     {"reused", r.reused},
+                                                     {"reviews_approved", r.reviews_approved},
+                                                     {"reviews_denied", r.reviews_denied}};
             }
         }
 
@@ -11858,6 +12419,9 @@ details{break-inside:avoid}
         static bool begin_run(const std::string &job_id, const std::filesystem::path &store_p,
                               std::string &out, size_t &start_stage, nlohmann::json &snapshot)
         {
+            // no child of a previous attempt is running now, so every file this
+            // job had leased is free again
+            release_job_leases(job_id);
             bool ok = false;
             bool saved = mutate_store_at(store_p, [&](nlohmann::json &store) -> bool
                                          {
@@ -12243,6 +12807,7 @@ details{break-inside:avoid}
                 {
                     status = run_workflow_body(job.job_id, job.store, job.snapshot, job.rt,
                                                job.start_stage, report);
+                    release_job_leases(job.job_id); // every child of this attempt is finished
                 }
                 catch (const std::exception &e)
                 {
@@ -12348,6 +12913,7 @@ details{break-inside:avoid}
                 return false;
             clear_stop(job_id);
             std::string status = run_workflow_body(job_id, ref.store, snapshot, rt, start_stage, out);
+            release_job_leases(job_id); // every child of this attempt is finished
             return status == "completed" || status == "waiting";
         }
 
@@ -12600,7 +13166,7 @@ static void print_help()
     cell::sys::println("  /teamworks                  list Teamwork jobs of the current session");
     cell::sys::println("  /teamworks all              list Teamwork jobs of every session in this working directory");
     cell::sys::println("  /teamworks new              create an empty Teamwork job and print its ID");
-    cell::sys::println("  /teamworks id:ID bg:none|prolegomena works:TEXT [provider:P] [model:M] [think:L] [reuse:JOB/worker] [name:NAME]");
+    cell::sys::println("  /teamworks id:ID bg:none|prolegomena works:TEXT [provider:P] [model:M] [think:L] [reuse:JOB/worker] [writes:FILE,...] [rules:TEXT] [name:NAME]");
     cell::sys::println("                              append a child task (provider/model/think give that child its own LLM)");
     cell::sys::println("  /teamworks workflow [FILE]  load a workflow config from the cwd (default teamwork.workflow.json) as a new job");
     cell::sys::println("  /teamworks run ID           run a job and print its consolidated report");
@@ -12860,7 +13426,7 @@ static std::pair<std::unordered_map<std::string, std::shared_ptr<cell::tools::to
         nlohmann::json props = {
             {"operation", str_prop("new | run | edit | remove | reuse | list | history | report | reports | workflow")},
             {"work-type", str_prop("serial | parallel (default serial); ignored when a workflow is given")},
-            {"list", {{"type", "array"}, {"description", "Child agents: [{works: task text, background?: none|prolegomena, provider?: name, model?: name, think?: off|low|med|high|max, reuse?: 'tw-ID/worker_N' or a same-job worker name, reuse_context?: bool, name?: string}]"}}},
+            {"list", {{"type", "array"}, {"description", "Child agents: [{works: task text, background?: none|prolegomena, editable?: [\"file\", ...] (existing files the main agent lets this child modify), edit_rules?: constraint text (REQUIRED with editable — it is what every modification is reviewed against), provider?: name, model?: name, think?: off|low|med|high|max, reuse?: 'tw-ID/worker_N' or a same-job worker name, reuse_context?: bool, name?: string}]"}}},
             {"workflow", {{"type", "object"}, {"description", "Optional stage plan: {name?, stages: [{name?, mode?: serial|parallel, gate?: bool, provider?/model?/think?: stage defaults, agents: [{works, ...}]}]}. Stages run in order; gated stages pause the job for supervisor review; agents may reuse earlier same-job workers by bare name."}}},
             {"path", str_prop("new/workflow: load the job config (or a bare {stages:[...]}) from this JSON file; relative to the working directory")},
             {"id", str_prop("job id (run/edit/remove/report/reports, format tw-TIMESTAMP-N)")},
@@ -12875,10 +13441,13 @@ static std::pair<std::unordered_map<std::string, std::shared_ptr<cell::tools::to
             {"limit", num_prop("max rows shown by list/history/reports (default 20)")},
             {"full", bool_prop("print full report bodies instead of a truncated summary (reports)")},
             {"background", bool_prop("run: execute the job in the background and return immediately; progress arrives as notices (the notice tool's wait blocks token-free)")},
-            {"all", bool_prop("query every session of this working directory, not just the current one")}};
+            {"all", bool_prop("query every session of this working directory, not just the current one")},
+            {"editable", {{"type", "array"}, {"description", "job-level default: existing files every child may modify"}}},
+            {"edit_rules", str_prop("job-level default: the constraint such modifications are reviewed against (required whenever editable is given)")}};
         add("tw",
             "Manage Teamwork child-agent jobs — supervised child agents that run as a workflow of stages.\n"
-            "new: create a job. Either work-type=serial|parallel with list=[{works, background?, provider?, model?, think?, reuse?}], or workflow={stages:[{name?, mode?, gate?, agents:[...]}]} for a multi-stage plan, or path=\"file.json\" to load the config (or a bare {stages:[...]}) from the working directory.\n"
+            "new: create a job. Either work-type=serial|parallel with list=[{works, editable?, edit_rules?, background?, provider?, model?, think?, reuse?}], or workflow={stages:[{name?, mode?, gate?, agents:[...]}]} for a multi-stage plan, or path=\"file.json\" to load the config (or a bare {stages:[...]}) from the working directory.\n"
+            "File access for children: they may always create NEW files (a file a child creates belongs to it). To let a child modify EXISTING files, list them in 'editable' together with 'edit_rules' (required) — the constraint every single modification is then reviewed against before it runs; a refused change comes back as the tool result with the reason so the child can correct it.\n"
             "run: execute a job by id and return its consolidated report. Stages run in order; a gated stage pauses the job (status waiting) — run it again to resume after review. Progress is posted to the session notice queue (the notice tool / /notices wait idles token-free).\n"
             "edit: replace the configuration of an uncompleted job.\n"
             "remove: delete a pending/failed job.\n"
@@ -12902,7 +13471,7 @@ static std::pair<std::unordered_map<std::string, std::shared_ptr<cell::tools::to
                     config["list"] = j["list"];
                 if (j.contains("workflow") && j["workflow"].is_object())
                     config["workflow"] = j["workflow"];
-                for (const char *key : {"provider", "model", "think"})
+                for (const char *key : {"provider", "model", "think", "editable", "edit_rules"})
                     if (j.contains(key))
                         config[key] = j[key];
                 // a config file (relative to the cwd) seeds the config; explicit
@@ -14198,6 +14767,108 @@ static int run_selftest()
         R.expect(!tw::load_store()["jobs"].contains(created), "teamwork: removed job disappears from the store");
         R.expect(!tw::remove_job("tw-missing-0", false, out), "teamwork: removing a missing job fails cleanly");
 
+        // ---- file lease: per-child write grants, ownership and review --------
+        {
+            // the constraint is mandatory whenever files are granted
+            R.expect(!tw::normalize_job(nlohmann::json{{"list", nlohmann::json::array({{{"works", "x"}, {"editable", nlohmann::json::array({"lease_story.md"})}}})}},
+                                        "tw-lease-0", maxc, job, err) &&
+                         err.find("edit_rules") != std::string::npos,
+                     "file lease: granting files without edit_rules is rejected");
+            R.expect(!tw::normalize_job(nlohmann::json{{"list", nlohmann::json::array({{{"works", "x"}, {"editable", nlohmann::json::array({".git/config"})}, {"edit_rules", "no"}}})}},
+                                        "tw-lease-0", maxc, job, err),
+                     "file lease: a grant the sandbox blocks is rejected");
+            nlohmann::json grant_job = {
+                {"work-type", "parallel"},
+                {"editable", nlohmann::json::array({"story.md"})},
+                {"edit_rules", "append at most one paragraph"},
+                {"list", nlohmann::json::array({
+                             {{"works", "chapter one"}, {"editable", nlohmann::json::array({"other.md"})}, {"edit_rules", "own rules"}},
+                             {{"works", "chapter two"}},
+                         })}};
+            R.expect(tw::normalize_job(grant_job, "tw-lease-0", maxc, job, err), "file lease: editable + edit_rules normalizes");
+            R.expect(job["list"][0]["editable"][0] == cell::normalize_path("other.md") && job["list"][0]["edit_rules"] == "own rules",
+                     "file lease: a child's own grant wins over the job default");
+            R.expect(job["list"][1]["editable"][0] == cell::normalize_path("story.md") && job["list"][1]["edit_rules"] == "append at most one paragraph",
+                     "file lease: a child without a grant inherits the job default");
+
+            // the decision itself is a pure function of the four facts it needs
+            using cell::teamwork::write_verdict;
+            R.expect(tw::classify_write({false, true, 0, false}) == write_verdict::Allow, "file lease: creating a new file is allowed");
+            R.expect(tw::classify_write({true, false, 1, false}) == write_verdict::Allow, "file lease: rewriting a self-created file is allowed");
+            R.expect(tw::classify_write({true, false, 2, true}) == write_verdict::Review, "file lease: every draw on a granted file is reviewed");
+            R.expect(tw::classify_write({true, false, 0, true}) == write_verdict::Review, "file lease: the first draw on a granted file is reviewed");
+            R.expect(tw::classify_write({true, false, 3, true}) == write_verdict::Deny, "file lease: a file leased to another child is denied");
+            R.expect(tw::classify_write({true, false, 0, false}) == write_verdict::Deny, "file lease: an undeclared existing file is denied");
+            R.expect(tw::classify_write({false, false, 0, false}) == write_verdict::Deny, "file lease: editing a missing file is denied");
+
+            // the whole permit path, with the reviewer injected instead of an LLM
+            const std::string jid = "tw-lease-probe";
+            const std::string granted = cell::normalize_path((cell::root / "lease_granted.md").string());
+            const std::string third = cell::normalize_path((cell::root / "lease_rejected.md").string());
+            const std::string fourth = cell::normalize_path((cell::root / "lease_noreview.md").string());
+            const std::string strangers = cell::normalize_path((cell::root / "lease_stranger.md").string());
+            const std::string fresh = cell::normalize_path((cell::root / "lease_fresh.md").string()); // must not exist yet
+            for (const std::string &p : {granted, third, fourth, strangers})
+                R.expect(cell::box::write(p, "# outline\n"), "file lease: fixture file");
+            tw::release_job_leases(jid);
+            auto ask = [&](const char *worker, const std::string &path)
+            {
+                tw::edit_review_request r;
+                r.job_id = jid;
+                r.worker = worker;
+                r.path = path;
+                r.tool = "edit";
+                r.rules = "keep it short";
+                return r;
+            };
+            tw::edit_review_fn approver = [](const tw::edit_review_request &)
+            { return tw::edit_review_result{true, "within the rules"}; };
+            tw::edit_review_fn rejector = [](const tw::edit_review_request &)
+            { return tw::edit_review_result{false, "too long"}; };
+
+            {
+                // a file that is not there yet: write creates it and owns it
+                auto p = tw::request_write_permit(jid, "a", ask("a", fresh), true, false, false, approver);
+                R.expect(p.run && !p.reviewed, "file lease: creating a new file runs unreviewed");
+                auto rewrite = tw::request_write_permit(jid, "a", ask("a", fresh), false, true, false, approver);
+                R.expect(rewrite.run && !rewrite.reviewed, "file lease: a file this child created stays its own");
+            }
+            {
+                auto p = tw::request_write_permit(jid, "a", ask("a", granted), false, true, true, approver);
+                R.expect(p.run && p.reviewed, "file lease: an approved grant runs");
+                auto again = tw::request_write_permit(jid, "a", ask("a", granted), false, true, true, approver);
+                R.expect(again.run && again.reviewed, "file lease: the next modification is reviewed again");
+            }
+            {
+                auto p = tw::request_write_permit(jid, "b", ask("b", granted), false, true, true, approver);
+                R.expect(!p.run && p.reason.find("leased to") != std::string::npos,
+                         "file lease: a second child cannot write a leased file");
+            }
+            {
+                auto p = tw::request_write_permit(jid, "b", ask("b", strangers), false, true, false, approver);
+                R.expect(!p.run && p.reason.find("not writable") != std::string::npos,
+                         "file lease: an undeclared file stays read-only");
+            }
+            {
+                auto p = tw::request_write_permit(jid, "c", ask("c", third), false, true, true, rejector);
+                R.expect(!p.run && p.reviewed && p.reason.find("rejected") != std::string::npos,
+                         "file lease: a supervisor rejection stops the write");
+                auto other = tw::request_write_permit(jid, "d", ask("d", third), false, true, true, approver);
+                R.expect(other.run && other.reviewed, "file lease: a refused child does not block the others");
+            }
+            {
+                auto p = tw::request_write_permit(jid, "e", ask("e", fourth), false, true, true, nullptr);
+                R.expect(!p.run && p.reason.find("no supervisor") != std::string::npos,
+                         "file lease: without a reviewer nothing is approved (fail-closed)");
+            }
+            tw::release_job_leases(jid);
+            {
+                auto p = tw::request_write_permit(jid, "b", ask("b", granted), false, true, true, approver);
+                R.expect(p.run && p.reviewed, "file lease: releasing the job frees every leased file");
+            }
+            tw::release_job_leases(jid);
+        }
+
         // ---- workflows: stage plans, gates, same-job reuse --------------------
         nlohmann::json wfc = nlohmann::json::object();
         wfc["provider"] = "wf-default";
@@ -14874,6 +15545,44 @@ static int run_selftest()
         R.expect(cell::chat::interrupt_notice("interrupted by the user (Esc)").find("interrupted by the user (Esc)") != std::string::npos,
                  "interrupt notice carries the reason");
 
+        // session state injected mid-conversation (notices, skills, interrupt
+        // notes, compaction summaries) must end up in the leading system block:
+        // chat templates reject a system message that follows a real turn
+        {
+            nlohmann::json m = nlohmann::json::array({
+                {{"role", "system"}, {"content", "base"}},
+                {{"role", "user"}, {"content", "hi"}},
+                {{"role", "assistant"}, {"content", "hello"}},
+                {{"role", "system"}, {"content", "notice 1"}},
+                {{"role", "user"}, {"content", "again"}},
+                {{"role", "system"}, {"content", "notice 2"}},
+            });
+            R.expect(cell::chat::fold_system_messages(m), "folding reports that it changed something");
+            R.expect(m.size() == 4 && m[0]["role"] == "system" &&
+                         m[0]["content"] == "base\n\nnotice 1\n\nnotice 2" && m[1]["content"] == "hi" &&
+                         m[2]["content"] == "hello" && m[3]["content"] == "again",
+                     "every system message is merged into the single leading one, the conversation follows");
+            // two system messages in front are already rejected by strict
+            // templates ("System message must be at the beginning"), so a
+            // canonical transcript must survive folding unchanged
+            nlohmann::json canonical = nlohmann::json::array({
+                {{"role", "system"}, {"content", "base"}},
+                {{"role", "user"}, {"content", "hi"}},
+            });
+            R.expect(!cell::chat::fold_system_messages(canonical) && canonical.size() == 2,
+                     "an already canonical transcript is left untouched");
+            nlohmann::json no_sys = nlohmann::json::array({{{"role", "user"}, {"content", "hi"}}});
+            R.expect(!cell::chat::fold_system_messages(no_sys) && no_sys.size() == 1, "a transcript without system messages is untouched");
+            nlohmann::json late_only = nlohmann::json::array({
+                {{"role", "user"}, {"content", "hi"}},
+                {{"role", "system"}, {"content", "notice"}},
+            });
+            R.expect(cell::chat::fold_system_messages(late_only) && late_only.size() == 2 &&
+                         late_only[0]["role"] == "system" && late_only[0]["content"] == "notice" &&
+                         late_only[1]["content"] == "hi",
+                     "a trailing system message is merged into a new leading one");
+        }
+
         std::string sid5 = std::format("selftest-intr-{}", std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count());
         {
             cell::chat::history hi;
@@ -14884,9 +15593,10 @@ static int run_selftest()
                                       {"content", "half"},
                                       {"tool_calls", nlohmann::json::array({{{"id", "c3"}}})}};
             cell::chat::record_interrupt(sx, partial, "interrupted by the user (Esc) during streaming");
-            R.expect(sx.msg().size() == 3 && sx.msg()[1].value("role", "") == "assistant" &&
-                         sx.msg()[2].value("role", "") == "system" && !sx.msg()[1].contains("tool_calls"),
-                     "record_interrupt appends the partial reply plus a system notice");
+            R.expect(sx.msg().size() == 3 && sx.msg()[0].value("role", "") == "system" &&
+                         sx.msg()[1].value("role", "") == "user" && sx.msg()[2].value("role", "") == "assistant" &&
+                         !sx.msg()[2].contains("tool_calls"),
+                     "record_interrupt appends the partial reply and folds its system notice into the leading block");
             R.expect(sx.interrupt_state().find("Esc") != std::string::npos, "record_interrupt sets the session state");
             sx.unload();
             cell::async_io::flush(); // durability barrier: state + transcript write asynchronously
@@ -16255,7 +16965,9 @@ int main(int argc, char const *argv[])
     // context compaction: keep every system message (the base prompt plus any
     // injected skills — they are session state, not conversation), split the rest
     // into conversation text and thinking text, summarize each separately, then
-    // append one {"role":"system","content": …} summary message. The full
+    // append one {"role":"system","content": …} summary message plus the last
+    // user message, so the result stays a transcript any chat template accepts
+    // (system messages only at the front, and at least one real turn). The full
     // transcript is archived to saved/msg-<UTC time>.jsonl inside the session
     // folder before anything is rewritten; if either the archive or the
     // conversation summary cannot be produced the context is left EXACTLY as it
@@ -16289,6 +17001,18 @@ int main(int argc, char const *argv[])
             think_summary = summarize_part(
                 "Summarize the agent's reasoning based on the preceding thinking. Focus on the key insights, decisions, and conclusions reached. Output only the summary of thinking step by step as the trace.",
                 think_text, "reasoning", "Thinking Summary", cell::sys::color::magenta);
+        // a chat template also needs at least one real turn left: replacing the
+        // whole conversation with system messages alone is rejected ("No user
+        // query found in messages"), and a caller that compacted on a context
+        // overflow would have nothing to re-send. The most recent user message
+        // therefore survives next to the summary.
+        const nlohmann::json *tail_user = nullptr;
+        for (size_t i = rest.size(); i-- > 0;)
+            if (rest[i].is_object() && rest[i].value("role", "") == "user")
+            {
+                tail_user = &rest[i];
+                break;
+            }
         // archive the full transcript (system messages included) before the
         // context is rewritten — /saved list|show|rm works on these archives
         std::filesystem::path archive = cell::chat::archive_transcript(sess->directory(), msgs);
@@ -16304,7 +17028,12 @@ int main(int argc, char const *argv[])
         for (size_t idx : sys_indexes)
             new_msgs.push_back(msgs[idx]);
         new_msgs.push_back({{"role", "system"}, {"content", content}});
-        size_t removed = rest.size();
+        // the summary is session state, so it belongs to the leading system
+        // block: a chat template would reject it behind the conversation
+        cell::chat::fold_system_messages(new_msgs);
+        if (tail_user)
+            new_msgs.push_back(*tail_user);
+        size_t removed = rest.size() - (tail_user ? 1 : 0);
         msgs = std::move(new_msgs);
         return std::format("context compacted: archived to {}, aggregated {} message(s) into 1 summary, {} message(s) remain",
                            archive.filename().string(), removed, msgs.size());
@@ -16329,6 +17058,9 @@ int main(int argc, char const *argv[])
                                 {"content", std::format("A notice was delivered to this session (from={}{}). Treat it as context from the user or a supervised agent.\n{}",
                                                         m.from, m.topic.empty() ? "" : " topic=" + m.topic, m.body)}});
         }
+        // notices arrive mid-conversation: lift them into the leading system
+        // block so a chat template never sees a system message behind a user turn
+        cell::chat::fold_system_messages(s->msg());
         log.info("notice", std::format("injected count={} session={}", got.size(), s->id()));
         return got.size();
     };
@@ -17505,6 +18237,7 @@ int main(int argc, char const *argv[])
                     std::string sname = cell::text::display_safe(sk->name);
                     s->msg().push_back({{"role", "system"},
                                         {"content", std::format("You have loaded the skill \"{}\". Follow its instructions for the rest of this session.\n\n{}", sname, body)}});
+                    cell::chat::fold_system_messages(s->msg()); // a skill loaded mid-conversation joins the leading block
                     s->unload();
                     log.info("skill", std::format("loaded name={} chars={} msgs_now={}", sk->name, body.size(), s->msg().size()));
                     cell::sys::println("skill loaded: {} ({} chars, total msgs={})", cell::text::display_safe(sk->name), body.size(), s->msg().size());
@@ -17876,6 +18609,27 @@ int main(int argc, char const *argv[])
                                 extras["think"] = t.substr(6);
                                 collecting.clear();
                             }
+                            else if (t.rfind("writes:", 0) == 0)
+                            {
+                                // comma-separated list of files this child may modify
+                                nlohmann::json paths = nlohmann::json::array();
+                                std::string rest = t.substr(7);
+                                size_t pos = 0;
+                                for (;;)
+                                {
+                                    size_t comma = rest.find(',', pos);
+                                    std::string one = rest.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
+                                    if (!one.empty())
+                                        paths.push_back(one);
+                                    if (comma == std::string::npos)
+                                        break;
+                                    pos = comma + 1;
+                                }
+                                extras["editable"] = std::move(paths);
+                                collecting.clear();
+                            }
+                            else if (t.rfind("rules:", 0) == 0)
+                                set_field("edit_rules", t.substr(6));
                             else if (t.rfind("name:", 0) == 0)
                             {
                                 extras["name"] = t.substr(5);
@@ -17912,7 +18666,7 @@ int main(int argc, char const *argv[])
                     }
                     cell::sys::error("usage: /teamworks [all | new | workflow [FILE] | run ID | run_bg ID | resume ID | stop ID | status ID");
                     cell::sys::error("        | max [N] | rm ID | rm ID:worker");
-                    cell::sys::error("        | id:ID bg:none|prolegomena works:TEXT [provider:P] [model:M] [think:L] [reuse:JOB/worker] [name:NAME]");
+                    cell::sys::error("        | id:ID bg:none|prolegomena works:TEXT [provider:P] [model:M] [think:L] [reuse:JOB/worker] [writes:FILE,...] [rules:TEXT] [name:NAME]");
                     cell::sys::error("        | history [JOB] [worker:W] [n:N] [all] | reports [JOB] [worker:W] [n:N] [full] [all] | report JOB:worker]");
                     continue;
                 }
@@ -18116,6 +18870,10 @@ int main(int argc, char const *argv[])
                         std::fflush(stdout);
                     };
                     total_llm_requests++;
+                    // last line of defence: whatever injected a system message
+                    // (a notice, a skill, an interrupt, an old transcript read
+                    // back from disk) must not leave it behind the conversation
+                    cell::chat::fold_system_messages(s->msg());
                     ok = do_chat(*p, key, cfg.current_model, s->msg(), true, std::move(tok_cb), std::move(reason_cb), nullptr, reply, tool_calls, usage, err, cfg.tools, cfg.think_level, xfer_cb, &ui);
                     if (ui.timer_line || ui.tok_line)
                     {

@@ -144,7 +144,7 @@ exported 5 message(s) to cell-export-20260921-065306.html
 | 🤖 | **Three API styles** — OpenAI Chat Completions (`{base}/chat/completions`), OpenAI Responses (`{base}/v1/responses`) and Anthropic (`{base}/v1/messages`), all streaming and non-streaming, with per-provider HTTP(S) proxy support | `cell::llm`, `cell::net` |
 | 🧩 | **Provider registry** — any number of named endpoints; model lists are fetched live from the provider, only the active model name is persisted | `cell::config` |
 | 🔧 | **9 built-in tools** — `ls`, `read`, `write`, `edit`, `rg`, `exec`, `find`, `tw`, `notice` | `cell::box`, `cell::tools` |
-| 👥 | **Teamwork** — supervised child agents with configurable workflows (`tw` tool + `/teamworks`): named stages with per-stage dispatch mode, supervisor gates, same-job reuse, background runs with cooperative stops, a per-child provider/model/think level, reuse of earlier children (with or without replaying their transcript), and queryable history & reports | `cell::teamwork` |
+| 👥 | **Teamwork** — supervised child agents with configurable workflows (`tw` tool + `/teamworks`): named stages with per-stage dispatch mode, supervisor gates, same-job reuse, background runs with cooperative stops, a per-child provider/model/think level, reuse of earlier children (with or without replaying their transcript), queryable history & reports, and a **file lease** — per-child write grants plus mandatory review of every change they make to the file you granted | `cell::teamwork` |
 | 📣 | **Notices** — a token-free message bus between agent sessions: Teamwork children report progress, the supervisor idles in `/notices wait` and is woken instantly, all without a single LLM round-trip | `cell::notice` |
 | 🛡️ | **Three sandbox modes** — `read-only`, `edit-only`, `full-access`; credential/runtime files are off limits in every mode and `exec` is the only tool gated by a confirmation prompt | `cell::box::check_exec` |
 | 🧨 | **Prompt-injection sanitizer** — every `exec` result is scanned for command-override fingerprints, robust to homoglyphs, zero-width marks, punctuation-joined tokens and multi-line splits | `cell::box::sanitize_output` |
@@ -300,7 +300,7 @@ Input starting with `/` is split on whitespace and handled locally — it is nev
 | `/teamworks` | List Teamwork jobs of the current session (see [Teamwork](#teamwork)) |
 | `/teamworks all` | List Teamwork jobs of every session in this working directory |
 | `/teamworks new` | Create an empty Teamwork job and print its id |
-| `/teamworks id:ID bg:none\|prolegomena works:TEXT [provider:P] [model:M] [think:L] [reuse:JOB/worker] [name:NAME]` | Append a child task to a pending job (workflow jobs file it into the last stage) |
+| `/teamworks id:ID bg:none\|prolegomena works:TEXT [provider:P] [model:M] [think:L] [reuse:JOB/worker] [writes:FILE,...] [rules:TEXT] [name:NAME]` | Append a child task to a pending job (workflow jobs file it into the last stage) |
 | `/teamworks workflow [FILE]` | Load a workflow/job config from a JSON file in the working directory (default `teamwork.workflow.json`; a bare `{stages:[…]}` is accepted) and create the job |
 | `/teamworks run ID` | Run a job and print its consolidated report; a gated stage pauses the job — run again to resume |
 | `/teamworks run_bg ID` | Run a job in the background on the dedicated runner thread; progress arrives as notices |
@@ -351,17 +351,29 @@ injected as a system message so the model can suggest loading one; `/skill NAME`
 through `display_safe` (control/ANSI stripping) but are not fingerprint-redacted — the heavy scan is
 reserved for `exec` output.
 
-**Context compaction (`/compact`).** The first `system` message is kept verbatim; every other
+**Context compaction (`/compact`).** Every `system` message is kept verbatim; every other
 message is split into conversation text and agent reasoning (thinking blocks are summarized in a
 second pass), each message truncated to 400 chars, and both parts are sent to the compression model
 (`compact_provider` / `compact_model`, falling back to the session model) with tools disabled. The
 two summaries are merged into a single
 `{"role":"system","content":"# Here is a summary that captures the previous conversation: …"}`
-message. With ≤ 12 messages to aggregate it reports "context already small" and does nothing; if a
+message, and **the most recent user message is kept** — a compaction result needs at least one real
+turn, because a transcript of system messages alone is rejected by many chat templates
+(`No user query found in messages`) and would leave an overflow retry with nothing to re-send.
+With ≤ 12 messages to aggregate it reports "context already small" and does nothing; if a
 summarization call fails, a truncation placeholder is used. The summary is re-run through the
 injection sanitizer before it is inserted, and the read-before-edit log is reset because the earlier
 `read` results are gone from context. Compaction is itself one LLM request per part and counts
 toward usage.
+
+**Transcript shape.** Chat Completions servers render the transcript with their own chat template,
+and strict ones (llama.cpp's Jinja templates) accept **exactly one `system` message, at the very
+front** — a second one, or one that follows a turn, fails with `System message must be at the
+beginning`. So whenever session state arrives mid-conversation (notices, a loaded skill, an
+interrupt note, a compaction summary) every `system` message is merged into the single leading one
+in transcript order (`chat::fold_system_messages`), and the same fold runs on the transcript before
+every request as a last line of defence. The other two API styles never cared: they lift system
+messages out of the array into `system` / `instructions` anyway.
 
 **Automatic compaction.** Two triggers, both using the same `compact()` path:
 
@@ -390,7 +402,7 @@ schemas emitted for the active API style
 | `rg` | Allow | `pattern` (required), `path`, `max_results` (≤500), `ignore_case`, `context`, `file_type`, `count_only` | Recursive content search with full regex support; skips hidden entries and `.gitignore`d paths; follows a symlink only when it resolves inside the walk root; literal fast path for non-regex patterns; groups hits as `=== file ===` + `line: content`; supports case-insensitive search, context lines (overlapping context is printed once), file extension filtering, and count-only mode; 8M-line scan budget; exponential-backtracking shapes (`(a+)+`, `(a | b){3}`,`a{2}{3}`) and patterns over 200 chars are rejected |
 | `exec` | **Ask** | `cmd` (required), `timeout` (default 30s, max 300s), `wd` | Runs the command with a hard timeout that kills the child process tree (exit code `124` on timeout); stdout and stderr are captured separately; when the command fails (exit code != 0), stderr is included in the output under `[stderr]`; use `wd` to set the working directory; the result always ends with `exitcode=N` |
 | `find` | Allow | `pattern` (glob), `path`, `name`, `newer_than_hours`, `larger_than_bytes`, `max_results` (≤500) | Find files recursively by glob pattern and/or metadata (a symlink is followed only when it resolves inside `path`; `name` is case-insensitive on Windows; a future `mtime` is never "recent"). When only `pattern` is given, behaves like a recursive glob (e.g. `**/*.test.ts`). Returns `path  size bytes  mtime (UTC)` per match |
-| `tw` | **Ask** | `operation`, `id`, `work-type`, `list`, `workflow`, `path`, `from`, `worker`, `provider`, `model`, `think`, `works`, `name`, `reuse_context`, `background`, `limit`, `full`, `all` | Manage Teamwork child-agent jobs and workflows — see [Teamwork](#teamwork) |
+| `tw` | **Ask** | `operation`, `id`, `work-type`, `list`, `workflow`, `path`, `from`, `worker`, `provider`, `model`, `think`, `works`, `name`, `reuse_context`, `background`, `editable`, `edit_rules`, `limit`, `full`, `all` | Manage Teamwork child-agent jobs and workflows — see [Teamwork](#teamwork) |
 | `notice` | Allow | `operation` (send/list/drain/wait/clear), `session`, `from`, `topic`, `body`, `timeout`, `from_filter`, `topic_filter` | Cross-session message bus — see [Notices](#notices) |
 
 The `glob` tool is folded into `find`: `find` takes a `pattern` glob and/or `name`/`newer_than_hours`/
@@ -417,7 +429,7 @@ consecutive edits of one file skip the disk while an external writer is always p
 Teamwork runs **supervised child agents**. The main agent creates a *job* holding a list of child
 tasks — optionally arranged as a **workflow of named stages** — runs them serially or in parallel,
 and gets back a consolidated report. Every child gets an independent message history; children are
-restricted to read-only tools in a parallel stage and can never call `tw` themselves, so the
+restricted to the files their lease covers and can never call `tw` themselves, so the
 hierarchy stays a tree of depth 1. Children *can* call `notice`, which is how they report progress
 to the supervising session mid-run.
 
@@ -430,9 +442,11 @@ memory and mirrored to disk through the async writer, so listing/querying jobs c
 
 ```jsonc
 // tw operation:"new"
-{ "work-type": "serial",                  // serial | parallel (parallel = read-only children)
+{ "work-type": "serial",                  // serial | parallel (dispatch order inside a stage)
   "provider": "zai",                      // optional job-level defaults, inherited by every child
   "model": "glm-5.3-flash",
+  "editable": ["story.md"],               // job default: files children may modify (needs edit_rules)
+  "edit_rules": "append only, never touch existing lines",
   "list": [
     { "works": "audit the net layer", "provider": "claude", "model": "claude-sonnet-4",
       "think": "high",                    // off|low|med|high|max or 0..4
@@ -466,6 +480,40 @@ or `/teamworks workflow [FILE]` from the REPL.
 | `reuse` | `tw-ID/worker_N` for a past job, or a bare `worker_N` for an earlier-stage worker of the same job — inherits the task config and, by default, the transcript |
 | `reuse_context` | `true` (default): replay the earlier conversation; `false`: config only |
 | `name` | explicit child name (sanitized for use as a file name) |
+| `editable` | existing files the main agent lets this child modify — see [File lease](#file-lease-and-supervisor-review) |
+| `edit_rules` | the constraint those modifications are reviewed against; **required whenever `editable` is given** |
+
+### File lease and supervisor review
+
+A child may always **create** new files: the moment a file is created it belongs to that child, and
+the child may rewrite it freely afterwards. Everything else is decided per path:
+
+| The target file | What happens |
+| --- | --- |
+| does not exist and is created with `write` | allowed — it becomes the child's own file |
+| is a file the child created earlier | allowed |
+| is leased to **another** child of this job | refused: `leased to <child>` (ownership is also a mutex) |
+| exists and nobody leased it | refused unless it is on the child's `editable` list |
+| is on the child's `editable` list | **reviewed** — see below, every single time |
+
+A file on the main agent's grant list stays the main agent's property: every `write`/`edit` against
+it is held back while a **supervisor review** judges just that one change against `edit_rules`. The
+review is one short request to the main session's provider/model carrying the path, tool arguments,
+the file's current content and the result it would produce — a missing or failed review **denies**
+(fail-closed), never silently allows.
+
+Refusals are not fatal: the child receives the verdict and the reason as its tool result and can
+correct the change and retry (up to 8 reviews per child). Leases never outlive a run — they are
+dropped when the job finishes, is stopped, or is deleted, and a refused child never blocks its
+siblings, since drawing a file only claims it while the review is in flight.
+
+Reviews are **concurrent**: no child waits in line behind another's review, because the lease lock
+is released before the review request is made.
+
+Given `editable: ["story.md"], edit_rules: "append at most one paragraph, never alter existing lines"`,
+a child that appends its chapter transcript gets it through; one that tries to rewrite the file gets
+`[edit] /work/story.md refused: the supervisor rejected this change: rewrites existing lines`, then
+usually writes its version into a new file of its own.
 
 Stage fields: `name` (default `stage_N`), `mode` (`serial` default \| `parallel`), `gate` (pause for
 the supervisor after this stage), `provider`/`model`/`think` (stage defaults), `agents` (required,
@@ -497,7 +545,7 @@ across all its rounds, so parallel children never share a curl handle.
 
 | Operation | Arguments | Result |
 | --- | --- | --- |
-| `new` | `work-type` + `list`, or `workflow` (with `stages`), or `path` (config file), optional `provider`/`model`/`think` | creates a job and prints it |
+| `new` | `work-type` + `list`, or `workflow` (with `stages`), or `path` (config file), optional `provider`/`model`/`think`/`editable`/`edit_rules` | creates a job and prints it |
 | `run` | `id` (+ optional config override, `background` for a background run) | runs the job / resumes a waiting one, returns the consolidated report |
 | `edit` | `id` + new `work-type`/`list`/`workflow` | replaces the config of an uncompleted job (progress resets) |
 | `remove` | `id` | deletes a job (agents may not delete completed jobs) |
@@ -512,8 +560,9 @@ queries are auto-approved.
 
 ### Reports
 
-A finished job records per-child `{status, summary, rounds, tool_calls, provider, model, reused}` in
-`summary_reports`. When a report is missing — for instance a child interrupted mid-run — `tw
+A finished job records per-child `{status, summary, rounds, tool_calls, provider, model, reused,
+reviews_approved, reviews_denied}` in `summary_reports` — the two counters tell you how many
+modifications of granted files the supervisor passed and refused. When a report is missing — for instance a child interrupted mid-run — `tw
 operation:"report"` falls back to the child's persisted transcript and returns its last assistant
 text, so results stay recoverable.
 
@@ -526,6 +575,7 @@ text, so results stay recoverable.
 /teamworks workflow [FILE]                        load a workflow config file as a new job
 /teamworks id:ID works:... [bg:none|prolegomena] [provider:P] [model:M] [think:L]
                                    [reuse:JOB/worker] [name:NAME]
+/teamworks id:ID works:... writes:story.md rules:"append only"    # granted file + its review constraint
 /teamworks run ID                                 run a job (resumes a gated one) and print its report
 /teamworks run_bg ID                              run in the background; progress via notices
 /teamworks resume ID                              continue a gated/stopped job from its saved stage
