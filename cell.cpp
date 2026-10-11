@@ -1326,12 +1326,18 @@ namespace cell
         {
             switch (type)
             {
-            case FileType::Text:     return "Text";
-            case FileType::Image:    return "Image";
-            case FileType::Audio:    return "Audio";
-            case FileType::Video:    return "Video";
-            case FileType::Document: return "Document";
-            case FileType::Binary:   return "Binary";
+            case FileType::Text:
+                return "Text";
+            case FileType::Image:
+                return "Image";
+            case FileType::Audio:
+                return "Audio";
+            case FileType::Video:
+                return "Video";
+            case FileType::Document:
+                return "Document";
+            case FileType::Binary:
+                return "Binary";
             }
             return "Binary";
         }
@@ -1340,62 +1346,195 @@ namespace cell
         {
             std::string ext = to_lower(std::filesystem::path(path).extension().string());
             static const std::unordered_set<std::string> text_exts = {
-                ".txt", ".cpp", ".h", ".hpp", ".c", ".cc", ".cxx",
-                ".py", ".js", ".ts", ".jsx", ".tsx", ".java", ".cs",
-                ".json", ".xml", ".yaml", ".yml", ".toml", ".ini",
-                ".md", ".rst", ".html", ".css", ".scss",
-                ".sh", ".bat", ".cmd", ".ps1",
-                ".sql", ".r", ".lua", ".rb", ".go", ".rs",
-                ".swift", ".kt", ".scala", ".dart", ".vue", ".svelte",
-                ".csv", ".tsv", ".log", ".conf", ".config",
-                ".gitignore", ".dockerignore", ".editorconfig",
-                ".graphql", ".proto", ".sol", ".cairo",
-                ".cmake", ".mk", ".makefile",
-                ".nim", ".zig", ".d", ".ex", ".exs", ".hs", ".ml",
-                ".pas", ".cob", ".f", ".f90", ".for", ".bas",
-                ".adb", ".ads", ".e", ".cl", ".lisp", ".el",
-                ".tex", ".bib", ".cls", ".sty",
-                ".adoc", ".textile",
-                ".ipynb", ".jsonl", ".ndjson",
-                ".wkt", ".fix", ".feature", ".robot",
-                ".gherkin", ".bdd", ".spec", ".test",
-                ".todo", ".fixme", ".hack",
-                ".license", ".readme", ".changelog",
+                ".txt",
+                ".cpp",
+                ".h",
+                ".hpp",
+                ".c",
+                ".cc",
+                ".cxx",
+                ".py",
+                ".js",
+                ".ts",
+                ".jsx",
+                ".tsx",
+                ".java",
+                ".cs",
+                ".json",
+                ".xml",
+                ".yaml",
+                ".yml",
+                ".toml",
+                ".ini",
+                ".md",
+                ".rst",
+                ".html",
+                ".css",
+                ".scss",
+                ".sh",
+                ".bat",
+                ".cmd",
+                ".ps1",
+                ".sql",
+                ".r",
+                ".lua",
+                ".rb",
+                ".go",
+                ".rs",
+                ".swift",
+                ".kt",
+                ".scala",
+                ".dart",
+                ".vue",
+                ".svelte",
+                ".csv",
+                ".tsv",
+                ".log",
+                ".conf",
+                ".config",
+                ".gitignore",
+                ".dockerignore",
+                ".editorconfig",
+                ".graphql",
+                ".proto",
+                ".sol",
+                ".cairo",
+                ".cmake",
+                ".mk",
+                ".makefile",
+                ".nim",
+                ".zig",
+                ".d",
+                ".ex",
+                ".exs",
+                ".hs",
+                ".ml",
+                ".pas",
+                ".cob",
+                ".f",
+                ".f90",
+                ".for",
+                ".bas",
+                ".adb",
+                ".ads",
+                ".e",
+                ".cl",
+                ".lisp",
+                ".el",
+                ".tex",
+                ".bib",
+                ".cls",
+                ".sty",
+                ".adoc",
+                ".textile",
+                ".ipynb",
+                ".jsonl",
+                ".ndjson",
+                ".wkt",
+                ".fix",
+                ".feature",
+                ".robot",
+                ".gherkin",
+                ".bdd",
+                ".spec",
+                ".test",
+                ".todo",
+                ".fixme",
+                ".hack",
+                ".license",
+                ".readme",
+                ".changelog",
             };
             if (text_exts.count(ext))
                 return FileType::Text;
 
             static const std::unordered_set<std::string> image_exts = {
-                ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp",
-                ".tiff", ".tif", ".svg", ".ico", ".cur",
-                ".tga", ".pbm", ".pgm", ".ppm", ".hdr",
-                ".psd", ".psb", ".xcf", ".heic", ".heif",
-                ".avif", ".jxl", ".flif", ".apng", ".mng",
-                ".raw", ".cr2", ".cr3", ".nef", ".arw", ".dng",
-                ".orf", ".rw2", ".pef", ".srw",
+                ".png",
+                ".jpg",
+                ".jpeg",
+                ".gif",
+                ".bmp",
+                ".webp",
+                ".tiff",
+                ".tif",
+                ".svg",
+                ".ico",
+                ".cur",
+                ".tga",
+                ".pbm",
+                ".pgm",
+                ".ppm",
+                ".hdr",
+                ".psd",
+                ".psb",
+                ".xcf",
+                ".heic",
+                ".heif",
+                ".avif",
+                ".jxl",
+                ".flif",
+                ".apng",
+                ".mng",
+                ".raw",
+                ".cr2",
+                ".cr3",
+                ".nef",
+                ".arw",
+                ".dng",
+                ".orf",
+                ".rw2",
+                ".pef",
+                ".srw",
             };
             if (image_exts.count(ext))
                 return FileType::Image;
 
             static const std::unordered_set<std::string> audio_exts = {
-                ".mp3", ".wav", ".ogg", ".flac", ".aac",
-                ".m4a", ".wma", ".opus", ".aiff", ".ape",
-                ".alac", ".wv", ".mid", ".midi",
+                ".mp3",
+                ".wav",
+                ".ogg",
+                ".flac",
+                ".aac",
+                ".m4a",
+                ".wma",
+                ".opus",
+                ".aiff",
+                ".ape",
+                ".alac",
+                ".wv",
+                ".mid",
+                ".midi",
             };
             if (audio_exts.count(ext))
                 return FileType::Audio;
 
             static const std::unordered_set<std::string> video_exts = {
-                ".mp4", ".avi", ".mkv", ".mov", ".wmv",
-                ".flv", ".webm", ".m4v", ".mpg", ".mpeg",
-                ".3gp", ".ogv", ".ts", ".vob",
+                ".mp4",
+                ".avi",
+                ".mkv",
+                ".mov",
+                ".wmv",
+                ".flv",
+                ".webm",
+                ".m4v",
+                ".mpg",
+                ".mpeg",
+                ".3gp",
+                ".ogv",
+                ".ts",
+                ".vob",
             };
             if (video_exts.count(ext))
                 return FileType::Video;
 
             static const std::unordered_set<std::string> doc_exts = {
-                ".pdf", ".docx", ".xlsx", ".pptx",
-                ".epub", ".mobi", ".djvu",
+                ".pdf",
+                ".docx",
+                ".xlsx",
+                ".pptx",
+                ".epub",
+                ".mobi",
+                ".djvu",
             };
             if (doc_exts.count(ext))
                 return FileType::Document;
@@ -1407,25 +1546,53 @@ namespace cell
         {
             std::string ext = to_lower(std::filesystem::path(path).extension().string());
             static const std::unordered_map<std::string, std::string> media_types = {
-                {".png", "image/png"}, {".jpg", "image/jpeg"}, {".jpeg", "image/jpeg"},
-                {".gif", "image/gif"}, {".bmp", "image/bmp"}, {".webp", "image/webp"},
-                {".tiff", "image/tiff"}, {".tif", "image/tiff"}, {".svg", "image/svg+xml"},
-                {".ico", "image/x-icon"}, {".psd", "image/vnd.adobe.photoshop"},
-                {".heic", "image/heic"}, {".heif", "image/heif"}, {".avif", "image/avif"},
-                {".jxl", "image/jxl"}, {".tga", "image/x-targa"},
-                {".raw", "image/x-raw"}, {".cr2", "image/x-canon-cr2"},
-                {".nef", "image/x-nikon-nef"}, {".arw", "image/x-sony-arw"},
+                {".png", "image/png"},
+                {".jpg", "image/jpeg"},
+                {".jpeg", "image/jpeg"},
+                {".gif", "image/gif"},
+                {".bmp", "image/bmp"},
+                {".webp", "image/webp"},
+                {".tiff", "image/tiff"},
+                {".tif", "image/tiff"},
+                {".svg", "image/svg+xml"},
+                {".ico", "image/x-icon"},
+                {".psd", "image/vnd.adobe.photoshop"},
+                {".heic", "image/heic"},
+                {".heif", "image/heif"},
+                {".avif", "image/avif"},
+                {".jxl", "image/jxl"},
+                {".tga", "image/x-targa"},
+                {".raw", "image/x-raw"},
+                {".cr2", "image/x-canon-cr2"},
+                {".nef", "image/x-nikon-nef"},
+                {".arw", "image/x-sony-arw"},
                 {".dng", "image/x-adobe-dng"},
-                {".mp3", "audio/mpeg"}, {".wav", "audio/wav"}, {".ogg", "audio/ogg"},
-                {".flac", "audio/flac"}, {".aac", "audio/aac"}, {".m4a", "audio/mp4"},
-                {".wma", "audio/x-ms-wma"}, {".opus", "audio/opus"},
-                {".aiff", "audio/aiff"}, {".mid", "audio/midi"}, {".midi", "audio/midi"},
-                {".mp4", "video/mp4"}, {".avi", "video/x-msvideo"}, {".mkv", "video/x-matroska"},
-                {".mov", "video/quicktime"}, {".wmv", "video/x-ms-wmv"},
-                {".flv", "video/x-flv"}, {".webm", "video/webm"}, {".m4v", "video/x-m4v"},
-                {".mpg", "video/mpeg"}, {".mpeg", "video/mpeg"}, {".3gp", "video/3gpp"},
-                {".ts", "video/mp2t"}, {".vob", "video/mpeg"},
-                {".pdf", "application/pdf"}, {".epub", "application/epub+zip"},
+                {".mp3", "audio/mpeg"},
+                {".wav", "audio/wav"},
+                {".ogg", "audio/ogg"},
+                {".flac", "audio/flac"},
+                {".aac", "audio/aac"},
+                {".m4a", "audio/mp4"},
+                {".wma", "audio/x-ms-wma"},
+                {".opus", "audio/opus"},
+                {".aiff", "audio/aiff"},
+                {".mid", "audio/midi"},
+                {".midi", "audio/midi"},
+                {".mp4", "video/mp4"},
+                {".avi", "video/x-msvideo"},
+                {".mkv", "video/x-matroska"},
+                {".mov", "video/quicktime"},
+                {".wmv", "video/x-ms-wmv"},
+                {".flv", "video/x-flv"},
+                {".webm", "video/webm"},
+                {".m4v", "video/x-m4v"},
+                {".mpg", "video/mpeg"},
+                {".mpeg", "video/mpeg"},
+                {".3gp", "video/3gpp"},
+                {".ts", "video/mp2t"},
+                {".vob", "video/mpeg"},
+                {".pdf", "application/pdf"},
+                {".epub", "application/epub+zip"},
                 {".docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"},
                 {".xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"},
                 {".pptx", "application/vnd.openxmlformats-officedocument.presentationml.presentation"},
@@ -1436,16 +1603,26 @@ namespace cell
 
         static std::string get_audio_format(const std::string &media_type)
         {
-            if (media_type == "audio/mpeg")  return "mp3";
-            if (media_type == "audio/wav")   return "wav";
-            if (media_type == "audio/ogg")   return "ogg";
-            if (media_type == "audio/flac")  return "flac";
-            if (media_type == "audio/aac")   return "aac";
-            if (media_type == "audio/mp4")   return "m4a";
-            if (media_type == "audio/x-ms-wma") return "wma";
-            if (media_type == "audio/opus")  return "opus";
-            if (media_type == "audio/aiff")  return "aiff";
-            if (media_type == "audio/midi")  return "midi";
+            if (media_type == "audio/mpeg")
+                return "mp3";
+            if (media_type == "audio/wav")
+                return "wav";
+            if (media_type == "audio/ogg")
+                return "ogg";
+            if (media_type == "audio/flac")
+                return "flac";
+            if (media_type == "audio/aac")
+                return "aac";
+            if (media_type == "audio/mp4")
+                return "m4a";
+            if (media_type == "audio/x-ms-wma")
+                return "wma";
+            if (media_type == "audio/opus")
+                return "opus";
+            if (media_type == "audio/aiff")
+                return "aiff";
+            if (media_type == "audio/midi")
+                return "midi";
             return "mp3";
         }
 
@@ -1535,9 +1712,28 @@ namespace cell
                 name.erase(sp); // "NUL " is still NUL
             lower_ascii(name);
             static constexpr std::string_view devices[] = {
-                "con", "prn", "aux", "nul",
-                "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8", "com9",
-                "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
+                "con",
+                "prn",
+                "aux",
+                "nul",
+                "com1",
+                "com2",
+                "com3",
+                "com4",
+                "com5",
+                "com6",
+                "com7",
+                "com8",
+                "com9",
+                "lpt1",
+                "lpt2",
+                "lpt3",
+                "lpt4",
+                "lpt5",
+                "lpt6",
+                "lpt7",
+                "lpt8",
+                "lpt9",
             };
             for (auto &d : devices)
                 if (name == d)
@@ -3444,9 +3640,15 @@ namespace cell
             cell::ContentBlock block;
             switch (file_type)
             {
-            case FileType::Image:  block.type = cell::ContentBlock::Type::InputImage;  break;
-            case FileType::Audio:  block.type = cell::ContentBlock::Type::InputAudio;  break;
-            default:               block.type = cell::ContentBlock::Type::InputImage;  break;
+            case FileType::Image:
+                block.type = cell::ContentBlock::Type::InputImage;
+                break;
+            case FileType::Audio:
+                block.type = cell::ContentBlock::Type::InputAudio;
+                break;
+            default:
+                block.type = cell::ContentBlock::Type::InputImage;
+                break;
             }
             block.data = std::move(b64);
             block.media_type = std::move(media_type);
@@ -3826,7 +4028,7 @@ namespace cell
                 }
             }
             if (search_trimmed_newline && !content_buf.empty() && content_buf.back() == '\n')
-                content_buf.pop_back(); // no newline there to replace
+                content_buf.pop_back();    // no newline there to replace
             size_t at = std::string::npos; // byte offset of the unique SEARCH block
             if (!search_buf.empty())
             {
@@ -7098,12 +7300,18 @@ namespace cell
         {
             switch (c)
             {
-            case '&': return "&amp;";
-            case '<': return "&lt;";
-            case '>': return "&gt;";
-            case '"': return "&quot;";
-            case '\'': return "&#39;";
-            default: return nullptr;
+            case '&':
+                return "&amp;";
+            case '<':
+                return "&lt;";
+            case '>':
+                return "&gt;";
+            case '"':
+                return "&quot;";
+            case '\'':
+                return "&#39;";
+            default:
+                return nullptr;
             }
         }
 
@@ -8667,8 +8875,8 @@ details{break-inside:avoid}
                 // as inactive, so there is exactly one write path (no unlink race
                 // against the background writer's pending writes)
                 async_io::submit(interrupt_file, interrupt_reason.empty()
-                                                      ? std::string()
-                                                      : nlohmann::json{{"reason", interrupt_reason}}.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace));
+                                                     ? std::string()
+                                                     : nlohmann::json{{"reason", interrupt_reason}}.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace));
             }
 
         public:
@@ -9456,13 +9664,13 @@ details{break-inside:avoid}
         constexpr size_t kMaxPendingFiles = 500;      // oldest pending notices are dropped beyond this
         constexpr size_t kSeenCapBytes = 1024 * 1024; // seen.jsonl is trimmed back to its tail beyond this
         constexpr size_t kSeenKeepLines = 200;
-        constexpr int kPollMillis = 700;              // cross-process pickup latency
+        constexpr int kPollMillis = 700; // cross-process pickup latency
 
         struct message
         {
             std::string id;
-            std::string from;      // sender label, e.g. "user", "teamwork/tw-X/worker_0"
-            std::string topic;     // free-form routing hint, e.g. "progress", "gate"
+            std::string from;  // sender label, e.g. "user", "teamwork/tw-X/worker_0"
+            std::string topic; // free-form routing hint, e.g. "progress", "gate"
             std::string body;
             long long created_at = 0;
         };
@@ -9783,7 +9991,7 @@ details{break-inside:avoid}
                 // bounded wait: cv for instant wake-ups, the deadline for the
                 // periodic folder re-scan (cross-process senders cannot notify)
                 wake_cv().wait_until(lk, std::min(deadline, std::chrono::steady_clock::now() +
-                                                                 std::chrono::milliseconds(kPollMillis)));
+                                                                std::chrono::milliseconds(kPollMillis)));
             }
         }
     } // namespace notice
@@ -9811,10 +10019,10 @@ details{break-inside:avoid}
         constexpr size_t kDefaultMaxChildren = 5;
         static constexpr size_t kMaxChildrenHardLimit = 100;
         static constexpr size_t kMaxRoundsPerWorker = 8;
-        static constexpr size_t kMaxReviewsPerWorker = 8;       // a child that keeps drawing the same rejection must not loop forever
-        static constexpr size_t kReviewSnippetChars = 4 * 1024; // how much of before/after the reviewer sees
-        static constexpr size_t kReviewReasonChars = 300;       // how much of the review comes back to the child
-        static constexpr size_t kReuseMaxMessages = 200;      // history cap when replaying a reused worker
+        static constexpr size_t kMaxReviewsPerWorker = 8;        // a child that keeps drawing the same rejection must not loop forever
+        static constexpr size_t kReviewSnippetChars = 4 * 1024;  // how much of before/after the reviewer sees
+        static constexpr size_t kReviewReasonChars = 300;        // how much of the review comes back to the child
+        static constexpr size_t kReuseMaxMessages = 200;         // history cap when replaying a reused worker
         static constexpr size_t kReportBulkCharLimit = 4 * 1024; // per-report cap in bulk listings
 
         // ---- tiny type-safe JSON accessors -----------------------------------
@@ -11020,7 +11228,7 @@ details{break-inside:avoid}
         };
 
         static void collect_tasks(bool all_cwds, const std::string &job_filter,
-                                 const std::string &worker_filter, std::vector<task_row> &out)
+                                  const std::string &worker_filter, std::vector<task_row> &out)
         {
             for (auto &p : all_store_paths(all_cwds))
             {
@@ -11077,8 +11285,7 @@ details{break-inside:avoid}
                       {
                           if (a.created_at != b.created_at)
                               return a.created_at > b.created_at;
-                          return a.job_id > b.job_id;
-                      });
+                          return a.job_id > b.job_id; });
         }
 
         static std::string format_task_rows(const std::vector<task_row> &rows, size_t limit)
@@ -11320,8 +11527,7 @@ details{break-inside:avoid}
                               return a.created_at > b.created_at;
                           if (a.job_id != b.job_id)
                               return a.job_id > b.job_id;
-                          return a.worker < b.worker;
-                      });
+                          return a.worker < b.worker; });
         }
 
         static bool get_report(const std::string &job_id, const std::string &worker, std::string &out)
@@ -11411,8 +11617,8 @@ details{break-inside:avoid}
         {
             bool found = false;
             std::string label;
-            nlohmann::json spec = nlohmann::json::object();          // referenced worker spec
-            nlohmann::json job_defaults = nlohmann::json::object();  // provider/model/think defaults
+            nlohmann::json spec = nlohmann::json::object();         // referenced worker spec
+            nlohmann::json job_defaults = nlohmann::json::object(); // provider/model/think defaults
             nlohmann::json messages = nlohmann::json::array();
             bool has_messages = false;
         };
@@ -11644,11 +11850,11 @@ details{break-inside:avoid}
         {
             std::string job_id, worker, task;
             std::string path;
-            std::string tool;    // write | edit
-            std::string rules;   // the constraint the main agent wrote for this child
-            std::string action;  // parameter summary of the requested change
-            std::string before;  // current content of the target (truncated)
-            std::string after;   // the content that would be written (truncated)
+            std::string tool;   // write | edit
+            std::string rules;  // the constraint the main agent wrote for this child
+            std::string action; // parameter summary of the requested change
+            std::string before; // current content of the target (truncated)
+            std::string after;  // the content that would be written (truncated)
         };
         struct edit_review_result
         {
@@ -11659,7 +11865,7 @@ details{break-inside:avoid}
 
         struct write_permit
         {
-            bool run = false;    // the tool may execute
+            bool run = false;      // the tool may execute
             bool reviewed = false; // true when a supervisor review decided it
             std::string reason;
         };
@@ -13335,7 +13541,7 @@ static std::pair<std::unordered_map<std::string, std::shared_ptr<cell::tools::to
                 return true;
             }
             // Text file: existing behavior
-                        cell::set_thread_local_tool_result(nullptr);
+            cell::set_thread_local_tool_result(nullptr);
             std::string err;
             if (!cell::box::read(path, out, 0, 0, true, num_arg(j, "offset", 0), num_arg(j, "limit", 0), &err))
             {
@@ -13444,18 +13650,17 @@ static std::pair<std::unordered_map<std::string, std::shared_ptr<cell::tools::to
             {"all", bool_prop("query every session of this working directory, not just the current one")},
             {"editable", {{"type", "array"}, {"description", "job-level default: existing files every child may modify"}}},
             {"edit_rules", str_prop("job-level default: the constraint such modifications are reviewed against (required whenever editable is given)")}};
-        add("tw",
-            "Manage Teamwork child-agent jobs — supervised child agents that run as a workflow of stages.\n"
-            "new: create a job. Either work-type=serial|parallel with list=[{works, editable?, edit_rules?, background?, provider?, model?, think?, reuse?}], or workflow={stages:[{name?, mode?, gate?, agents:[...]}]} for a multi-stage plan, or path=\"file.json\" to load the config (or a bare {stages:[...]}) from the working directory.\n"
-            "File access for children: they may always create NEW files (a file a child creates belongs to it). To let a child modify EXISTING files, list them in 'editable' together with 'edit_rules' (required) — the constraint every single modification is then reviewed against before it runs; a refused change comes back as the tool result with the reason so the child can correct it.\n"
-            "run: execute a job by id and return its consolidated report. Stages run in order; a gated stage pauses the job (status waiting) — run it again to resume after review. Progress is posted to the session notice queue (the notice tool / /notices wait idles token-free).\n"
-            "edit: replace the configuration of an uncompleted job.\n"
-            "remove: delete a pending/failed job.\n"
-            "reuse: create a new job from a previously executed child (from='tw-ID/worker_N').\n"
-            "list: list jobs (all=true also scans the other sessions of this working directory).\n"
-            "history: list past child-agent tasks with status, rounds, tool calls and model.\n"
-            "report: return one child's report (needs id + worker).\n"
-            "reports: return several child reports (id/worker are optional filters; limit/full control output).",
+        add("tw", "Manage Teamwork child-agent jobs — supervised child agents that run as a workflow of stages.\n"
+                  "new: create a job. Either work-type=serial|parallel with list=[{works, editable?, edit_rules?, background?, provider?, model?, think?, reuse?}], or workflow={stages:[{name?, mode?, gate?, agents:[...]}]} for a multi-stage plan, or path=\"file.json\" to load the config (or a bare {stages:[...]}) from the working directory.\n"
+                  "File access for children: they may always create NEW files (a file a child creates belongs to it). To let a child modify EXISTING files, list them in 'editable' together with 'edit_rules' (required) — the constraint every single modification is then reviewed against before it runs; a refused change comes back as the tool result with the reason so the child can correct it.\n"
+                  "run: execute a job by id and return its consolidated report. Stages run in order; a gated stage pauses the job (status waiting) — run it again to resume after review. Progress is posted to the session notice queue (the notice tool / /notices wait idles token-free).\n"
+                  "edit: replace the configuration of an uncompleted job.\n"
+                  "remove: delete a pending/failed job.\n"
+                  "reuse: create a new job from a previously executed child (from='tw-ID/worker_N').\n"
+                  "list: list jobs (all=true also scans the other sessions of this working directory).\n"
+                  "history: list past child-agent tasks with status, rounds, tool calls and model.\n"
+                  "report: return one child's report (needs id + worker).\n"
+                  "reports: return several child reports (id/worker are optional filters; limit/full control output).",
             props, {"operation"}, Policy::Ask, [](const nlohmann::json &j, std::string &out)
             {
                 std::string operation = j.value("operation", "");
@@ -14158,9 +14363,9 @@ static int run_selftest()
         R.expect(decoded == png, "read_multimodal base64 roundtrip matches original PNG");
 
         // Audio multimodal read
-        std::vector<uint8_t> wav = {'R','I','F','F', 0,0,0,0, 'W','A','V','E', 'f','m','t',' ',
-                                     0x10,0,0,0, 1,0,1,0, 0x44,0xAC,0,0, 0x88,0x58,1,0, 2,0,16,0, 'd','a','t','a',
-                                     0,0,0,0, 0,0};
+        std::vector<uint8_t> wav = {'R', 'I', 'F', 'F', 0, 0, 0, 0, 'W', 'A', 'V', 'E', 'f', 'm', 't', ' ',
+                                    0x10, 0, 0, 0, 1, 0, 1, 0, 0x44, 0xAC, 0, 0, 0x88, 0x58, 1, 0, 2, 0, 16, 0, 'd', 'a', 't', 'a',
+                                    0, 0, 0, 0, 0, 0};
         R.expect(write_bin("test.wav", wav), "multimodal fixture: write test.wav");
         cell::ToolResult audio_result;
         R.expect(cell::box::read_multimodal("test.wav", audio_result, 0, 0, true, &mm_err), "read_multimodal test.wav succeeds");
@@ -14170,7 +14375,7 @@ static int run_selftest()
         R.expect(audio_result.multimodal_blocks[0].type == cell::ContentBlock::Type::InputAudio, "audio block type is InputAudio");
 
         // Video returns metadata only (no base64)
-        std::vector<uint8_t> fake_video = {0,0,0,0x1C, 'f','t','y','p','i','s','o','m', 0,0,0,1, 'i','s','o','m'};
+        std::vector<uint8_t> fake_video = {0, 0, 0, 0x1C, 'f', 't', 'y', 'p', 'i', 's', 'o', 'm', 0, 0, 0, 1, 'i', 's', 'o', 'm'};
         R.expect(write_bin("test.mp4", fake_video), "multimodal fixture: write test.mp4");
         cell::ToolResult video_result;
         R.expect(cell::box::read_multimodal("test.mp4", video_result, 0, 0, true, &mm_err), "read_multimodal test.mp4 succeeds");
@@ -14178,7 +14383,7 @@ static int run_selftest()
         R.expect(video_result.multimodal_blocks.empty(), "read_multimodal video returns no multimodal blocks");
 
         // Document returns metadata only (no base64)
-        std::vector<uint8_t> fake_pdf = {'%','P','D','F','-','1','.','4'};
+        std::vector<uint8_t> fake_pdf = {'%', 'P', 'D', 'F', '-', '1', '.', '4'};
         R.expect(write_bin("test.pdf", fake_pdf), "multimodal fixture: write test.pdf");
         cell::ToolResult doc_result;
         R.expect(cell::box::read_multimodal("test.pdf", doc_result, 0, 0, true, &mm_err), "read_multimodal test.pdf succeeds");
@@ -14674,7 +14879,7 @@ static int run_selftest()
         // store round-trip: create, append, remove a child, query, delete
         std::string created;
         R.expect(tw::new_job(nlohmann::json{{"work-type", "serial"},
-                                           {"list", nlohmann::json::array({{{"works", "alpha"}}, {{"works", "beta"}}})}},
+                                            {"list", nlohmann::json::array({{{"works", "alpha"}}, {{"works", "beta"}}})}},
                              maxc, created),
                  "teamwork: new_job creates a job");
         nlohmann::json stored = tw::load_store();
@@ -14727,11 +14932,9 @@ static int run_selftest()
                                      {
                                          if (auto *j = tw::find_job(st, created))
                                              (*j)["summary_reports"]["worker_0"] = "merged while editing";
-                                         return true;
-                                     }),
+                                         return true; }),
                  "teamwork: edit fixture seeds a merged report");
-        R.expect(tw::edit_job(created, nlohmann::json{{"work-type", "serial"},
-                                                      {"list", nlohmann::json::array({{{"works", "edited"}}})}},
+        R.expect(tw::edit_job(created, nlohmann::json{{"work-type", "serial"}, {"list", nlohmann::json::array({{{"works", "edited"}}})}},
                               maxc, out),
                  "teamwork: edit_job updates a job");
         {
@@ -14747,11 +14950,9 @@ static int run_selftest()
                                      {
                                          if (auto *j = tw::find_job(st, created))
                                              (*j)["status"] = "running";
-                                         return true;
-                                     }),
+                                         return true; }),
                  "teamwork: edit fixture marked running");
-        R.expect(!tw::edit_job(created, nlohmann::json{{"work-type", "serial"},
-                                                       {"list", nlohmann::json::array({{{"works", "y"}}})}},
+        R.expect(!tw::edit_job(created, nlohmann::json{{"work-type", "serial"}, {"list", nlohmann::json::array({{{"works", "y"}}})}},
                                maxc, out) &&
                      out.find("running") != std::string::npos,
                  "teamwork: edit_job refuses a running job");
@@ -14759,8 +14960,7 @@ static int run_selftest()
                                      {
                                          if (auto *j = tw::find_job(st, created))
                                              (*j)["status"] = "pending";
-                                         return true;
-                                     }),
+                                         return true; }),
                  "teamwork: edit fixture reset to pending");
 
         R.expect(tw::remove_job(created, false, out), "teamwork: remove_job deletes the job");
@@ -14874,15 +15074,13 @@ static int run_selftest()
         wfc["provider"] = "wf-default";
         {
             nlohmann::json stages = nlohmann::json::array();
-            stages.push_back(nlohmann::json{{"name", "research"}, {"mode", "parallel"},
-                                            {"agents", nlohmann::json::array({
-                                                            nlohmann::json{{"works", "scan headers"}, {"provider", "p1"}},
-                                                            nlohmann::json{{"works", "scan sources"}},
-                                                        })}});
-            stages.push_back(nlohmann::json{{"name", "implement"}, {"gate", true}, {"think", "low"},
-                                            {"agents", nlohmann::json::array({
-                                                            nlohmann::json{{"works", "patch the code"}, {"reuse", "worker_0"}},
-                                                        })}});
+            stages.push_back(nlohmann::json{{"name", "research"}, {"mode", "parallel"}, {"agents", nlohmann::json::array({
+                                                                                                       nlohmann::json{{"works", "scan headers"}, {"provider", "p1"}},
+                                                                                                       nlohmann::json{{"works", "scan sources"}},
+                                                                                                   })}});
+            stages.push_back(nlohmann::json{{"name", "implement"}, {"gate", true}, {"think", "low"}, {"agents", nlohmann::json::array({
+                                                                                                                    nlohmann::json{{"works", "patch the code"}, {"reuse", "worker_0"}},
+                                                                                                                })}});
             wfc["workflow"] = nlohmann::json{{"name", "audit-fix"}, {"stages", stages}};
         }
         R.expect(tw::normalize_job(wfc, "tw-wf-1", maxc, job, err), "teamwork: workflow job normalizes");
@@ -14903,8 +15101,8 @@ static int run_selftest()
 
         // a bare reuse pointing at a LATER stage is rejected at normalize time
         nlohmann::json bad_wf = {{"workflow", {{"stages", nlohmann::json::array({
-                                      {{"agents", nlohmann::json::array({{{"works", "x"}, {"reuse", "worker_5"}}})}},
-                                  })}}}};
+                                                              {{"agents", nlohmann::json::array({{{"works", "x"}, {"reuse", "worker_5"}}})}},
+                                                          })}}}};
         R.expect(!tw::normalize_job(bad_wf, "tw-bad", maxc, job, err) && err.find("earlier stage") != std::string::npos,
                  "teamwork: reuse of a later-stage worker is rejected");
 
@@ -14957,7 +15155,7 @@ static int run_selftest()
         R.expect(probe_store.value("probe_a", 0) == 1 && probe_store.value("probe_b", 0) == 2,
                  "teamwork: sequential store mutations both survive (atomic RMW)");
         R.expect(!tw::mutate_store_at(tw::store_path(), [](nlohmann::json &st)
-                                     { st["aborted"] = true; return false; }),
+                                      { st["aborted"] = true; return false; }),
                  "teamwork: aborted mutation reports failure");
         R.expect(!tw::load_store().contains("aborted"), "teamwork: aborted mutation is not saved");
         R.expect(tw::mutate_store_at(tw::store_path(), [](nlohmann::json &st)
@@ -14981,8 +15179,7 @@ static int run_selftest()
                                                                return true;
                                                            });
                                        merged.store(i + 1, std::memory_order_release);
-                                   }
-                               });
+                                   } });
             std::vector<std::string> created;
             for (int i = 0; i < 150; i++)
             {
@@ -15012,7 +15209,7 @@ static int run_selftest()
         std::string rc_id;
         R.expect(tw::new_job(nlohmann::json{{"work-type", "serial"},
                                             {"list", nlohmann::json::array({{{"works", "x"}}})}},
-                            maxc, rc_id),
+                             maxc, rc_id),
                  "teamwork: recovery fixture job created");
         R.expect(tw::mutate_store_at(tw::store_path(), [&](nlohmann::json &st)
                                      {
@@ -15098,8 +15295,7 @@ static int run_selftest()
         std::thread waiter([&]
                            {
                                std::vector<nt::message> got;
-                               woke = nt::wait_for(5.0, "", "", got);
-                           });
+                               woke = nt::wait_for(5.0, "", "", got); });
         std::this_thread::sleep_for(std::chrono::milliseconds(60));
         nt::send_to("", "user", "", "wake up", nerr);
         waiter.join();
@@ -17147,15 +17343,15 @@ int main(int argc, char const *argv[])
         // process terminates. It runs in an ordinary thread context (see
         // sys::install_interrupt_handler), never inside a signal handler.
         cell::sys::arm_exit_hook([&]()
-        {
-            // an interrupt can land between an assistant's tool_calls and their
-            // results: repair the transcript before it is persisted
-            cell::chat::repair_tool_pairing(s->msg());
-            s->unload();
-            cfg.session_id = s->id();
-            cell::config::save(cfg);
-            cell::async_io::flush(); // persist queued writes before terminating
-        });
+                                 {
+                                     // an interrupt can land between an assistant's tool_calls and their
+                                     // results: repair the transcript before it is persisted
+                                     cell::chat::repair_tool_pairing(s->msg());
+                                     s->unload();
+                                     cfg.session_id = s->id();
+                                     cell::config::save(cfg);
+                                     cell::async_io::flush(); // persist queued writes before terminating
+                                 });
         bool running = true;
         while (running)
         {
@@ -17234,7 +17430,7 @@ int main(int argc, char const *argv[])
                         continue;
                     long long before = (long long)s->msg().size();
                     s->msg().clear();
-                    s->clear_interrupt(); // the transcript an interrupt could resume is gone
+                    s->clear_interrupt();        // the transcript an interrupt could resume is gone
                     cell::box::reset_read_log(); // context gone: recorded reads no longer apply
                     // clear teamwork: remove all job directories and the store file
                     {
@@ -19165,18 +19361,14 @@ int main(int argc, char const *argv[])
                                     {
                                         if (p->api_style == "openai-responses")
                                         {
-                                            content_array.push_back({
-                                                {"type", "input_image"},
-                                                {"image_url", "data:" + block.media_type + ";base64," + block.data},
-                                                {"detail", block.detail.empty() ? "low" : block.detail}
-                                            });
+                                            content_array.push_back({{"type", "input_image"},
+                                                                     {"image_url", "data:" + block.media_type + ";base64," + block.data},
+                                                                     {"detail", block.detail.empty() ? "low" : block.detail}});
                                         }
                                         else
                                         {
-                                            content_array.push_back({
-                                                {"type", "image_url"},
-                                                {"image_url", {{"url", "data:" + block.media_type + ";base64," + block.data}}}
-                                            });
+                                            content_array.push_back({{"type", "image_url"},
+                                                                     {"image_url", {{"url", "data:" + block.media_type + ";base64," + block.data}}}});
                                         }
                                     }
                                     else if (block.type == cell::ContentBlock::Type::InputAudio)
@@ -19184,18 +19376,14 @@ int main(int argc, char const *argv[])
                                         std::string format = cell::box::get_audio_format(block.media_type);
                                         if (p->api_style == "openai-responses")
                                         {
-                                            content_array.push_back({
-                                                {"type", "input_audio"},
-                                                {"data", block.data},
-                                                {"format", format}
-                                            });
+                                            content_array.push_back({{"type", "input_audio"},
+                                                                     {"data", block.data},
+                                                                     {"format", format}});
                                         }
                                         else
                                         {
-                                            content_array.push_back({
-                                                {"type", "input_audio"},
-                                                {"input_audio", {{"data", block.data}, {"format", format}}}
-                                            });
+                                            content_array.push_back({{"type", "input_audio"},
+                                                                     {"input_audio", {{"data", block.data}, {"format", format}}}});
                                         }
                                     }
                                 }
@@ -19235,25 +19423,13 @@ int main(int argc, char const *argv[])
                                 {
                                     if (block.type == cell::ContentBlock::Type::InputImage)
                                     {
-                                        content_array.push_back({
-                                            {"type", "image"},
-                                            {"source", {
-                                                {"type", "base64"},
-                                                {"media_type", block.media_type},
-                                                {"data", block.data}
-                                            }}
-                                        });
+                                        content_array.push_back({{"type", "image"},
+                                                                 {"source", {{"type", "base64"}, {"media_type", block.media_type}, {"data", block.data}}}});
                                     }
                                     else if (block.type == cell::ContentBlock::Type::InputAudio)
                                     {
-                                        content_array.push_back({
-                                            {"type", "audio"},
-                                            {"source", {
-                                                {"type", "base64"},
-                                                {"media_type", block.media_type},
-                                                {"data", block.data}
-                                            }}
-                                        });
+                                        content_array.push_back({{"type", "audio"},
+                                                                 {"source", {{"type", "base64"}, {"media_type", block.media_type}, {"data", block.data}}}});
                                     }
                                 }
                                 s->msg().push_back({{"role", "user"}, {"content", nlohmann::json::array({{{"type", "tool_result"}, {"tool_use_id", tc.value("id", "")}, {"content", content_array}}})}});
