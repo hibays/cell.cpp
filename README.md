@@ -146,7 +146,7 @@ exported 5 message(s) to cell-export-20260921-065306.html
 | 🔧 | **9 built-in tools** — `ls`, `read`, `write`, `edit`, `rg`, `exec`, `find`, `tw`, `notice` | `cell::box`, `cell::tools` |
 | 👥 | **Teamwork** — supervised child agents with configurable workflows (`tw` tool + `/teamworks`): named stages with per-stage dispatch mode, supervisor gates, same-job reuse, background runs with cooperative stops, a per-child provider/model/think level, reuse of earlier children (with or without replaying their transcript), queryable history & reports, and a **file lease** — per-child write grants plus mandatory review of every change they make to the file you granted | `cell::teamwork` |
 | 📣 | **Notices** — a token-free message bus between agent sessions: Teamwork children report progress, the supervisor idles in `/notices wait` and is woken instantly, all without a single LLM round-trip | `cell::notice` |
-| 🛡️ | **Three sandbox modes** — `read-only`, `edit-only`, `full-access`; credential/runtime files are off limits in every mode and `exec` is the only tool gated by a confirmation prompt | `cell::box::check_exec` |
+| 🛡️ | **Three sandbox modes** — `read-only`, `edit-only`, `full-access`; credential/runtime files are off limits in every mode (symlinks and Windows junctions that resolve into the runtime root are followed and blocked, including targets that do not exist yet) and `exec` is the only tool gated by a confirmation prompt | `cell::box::check_exec` |
 | 🧨 | **Prompt-injection sanitizer** — every `exec` result is scanned for command-override fingerprints, robust to homoglyphs, zero-width marks, punctuation-joined tokens and multi-line splits | `cell::box::sanitize_output` |
 | 🔐 | **Encrypted credential vault** — Argon2id key derivation + AES-256-GCM (XChaCha20-Poly1305 fallback), `sodium_malloc`/`sodium_memzero` secret buffers | `cell::encrypt` |
 | 💬 | **Per-directory sessions** — session ids embed a hash of the working directory; switching a session follows its cwd | `cell::chat` |
@@ -156,6 +156,7 @@ exported 5 message(s) to cell-export-20260921-065306.html
 | 🔎 | **Numbered reads** — `read` returns every line prefixed with a right-aligned line number, and `rg` groups hits as `=== file ===` + `line: content`, so the model can cite exact lines to `edit` | `cell::box` |
 | 📦 | **Skills** — Markdown files with YAML front matter under `.cell/skills/` (recursive, directory-style supported), injected as system messages | `cell::skills` |
 | 📊 | **Usage statistics** — per-model and per-session request/token/character counters with prompt-cache hit rate | `cell::stats` |
+| ⌨️ | **Shell-style line editing** — the prompt has cursor keys, input history (per session), Home/End/Delete, Ctrl+A/E/B/F/K/U/W; UTF-8 aware, raw mode only while a line is being typed | `cell::plat::read_line` |
 | ⚡ | **Async I/O** — session/config/stats writes are coalesced and flushed by one background thread; a dynamic worker pool runs read-only tool calls concurrently | `cell::async_io`, `cell::sys::thread_pool` |
 | 🖥️ | **Cross-platform** — Windows (Job Objects, `cmd.exe`, UTF-8 codepage, virtual terminal) and POSIX (`fork`/`exec`, `termios`); all OS-specific code is isolated in one namespace | `cell::plat` |
 | 🧪 | **Self-test** — a few hundred assertions covering the sandbox, editor, sanitizer, crypto, config, sessions, skills, stats and the tool registry | `--selftest` |
@@ -847,7 +848,9 @@ libsodium.
 ```
 cell::async_io   coalescing background file writer (submit / flush)
 cell::plat       OS shims: spawn_cmd (timeout + process-tree kill), is_tty, init_console,
-                 peek_key (Esc cancel), executable_dir, restore_console
+                 read_line (line editor: cursor keys, history, UTF-8 aware), decode_key,
+                 peek_key (Esc cancel), executable_dir, reparse_resolved_path
+                 (junction/symlink resolution via the OS), restore_console
 cell::text       zero-copy line generator, trim, BOM strip, display_safe / console_safe
 cell::box        the sandbox + every tool implementation: check_path / check / check_exec,
                  is_high_risk, sanitize_output, wrap_tool_output, truncate_output,
@@ -894,16 +897,48 @@ compacted once and retried immediately instead of burning a retry attempt (see
 
 - `>` prompt, `reply>` prefix for streamed answers; the reasoning stream is printed **dim**, the
   answer **plain**, tool results and their echo **cyan**.
+- **The prompt has line editing** (`cell::plat::read_line`): the terminal is raw only while a line is
+  being typed, every key below is the emacs/readline binding, and backspace/delete/cursor motion never
+  split a multi-byte character. Input history is per process, seeded from the current session's user
+  turns (so a resumed session can recall earlier prompts), capped at 200 entries.
+
+  | Key | Action |
+  | --- | --- |
+  | `←` `→` / `Ctrl+B` `Ctrl+F` | move one character |
+  | `Ctrl+←` `Ctrl+→` / `Alt+B` `Alt+F` | move one word |
+  | `Home` `End` / `Ctrl+A` `Ctrl+E` | line start / end |
+  | `↑` `↓` / `Ctrl+P` `Ctrl+N` | history back / forward (the draft is restored at the end) |
+  | `Alt+<` `Alt+>` | oldest / newest history entry |
+  | `Backspace` `Delete` `Ctrl+D` | delete before / at the cursor (`Ctrl+D` on an empty line exits) |
+  | `Ctrl+W` `Alt+Backspace` | kill the word before the cursor |
+  | `Alt+D` | kill to the end of the next word |
+  | `Ctrl+U` `Ctrl+K` | kill to the start / end of the line |
+  | `Ctrl+Y` | yank (paste) the last killed text |
+  | `Ctrl+T` | transpose the two characters around the cursor |
+  | `Ctrl+L` | clear the screen and redraw the line |
+  | `Enter` | submit |
+  | `Ctrl+C` | save and exit (see below) |
+  | `Esc` | cancel a running stream (not an editor key) |
+
+  All of it is decoded from the standard encodings — CSI (`\x1b[1;5D`), SS3/application-cursor
+  (`\x1bOD`), the meta pairs (`\x1bb`), and Windows scan codes — so the same bindings work in xterm,
+  tmux, the Linux console and the Windows console.
 - While waiting for the first token a `⏳ Ns` spinner is refreshed every 500 ms; afterwards a
   `~N tok` counter is refreshed on line boundaries.
 - **Esc** during a stream cancels it: the turn is recorded as *interrupted* — the partial reply
   (chain-of-thought and answer text as far as it got) stays in the transcript and `[cancelled]` is
   printed. See [Interruptions](#interruptions-and-reload). (Implemented by `cell::plat::peek_key`,
-  which temporarily puts stdin in raw mode.)
+  which temporarily puts stdin in raw mode; only a *lone* Esc cancels, so pressing an arrow key
+  during a stream no longer aborts the turn.)
 - **Ctrl+C** (and `SIGTERM`/`SIGHUP`/`SIGABRT` on Windows) runs the persistence hook — repair the tool
   transcript, save session, save config, flush async writes — restores the terminal and exits with the
-  signal number. The terminating signals are taken from a dedicated `sigwait` thread, so the
-  persistence code never runs inside an asynchronous signal handler. `SIGSEGV`/`SIGFPE`/`SIGILL`
+  signal number. At the prompt the editor handles Ctrl+C itself and leaves through the same path as
+  `/exit` (the session/config guard). The terminating signals are taken from a dedicated `sigwait`
+  thread, so the persistence code never runs inside an asynchronous signal handler; the process then
+  leaves with `_Exit`, deliberately skipping static destructors, because tearing those down while the
+  REPL, the async writer and worker threads are still alive is a heap race (it used to die with
+  "out of memory (operator new failed)" instead of exiting). A second Ctrl+C, or a 10 s watchdog,
+  forces the exit if the persistence path ever stalls. `SIGSEGV`/`SIGFPE`/`SIGILL`
   deliberately do **not** try to serialize state: they restore the default action and terminate.
 - Non-interactive mode (stdin is not a tty) reads all of stdin as one message, requires a configured
   provider, runs the agent loop once and exits.
@@ -957,7 +992,10 @@ cell --selftest
 ```
 
 Runs against a throwaway `.cell-selftest/` root (removed afterwards) and covers: high-risk and
-sandbox decisions in all three modes, path/traversal/symlink/credential blocking, the injection
+sandbox decisions in all three modes, path/traversal/symlink/credential blocking (including the
+`is_sensitive_path` rule set itself, POSIX symlinks — dangling ones included — and, on Windows, a
+`mklink /J` junction into the runtime root, since neither can be created through this toolchain's
+`std::filesystem`), the injection
 sanitizer (case, `\r`, zero-width, fullwidth, Cyrillic/Greek, accented, split-across-lines,
 punctuation-joined, paraphrases, oversized output), `wrap_tool_output` forgery resistance,
 read/write/`write_new`/`edit` (all five modes, ambiguity, partial-read coverage, no-ops),
@@ -969,7 +1007,10 @@ and buffer compaction, the lazy directory walker, thread-pool job accounting, lo
 round-trip and persistence, config save/load/migration/error handling, session grouping, `/new`
 semantics, the cwd index, load-time re-sanitization of exec results, interrupted turns (partial
 reply truncation, tool-call cancellation, the reason notice, and the persisted/cleared interrupt
-state), skill discovery (including
+state), the line editor (CSI/SS3/meta/key-code decoding for every bound key, word boundaries, UTF-8
+cursor stepping and display width, history dedup/cap, and the motion/kill/yank/transpose semantics of
+`line_buffer::apply`), skill discovery
+(including
 directory-style) and usage statistics. Prints `selftest OK` / `selftest FAILED`.
 
 ## Implementation notes

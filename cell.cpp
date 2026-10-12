@@ -379,6 +379,14 @@ namespace cell
     // =========================================================================
     //  plat — OS shims: the only place that knows about platform APIs.
     // =========================================================================
+    // The text namespace is defined further down, but the line editor needs its
+    // UTF-8 helpers now.
+    namespace text
+    {
+        static size_t utf8_prev(std::string_view s, size_t i);
+        static size_t utf8_next(std::string_view s, size_t i);
+        static size_t display_width(std::string_view s);
+    }
     namespace plat
     {
         // Spawn a command with timeout; captures stdout/stderr; exit_code=124 on timeout.
@@ -507,6 +515,15 @@ namespace cell
             }
             if (pid == 0)
             {
+                // The SIGINT/SIGTERM/SIGHUP block installed for the sigwait thread is
+                // inherited across fork + exec, which would make the child immune to
+                // Ctrl+C and to a plain kill: reset mask and dispositions first.
+                sigset_t empty;
+                sigemptyset(&empty);
+                sigprocmask(SIG_SETMASK, &empty, nullptr);
+                std::signal(SIGINT, SIG_DFL);
+                std::signal(SIGTERM, SIG_DFL);
+                std::signal(SIGHUP, SIG_DFL);
                 setpgid(0, 0); // own process group: the parent reaps the whole tree
                 close(fds_out[0]);
                 close(fds_err[0]);
@@ -802,14 +819,721 @@ namespace cell
             raw_noecho.c_cc[VMIN] = 0;
             raw_noecho.c_cc[VTIME] = 0;
             tcsetattr(fileno(stdin), TCSANOW, &raw_noecho);
-            int key = 0;
+            std::string seen;
             char ch{};
             while (read(fileno(stdin), &ch, 1) == 1)
-                if ((unsigned char)ch == 27)
-                    key = 27;
+                seen += ch;
             tcsetattr(fileno(stdin), TCSANOW, &raw);
-            return key;
+            // an escape *sequence* (arrow key, Home, ...) starts with the same
+            // byte as a bare Esc: only the lone byte is the cancel key, otherwise
+            // pressing Up during a stream would abort the turn
+            return seen == "\x1b" ? 27 : 0;
 #endif
+        }
+
+        // ---- readline-style line editor ---------------------------------------
+        // The REPL used to read with std::getline, so arrow keys arrived as raw
+        // escape bytes ("^[[A") and there was no history at all. This editor keeps
+        // the terminal raw while a line is being typed and implements the key set
+        // a shell user expects: motion (char/word/line), kill-yank editing, and
+        // history. Still single-line — no completion, and a line wider than the
+        // terminal redraws without wrapping.
+        enum class read_result
+        {
+            line,      // a full line was submitted (out)
+            eof,       // Ctrl+D on an empty line / stdin closed
+            interrupt, // Ctrl+C: discard the line; the caller decides (exit or deny)
+        };
+
+        // One decoded key; `text` carries the UTF-8 bytes of a typed character.
+        struct key_event
+        {
+            enum class key
+            {
+                none, insert, backspace, del, left, right, word_left, word_right,
+                home, end, up, down, enter, ctrl_c, ctrl_d,
+                kill_start, kill_end, kill_word_back, kill_word_fwd,
+                yank, transpose, clear_screen, hist_first, hist_last
+            };
+            key k = key::none;
+            std::string text;
+        };
+
+        // Decodes the first key in `buf`; returns the bytes it consumed, or 0 when
+        // `buf` holds only a partial sequence (the caller reads more and retries).
+        // Pure string handling, so the selftest covers it without a terminal.
+        // Recognized encodings: CSI ("\x1b[1;5C"), SS3 ("\x1bOA"), the meta pairs
+        // ("\x1bb") and the C0 control bytes.
+        inline size_t decode_key(std::string_view buf, key_event &ev)
+        {
+            if (buf.empty())
+                return 0;
+            ev = key_event{};
+            using k = key_event::key;
+            unsigned char c = (unsigned char)buf[0];
+            if (c == 0x1B)
+            {
+                // A lone ESC cannot be told apart from the start of a sequence until
+                // the input runs dry, so it stays "incomplete" here and the caller
+                // drops it on its timeout.
+                if (buf.size() < 2)
+                    return 0;
+                unsigned char c1 = (unsigned char)buf[1];
+                if (c1 == 0x1B)
+                    return 1; // ESC ESC: drop one, the next byte may start a sequence
+                if (c1 != '[' && c1 != 'O')
+                {
+                    // meta (Alt) pair: a single byte after ESC
+                    switch (c1)
+                    {
+                    case 'b': case 'B': ev.k = k::word_left; break;
+                    case 'f': case 'F': ev.k = k::word_right; break;
+                    case 'd': case 'D': ev.k = k::kill_word_fwd; break;
+                    case '<': ev.k = k::hist_first; break;
+                    case '>': ev.k = k::hist_last; break;
+                    case 0x7F: case 0x08: ev.k = k::kill_word_back; break; // Alt+Backspace
+                    default: ev.k = k::none; break;                        // unbound meta key: ignore the pair
+                    }
+                    return 2;
+                }
+                // parameter bytes ("3", "1;5", ...); the last number is the modifier
+                size_t params[4] = {0, 0, 0, 0};
+                size_t nparams = 0;
+                size_t i = 2;
+                size_t value = 0;
+                bool have = false;
+                while (i < buf.size())
+                {
+                    unsigned char d = (unsigned char)buf[i];
+                    if (d >= '0' && d <= '9')
+                    {
+                        value = value * 10 + (size_t)(d - '0');
+                        have = true;
+                        i++;
+                        continue;
+                    }
+                    if (d == ';')
+                    {
+                        if (have && nparams < 4)
+                            params[nparams++] = value;
+                        have = false;
+                        value = 0;
+                        i++;
+                        continue;
+                    }
+                    break; // the final byte
+                }
+                if (have && nparams < 4)
+                    params[nparams++] = value;
+                if (i >= buf.size())
+                    return 0; // the final byte has not arrived yet
+                size_t param = nparams ? params[0] : 0;
+                size_t mod = nparams > 1 ? params[nparams - 1] : 1;
+                bool word = mod >= 3; // Alt/Ctrl held; 2 is Shift only
+                switch ((unsigned char)buf[i])
+                {
+                case 'A': ev.k = k::up; break;
+                case 'B': ev.k = k::down; break;
+                case 'C': ev.k = word ? k::word_right : k::right; break;
+                case 'D': ev.k = word ? k::word_left : k::left; break;
+                case 'H': ev.k = k::home; break;
+                case 'F': ev.k = k::end; break;
+                case '~':
+                    switch (param)
+                    {
+                    case 1: case 7: ev.k = k::home; break;
+                    case 3: ev.k = word ? k::kill_word_fwd : k::del; break;
+                    case 4: case 8: ev.k = k::end; break;
+                    default: ev.k = k::none; break; // Insert / PgUp / PgDn / F-keys: not edited here
+                    }
+                    break;
+                default: ev.k = k::none; break;
+                }
+                return i + 1;
+            }
+            switch (c)
+            {
+            case 0x0D: case 0x0A: ev.k = k::enter; return 1;
+            case 0x7F: case 0x08: ev.k = k::backspace; return 1;
+            case 0x03: ev.k = k::ctrl_c; return 1;
+            case 0x04: ev.k = k::ctrl_d; return 1;
+            case 0x01: ev.k = k::home; return 1;           // Ctrl+A
+            case 0x05: ev.k = k::end; return 1;            // Ctrl+E
+            case 0x02: ev.k = k::left; return 1;           // Ctrl+B
+            case 0x06: ev.k = k::right; return 1;          // Ctrl+F
+            case 0x10: ev.k = k::up; return 1;             // Ctrl+P
+            case 0x0E: ev.k = k::down; return 1;           // Ctrl+N
+            case 0x0B: ev.k = k::kill_end; return 1;       // Ctrl+K
+            case 0x15: ev.k = k::kill_start; return 1;     // Ctrl+U
+            case 0x17: ev.k = k::kill_word_back; return 1; // Ctrl+W
+            case 0x19: ev.k = k::yank; return 1;           // Ctrl+Y
+            case 0x14: ev.k = k::transpose; return 1;      // Ctrl+T
+            case 0x0C: ev.k = k::clear_screen; return 1;   // Ctrl+L
+            default: break;
+            }
+            if (c < 0x20)
+                return 1; // other control keys (Ctrl+G, Ctrl+O, ...) are ignored
+            size_t n = c < 0x80 ? 1 : (c >= 0xF0 ? 4 : c >= 0xE0 ? 3 : c >= 0xC0 ? 2 : 1);
+            if (buf.size() < n)
+                return 0; // the rest of the code point is still in flight
+            for (size_t j = 1; j < n; j++)
+                if (((unsigned char)buf[j] & 0xC0) != 0x80)
+                    n = 1; // not valid UTF-8: treat the lead byte as one character
+            ev.k = k::insert;
+            ev.text = std::string(buf.substr(0, n));
+            return n;
+        }
+
+        // Word boundaries used by word motion and word kills. A word is a run of
+        // non-space bytes; the cursor and both results always sit on code-point
+        // boundaries (spaces are single bytes, so byte stepping back is safe).
+        inline size_t word_prev(std::string_view s, size_t pos)
+        {
+            if (pos > s.size())
+                pos = s.size();
+            while (pos > 0 && s[pos - 1] == ' ')
+                pos--;
+            while (pos > 0 && s[pos - 1] != ' ')
+                pos = cell::text::utf8_prev(s, pos);
+            return pos;
+        }
+        inline size_t word_next(std::string_view s, size_t pos)
+        {
+            while (pos < s.size() && s[pos] == ' ')
+                pos++;
+            while (pos < s.size() && s[pos] != ' ')
+                pos = cell::text::utf8_next(s, pos);
+            return pos;
+        }
+
+        // Input history: skip empty and immediately repeated lines, keep the cap.
+        inline void history_add(std::vector<std::string> &history, const std::string &line)
+        {
+            if (line.empty() || (!history.empty() && history.back() == line))
+                return;
+            history.push_back(line);
+            constexpr size_t kMaxHistory = 200;
+            if (history.size() > kMaxHistory)
+                history.erase(history.begin(), history.begin() + (history.size() - kMaxHistory));
+        }
+
+        // Editable line state for read_line. `apply` performs one key with no I/O,
+        // so the selftest can cover the editing semantics without a terminal.
+        struct line_buffer
+        {
+            std::string text;
+            size_t cursor = 0;
+            size_t hidx = 0;    // history index; == history.size() while not browsing
+            std::string saved;  // the draft stashed when history browsing starts
+            std::string killed; // last killed text (single-slot kill ring) for Ctrl+Y
+            bool clear_screen = false; // Ctrl+L: the caller repaints from a cleared screen
+            bool dirty = false; // an edit or cursor move happened: the caller redraws
+
+            // returns 0 = handled, 1 = submit, 2 = end of input, 3 = interrupt
+            int apply(const key_event &ev, const std::vector<std::string> &history)
+            {
+                dirty = false;
+                using k = key_event::key;
+                switch (ev.k)
+                {
+                case k::enter:
+                    return 1;
+                case k::ctrl_c:
+                    return 3;
+                case k::ctrl_d:
+                    if (text.empty())
+                        return 2;
+                    [[fallthrough]]; // non-empty: delete at the cursor, like Delete
+                case k::del:
+                    if (cursor < text.size())
+                    {
+                        text.erase(cursor, cell::text::utf8_next(text, cursor) - cursor);
+                        dirty = true;
+                    }
+                    break;
+                case k::insert:
+                    text.insert(cursor, ev.text);
+                    cursor += ev.text.size();
+                    dirty = true;
+                    break;
+                case k::backspace:
+                    if (cursor > 0)
+                    {
+                        size_t prev = cell::text::utf8_prev(text, cursor);
+                        text.erase(prev, cursor - prev);
+                        cursor = prev;
+                        dirty = true;
+                    }
+                    break;
+                case k::left:
+                    if (cursor > 0)
+                    {
+                        cursor = cell::text::utf8_prev(text, cursor);
+                        dirty = true;
+                    }
+                    break;
+                case k::right:
+                    if (cursor < text.size())
+                    {
+                        cursor = cell::text::utf8_next(text, cursor);
+                        dirty = true;
+                    }
+                    break;
+                case k::word_left:
+                {
+                    size_t p = word_prev(text, cursor);
+                    if (p != cursor)
+                    {
+                        cursor = p;
+                        dirty = true;
+                    }
+                    break;
+                }
+                case k::word_right:
+                {
+                    size_t p = word_next(text, cursor);
+                    if (p != cursor)
+                    {
+                        cursor = p;
+                        dirty = true;
+                    }
+                    break;
+                }
+                case k::home:
+                    if (cursor != 0)
+                    {
+                        cursor = 0;
+                        dirty = true;
+                    }
+                    break;
+                case k::end:
+                    if (cursor != text.size())
+                    {
+                        cursor = text.size();
+                        dirty = true;
+                    }
+                    break;
+                case k::kill_start:
+                    if (cursor != 0)
+                    {
+                        killed = text.substr(0, cursor);
+                        text.erase(0, cursor);
+                        cursor = 0;
+                        dirty = true;
+                    }
+                    break;
+                case k::kill_end:
+                    if (cursor < text.size())
+                    {
+                        killed = text.substr(cursor);
+                        text.erase(cursor);
+                        dirty = true;
+                    }
+                    break;
+                case k::kill_word_back:
+                {
+                    size_t p = word_prev(text, cursor);
+                    if (p != cursor)
+                    {
+                        killed = text.substr(p, cursor - p);
+                        text.erase(p, cursor - p);
+                        cursor = p;
+                        dirty = true;
+                    }
+                    break;
+                }
+                case k::kill_word_fwd:
+                {
+                    size_t q = word_next(text, cursor);
+                    if (q != cursor)
+                    {
+                        killed = text.substr(cursor, q - cursor);
+                        text.erase(cursor, q - cursor);
+                        dirty = true;
+                    }
+                    break;
+                }
+                case k::yank:
+                    if (!killed.empty())
+                    {
+                        text.insert(cursor, killed);
+                        cursor += killed.size();
+                        dirty = true;
+                    }
+                    break;
+                case k::transpose:
+                    if (text.size() >= 2)
+                    {
+                        if (cursor == 0)
+                            cursor = cell::text::utf8_next(text, 0); // nothing to the left: use the first two
+                        size_t left = cell::text::utf8_prev(text, cursor);
+                        if (cursor < text.size())
+                        {
+                            size_t right = cell::text::utf8_next(text, cursor);
+                            std::string a = text.substr(left, cursor - left);
+                            std::string b = text.substr(cursor, right - cursor);
+                            text.replace(left, right - left, b + a);
+                            cursor = right;
+                            dirty = true;
+                        }
+                        else if (left > 0)
+                        {
+                            // at the end: swap the last two code points, cursor stays
+                            size_t left2 = cell::text::utf8_prev(text, left);
+                            std::string a = text.substr(left2, left - left2);
+                            std::string b = text.substr(left);
+                            text.replace(left2, text.size() - left2, b + a);
+                            dirty = true;
+                        }
+                    }
+                    break;
+                case k::clear_screen:
+                    clear_screen = true;
+                    dirty = true;
+                    break;
+                case k::up:
+                    if (hidx > 0 && hidx <= history.size())
+                    {
+                        if (hidx == history.size())
+                            saved = text;
+                        hidx--;
+                        text = history[hidx];
+                        cursor = text.size();
+                        dirty = true;
+                    }
+                    break;
+                case k::down:
+                    if (hidx < history.size())
+                    {
+                        hidx++;
+                        text = hidx == history.size() ? saved : history[hidx];
+                        cursor = text.size();
+                        dirty = true;
+                    }
+                    break;
+                case k::hist_first:
+                    if (!history.empty() && hidx > 0)
+                    {
+                        if (hidx == history.size())
+                            saved = text;
+                        hidx = 0;
+                        text = history[hidx];
+                        cursor = text.size();
+                        dirty = true;
+                    }
+                    break;
+                case k::hist_last:
+                    if (hidx < history.size())
+                    {
+                        hidx = history.size();
+                        text = saved;
+                        cursor = text.size();
+                        dirty = true;
+                    }
+                    break;
+                case k::none:
+                    break;
+                }
+                return 0;
+            }
+        };
+
+        // Reads one line with line editing (cursor keys, history, UTF-8 aware).
+        // The prompt is printed here so a redraw can rewrite the whole line.
+        // Falls back to plain std::getline when stdin is not a terminal.
+        inline read_result read_line(const std::string &prompt, std::vector<std::string> &history, std::string &out)
+        {
+            out.clear();
+            if (!is_tty(stdin))
+            {
+                std::string line;
+                if (!std::getline(std::cin, line))
+                    return read_result::eof;
+                out = line;
+                return read_result::line;
+            }
+
+            // Raw console for the duration of the edit: per-key input, no echo, and
+            // Ctrl+C delivered as a byte so the editor (not a signal) decides what
+            // it means. The previous mode is restored on every exit path.
+            struct console_guard
+            {
+#ifdef _WIN32
+                HANDLE h = INVALID_HANDLE_VALUE;
+                DWORD saved = 0;
+                console_guard()
+                {
+                    h = GetStdHandle(STD_INPUT_HANDLE);
+                    if (h != INVALID_HANDLE_VALUE && GetConsoleMode(h, &saved))
+                    {
+                        DWORD mode = saved & ~(DWORD)(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_PROCESSED_INPUT);
+                        // VT input keeps the modifier bits of Ctrl/Alt+arrow (they
+                        // arrive as "\x1b[1;5D"); without it the scan-code path below
+                        // still covers the plain keys
+                        if (!SetConsoleMode(h, mode | ENABLE_VIRTUAL_TERMINAL_INPUT) && !SetConsoleMode(h, mode))
+                            h = INVALID_HANDLE_VALUE;
+                    }
+                    else
+                        h = INVALID_HANDLE_VALUE;
+                }
+                ~console_guard()
+                {
+                    if (h != INVALID_HANDLE_VALUE)
+                        SetConsoleMode(h, saved);
+                }
+                bool ok() const { return h != INVALID_HANDLE_VALUE; }
+#else
+                struct termios saved{};
+                bool active = false;
+                console_guard()
+                {
+                    if (tcgetattr(fileno(stdin), &saved) == 0)
+                    {
+                        struct termios raw = saved;
+                        raw.c_lflag &= ~(tcflag_t)(ICANON | ECHO | ISIG); // ISIG off: Ctrl+C is a byte
+                        raw.c_iflag &= ~(tcflag_t)IXON;                   // no Ctrl+S/Ctrl+Q freeze
+                        raw.c_cc[VMIN] = 1;
+                        raw.c_cc[VTIME] = 0;
+                        active = tcsetattr(fileno(stdin), TCSANOW, &raw) == 0;
+                    }
+                }
+                ~console_guard()
+                {
+                    if (active)
+                        tcsetattr(fileno(stdin), TCSANOW, &saved);
+                }
+                bool ok() const { return active; }
+#endif
+            } console;
+            if (!console.ok())
+            {
+                // the terminal refused raw mode: plain input beats a broken editor
+                std::string line;
+                if (!std::getline(std::cin, line))
+                    return read_result::eof;
+                out = line;
+                return read_result::line;
+            }
+
+            auto write_out = [](const std::string &s)
+            {
+                std::fwrite(s.data(), 1, s.size(), stdout);
+                std::fflush(stdout);
+            };
+
+            line_buffer lb;
+            lb.hidx = history.size();
+            std::string pending; // bytes received but not yet decoded
+            bool dirty = false;
+
+            auto redraw = [&]()
+            {
+                std::string s = "\r\x1b[K";
+                s += prompt;
+                s += lb.text;
+                size_t tail = cell::text::display_width(std::string_view(lb.text).substr(lb.cursor));
+                if (tail)
+                    s += std::format("\x1b[{}D", tail);
+                write_out(s);
+            };
+
+            // fills `pending`; 1 = bytes read, 0 = nothing within timeout, -1 = closed
+            auto read_more = [&](int timeout_ms) -> int
+            {
+#ifdef _WIN32
+                // _kbhit has no timeout, so poll it: a negative timeout means block
+                auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms < 0 ? 0 : timeout_ms);
+                for (;;)
+                {
+                    if (_kbhit())
+                        break;
+                    if (timeout_ms >= 0 && std::chrono::steady_clock::now() >= deadline)
+                        return 0;
+                    std::this_thread::sleep_for(std::chrono::milliseconds(timeout_ms < 0 ? 10 : 2));
+                }
+                auto utf8 = [](std::string &o, uint32_t cp)
+                {
+                    if (cp < 0x80)
+                        o += (char)cp;
+                    else if (cp < 0x800)
+                    {
+                        o += (char)(0xC0 | (cp >> 6));
+                        o += (char)(0x80 | (cp & 0x3F));
+                    }
+                    else if (cp < 0x10000)
+                    {
+                        o += (char)(0xE0 | (cp >> 12));
+                        o += (char)(0x80 | ((cp >> 6) & 0x3F));
+                        o += (char)(0x80 | (cp & 0x3F));
+                    }
+                    else
+                    {
+                        o += (char)(0xF0 | (cp >> 18));
+                        o += (char)(0x80 | ((cp >> 12) & 0x3F));
+                        o += (char)(0x80 | ((cp >> 6) & 0x3F));
+                        o += (char)(0x80 | (cp & 0x3F));
+                    }
+                };
+                wchar_t wc = _getwch();
+                if (wc == (wchar_t)-1) // _getwch error
+                    return -1;
+                // classic console: arrows/Home/End/Delete arrive as a 0xE0/0x00
+                // prefix plus a scan code; translate them to their VT form so the
+                // shared decoder above handles them
+                if (wc == 0xE0 || wc == 0x00)
+                {
+                    auto sc_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(50);
+                    while (!_kbhit() && std::chrono::steady_clock::now() < sc_deadline)
+                        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                    if (!_kbhit())
+                        return 1;
+                    switch ((int)_getwch())
+                    {
+                    case 72: pending += "\x1b[A"; break;
+                    case 80: pending += "\x1b[B"; break;
+                    case 77: pending += "\x1b[C"; break;
+                    case 75: pending += "\x1b[D"; break;
+                    case 71: pending += "\x1b[H"; break;
+                    case 79: pending += "\x1b[F"; break;
+                    case 83: pending += "\x1b[3~"; break;
+                    default: break;
+                    }
+                    return 1;
+                }
+                if (wc == 0x1B)
+                {
+                    // Esc, or the start of a VT sequence: the decoder decides, and a
+                    // lone Esc is dropped by the caller after its short wait
+                    pending += '\x1b';
+                    return 1;
+                }
+                if (wc == L'\r')
+                {
+                    pending += '\r';
+                    return 1;
+                }
+                if (wc < 0x20 || wc == 0x7F)
+                {
+                    pending += (char)wc;
+                    return 1;
+                }
+                uint32_t cp = (uint32_t)wc;
+                if (wc >= 0xD800 && wc <= 0xDBFF) // surrogate pair (rare non-BMP input)
+                {
+                    auto hi_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(50);
+                    while (!_kbhit() && std::chrono::steady_clock::now() < hi_deadline)
+                        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                    if (_kbhit())
+                    {
+                        wchar_t lo = _getwch();
+                        if (lo >= 0xDC00 && lo <= 0xDFFF)
+                            cp = 0x10000 + (((uint32_t)wc - 0xD800) << 10) + ((uint32_t)lo - 0xDC00);
+                    }
+                }
+                utf8(pending, cp);
+                return 1;
+#else
+                struct pollfd p{fileno(stdin), POLLIN, 0};
+                int pr = ::poll(&p, 1, timeout_ms);
+                if (pr < 0) // EINTR: nothing this instant, the caller retries
+                    return 0;
+                if (pr == 0)
+                    return 0;
+                char buf[32];
+                ssize_t n = ::read(fileno(stdin), buf, sizeof buf);
+                if (n < 0)
+                    return errno == EINTR ? 0 : -1;
+                if (n == 0)
+                    return -1; // tty closed
+                pending.append(buf, (size_t)n);
+                return 1;
+#endif
+            };
+
+            auto finish = [&](read_result r, bool newline) -> read_result
+            {
+                if (newline)
+                    write_out("\n");
+                if (r == read_result::line)
+                    history_add(history, lb.text);
+                out = lb.text;
+                return r;
+            };
+
+            write_out(prompt);
+            for (;;)
+            {
+                if (pending.empty())
+                {
+                    int r = read_more(-1);
+                    if (r < 0)
+                    {
+                        // stdin closed: like getline, a non-empty tail is still a line
+                        if (lb.text.empty())
+                            return finish(read_result::eof, false);
+                        return finish(read_result::line, true);
+                    }
+                    if (r == 0)
+                        continue; // Windows poll: nothing arrived yet
+                }
+                // decode everything already buffered before waiting for more: a
+                // keystroke must not pay for the timeout of a partial sequence
+                bool progress = false;
+                while (!pending.empty())
+                {
+                    key_event ev;
+                    size_t used = decode_key(pending, ev);
+                    if (used == 0)
+                        break; // sequence not complete yet
+                    progress = true;
+                    pending.erase(0, used);
+                    int res = lb.apply(ev, history);
+                    if (res == 1)
+                        return finish(read_result::line, true);
+                    if (res == 2)
+                        return finish(read_result::eof, true);
+                    if (res == 3)
+                    {
+                        write_out("^C");
+                        return finish(read_result::interrupt, true);
+                    }
+                    dirty = dirty || lb.dirty;
+                }
+                if (!progress)
+                {
+                    // a sequence that never completed: a stray Esc is dropped, any
+                    // other byte is kept as text so nothing typed is swallowed
+                    int r = read_more(30);
+                    if (r < 0)
+                    {
+                        if (lb.text.empty())
+                            return finish(read_result::eof, false);
+                        return finish(read_result::line, true);
+                    }
+                    if (r == 0)
+                    {
+                        if ((unsigned char)pending[0] == 0x1B)
+                            pending.erase(0, 1);
+                        else
+                        {
+                            lb.text.insert(lb.cursor, pending.substr(0, 1));
+                            lb.cursor += 1;
+                            pending.erase(0, 1);
+                            dirty = true;
+                        }
+                    }
+                }
+                if (dirty)
+                {
+                    dirty = false;
+                    if (lb.clear_screen)
+                    {
+                        lb.clear_screen = false;
+                        write_out("\x1b[2J\x1b[H"); // Ctrl+L: wipe the screen, redraw the prompt on top
+                    }
+                    redraw();
+                }
+            }
         }
 
         // Directory containing the cell executable.
@@ -837,6 +1561,101 @@ namespace cell
                 return std::filesystem::path(buf).parent_path();
             }
             return std::filesystem::current_path();
+#endif
+        }
+
+#ifdef _WIN32
+        // UTF-8 <-> UTF-16 for the Win32 *W APIs: the rest of the program speaks
+        // UTF-8, and a narrow (ANSI) conversion would mangle non-ASCII paths.
+        inline std::wstring utf8_to_wide(std::string_view s)
+        {
+            if (s.empty())
+                return {};
+            int n = MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), nullptr, 0);
+            if (n <= 0)
+                return {};
+            std::wstring w((size_t)n, L'\0');
+            MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), w.data(), n);
+            return w;
+        }
+        inline std::string wide_to_utf8(std::wstring_view w)
+        {
+            if (w.empty())
+                return {};
+            int n = WideCharToMultiByte(CP_UTF8, 0, w.data(), (int)w.size(), nullptr, 0, nullptr, nullptr);
+            if (n <= 0)
+                return {};
+            std::string s((size_t)n, '\0');
+            WideCharToMultiByte(CP_UTF8, 0, w.data(), (int)w.size(), s.data(), n, nullptr, nullptr);
+            return s;
+        }
+        // Where the OS really opens this path, with every reparse point (symlink,
+        // junction) followed; empty when it cannot be opened.
+        inline std::string final_path_of(const std::filesystem::path &p)
+        {
+            HANDLE h = CreateFileW(p.c_str(), 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                   nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+            if (h == INVALID_HANDLE_VALUE)
+                return {};
+            std::wstring buf(MAX_PATH, L'\0');
+            DWORD n = 0;
+            for (;;)
+            {
+                n = GetFinalPathNameByHandleW(h, buf.data(), (DWORD)buf.size(), FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+                if (n == 0)
+                {
+                    CloseHandle(h);
+                    return {};
+                }
+                if (n < buf.size()) // a too-small buffer reports the size it needs
+                    break;
+                buf.resize((size_t)n + 1);
+            }
+            CloseHandle(h);
+            buf.resize(n);
+            // drop the extended-length prefix the call adds ("\\?\C:\x" / "\\?\UNC\srv\s")
+            if (buf.rfind(L"\\\\?\\UNC\\", 0) == 0)
+                buf = L"\\\\" + buf.substr(8);
+            else if (buf.rfind(L"\\\\?\\", 0) == 0)
+                buf = buf.substr(4);
+            return wide_to_utf8(buf);
+        }
+#endif
+        // The real path a (possibly not yet existing) file would resolve to, with
+        // every reparse point followed: the longest existing prefix is resolved by
+        // the OS and the missing tail is appended unchanged, so "junction/new.json"
+        // is seen as the file it would really create. This exists because the
+        // MinGW/ucrt64 std::filesystem neither reports a junction as a symlink
+        // (is_symlink is false) nor canonicalizes one, so the sandbox has to ask
+        // the OS. Always empty on POSIX, where weakly_canonical plus the explicit
+        // link walk in box::is_sensitive_path already cover it.
+        inline std::string reparse_resolved_path(std::string_view path)
+        {
+#ifdef _WIN32
+            std::wstring w = utf8_to_wide(path);
+            if (w.empty())
+                return {};
+            std::filesystem::path p(w);
+            std::vector<std::filesystem::path> tail;
+            for (;;)
+            {
+                std::string real = final_path_of(p);
+                if (!real.empty())
+                {
+                    std::filesystem::path r(utf8_to_wide(real));
+                    for (auto it = tail.rbegin(); it != tail.rend(); ++it)
+                        r /= *it;
+                    return wide_to_utf8(r.wstring());
+                }
+                std::filesystem::path parent = p.parent_path();
+                if (parent.empty() || parent == p)
+                    return {};
+                tail.push_back(p.filename());
+                p = parent;
+            }
+#else
+            (void)path;
+            return {};
 #endif
         }
     } // namespace plat
@@ -1252,6 +2071,71 @@ namespace cell
             }
             return out;
         }
+
+        // Byte offset of the code point before / after `i`. Out-of-range indices
+        // clamp; a mid-sequence index walks back to its lead byte. Used by the
+        // line editor so cursor moves and deletes never split a UTF-8 sequence.
+        static size_t utf8_prev(std::string_view s, size_t i)
+        {
+            if (i > s.size())
+                i = s.size();
+            if (i == 0)
+                return 0;
+            i--;
+            while (i > 0 && ((unsigned char)s[i] & 0xC0) == 0x80)
+                i--;
+            return i;
+        }
+        static size_t utf8_next(std::string_view s, size_t i)
+        {
+            if (i >= s.size())
+                return s.size();
+            i++;
+            while (i < s.size() && ((unsigned char)s[i] & 0xC0) == 0x80)
+                i++;
+            return i;
+        }
+        // Terminal columns a string occupies: wide characters (CJK, Hangul,
+        // fullwidth forms, emoji) count 2, combining / zero-width marks 0,
+        // everything else printable 1. The line editor needs this to put the
+        // cursor back after a redraw (a byte count would drift on Chinese text).
+        static size_t display_width(std::string_view s)
+        {
+            size_t w = 0;
+            for (size_t i = 0; i < s.size();)
+            {
+                unsigned char c = (unsigned char)s[i];
+                uint32_t cp = c;
+                size_t n = 1;
+                if (c >= 0xF0) { cp = c & 0x07u; n = 4; }
+                else if (c >= 0xE0) { cp = c & 0x0Fu; n = 3; }
+                else if (c >= 0xC0) { cp = c & 0x1Fu; n = 2; }
+                for (size_t k = 1; k < n && i + k < s.size(); k++)
+                    cp = (cp << 6) | ((unsigned char)s[i + k] & 0x3Fu);
+                i += n;
+                if (cp < 0x20 || cp == 0x7F)
+                    continue; // control bytes are never echoed
+                if ((cp >= 0x0300 && cp <= 0x036F) || (cp >= 0x200B && cp <= 0x200F) || cp == 0xFE0F)
+                    continue; // combining marks / zero-width joiners
+                if ((cp >= 0x1100 && cp <= 0x115F) ||
+                    (cp >= 0x2E80 && cp <= 0x303E) ||
+                    (cp >= 0x3041 && cp <= 0x33FF) ||
+                    (cp >= 0x3400 && cp <= 0x4DBF) ||
+                    (cp >= 0x4E00 && cp <= 0x9FFF) ||
+                    (cp >= 0xA000 && cp <= 0xA4CF) ||
+                    (cp >= 0xAC00 && cp <= 0xD7A3) ||
+                    (cp >= 0xF900 && cp <= 0xFAFF) ||
+                    (cp >= 0xFE30 && cp <= 0xFE4F) ||
+                    (cp >= 0xFF00 && cp <= 0xFF60) ||
+                    (cp >= 0xFFE0 && cp <= 0xFFE6) ||
+                    (cp >= 0x1F300 && cp <= 0x1FAFF) ||
+                    (cp >= 0x20000 && cp <= 0x3FFFD))
+                    w += 2;
+                else
+                    w += 1;
+            }
+            return w;
+        }
     } // namespace text
 
     // =====================================================================
@@ -1630,31 +2514,21 @@ namespace cell
         //  multimodal — file type detection and media type mapping (end)
         // =====================================================================
 
-        // Check if path is sensitive (vault, credentials, etc.).
-        bool is_sensitive_path(std::string_view path)
+        // The sensitivity rules, applied to an already-normalized path: anything
+        // inside the runtime root (the read-only skills area excepted) plus the
+        // credential files below are off limits. Split out so the path itself and
+        // every symlink hop (see is_sensitive_path) run exactly the same test.
+        inline bool sensitive_normalized(std::string_view n, std::string_view root)
         {
-            static std::mutex rc_mx;
-            static std::filesystem::path rc_root;
-            static std::string rc_root_s;
-            std::string root_s;
-            {
-                std::lock_guard<std::mutex> lk(rc_mx);
-                if (rc_root != cell::root)
-                {
-                    rc_root = cell::root;
-                    rc_root_s = cell::normalize_path(cell::root.string());
-                }
-                root_s = rc_root_s;
-            }
-            std::string s = cell::normalize_path(path);
-            if (root_s.empty())
+            if (root.empty())
                 return false;
-            const std::string skills_prefix = root_s + "/skills";
+            std::string s(n);
+            const std::string skills_prefix = std::string(root) + "/skills";
             if (s.rfind(skills_prefix, 0) == 0)
                 return false;
             // component boundary: "/x/.celleta" must not count as being inside "/x/.cell"
-            if (s.rfind(root_s, 0) == 0 &&
-                (s.size() == root_s.size() || s[root_s.size()] == '/' || s[root_s.size()] == '\\'))
+            if (s.rfind(root, 0) == 0 &&
+                (s.size() == root.size() || s[root.size()] == '/' || s[root.size()] == '\\'))
                 return true;
             static constexpr std::string_view cred_files[] = {
                 "/.ssh/id_rsa",
@@ -1685,6 +2559,60 @@ namespace cell
                     if (after == s.size() || s[after] == '/' || s[after] == '\\')
                         return true;
                 }
+            }
+            return false;
+        }
+
+        // Check if path is sensitive (vault, credentials, etc.).
+        bool is_sensitive_path(std::string_view path)
+        {
+            static std::mutex rc_mx;
+            static std::filesystem::path rc_root;
+            static std::string rc_root_s;
+            std::string root_s;
+            {
+                std::lock_guard<std::mutex> lk(rc_mx);
+                if (rc_root != cell::root)
+                {
+                    rc_root = cell::root;
+                    rc_root_s = cell::normalize_path(cell::root.string());
+                }
+                root_s = rc_root_s;
+            }
+            if (root_s.empty())
+                return false;
+            if (sensitive_normalized(cell::normalize_path(path), root_s))
+                return true;
+            // Reparse points. On Windows this toolchain's is_symlink() does not
+            // report a junction and weakly_canonical() does not resolve one, so ask
+            // the OS where the path really leads; a not-yet-existing tail is
+            // resolved through its existing prefix, otherwise "junction/new.json"
+            // would slip past and create a file inside the runtime root. Empty on
+            // POSIX, where the link walk below covers everything.
+            std::string real = plat::reparse_resolved_path(path);
+            if (!real.empty() && sensitive_normalized(cell::normalize_path(real), root_s))
+                return true;
+            // Symlinks (POSIX, and Windows links this toolchain does see):
+            // normalize_path resolves them through weakly_canonical, which stops at
+            // a link whose target does not exist (status() fails on a dangling
+            // link) — and a dangling link into the runtime root is exactly how a
+            // write would *create* the sensitive file. Follow the remaining hops
+            // explicitly (bounded: a link cycle must not loop here).
+            std::filesystem::path probe(path);
+            for (int hop = 0; hop < 16; hop++)
+            {
+                std::error_code lec;
+                if (!std::filesystem::is_symlink(probe, lec) || lec)
+                    break;
+                std::error_code rec;
+                std::filesystem::path target = std::filesystem::read_symlink(probe, rec);
+                if (rec)
+                    break;
+                if (target.is_relative())
+                    target = probe.parent_path() / target;
+                if (sensitive_normalized(cell::normalize_path(target.string()), root_s))
+                    return true;
+                probe = target;
             }
             return false;
         }
@@ -4864,6 +5792,14 @@ namespace cell
             inline void run_exit_hook(int signum)
             {
                 logger::instance().error("core", std::format("Interruption caused by {} ({})", signal_name(signum), signum));
+                // The hook persists through the async writer and waits for it; a
+                // stuck write must not make an interrupt unresponsive, so force the
+                // exit if the graceful path takes too long.
+                std::thread([signum]()
+                            {
+                                std::this_thread::sleep_for(std::chrono::seconds(10));
+                                std::_Exit(signum); })
+                    .detach();
                 {
                     // arming/disarming is serialized with this lock, so the hook can
                     // never fire after main disarmed it (no use-after-free during
@@ -4873,7 +5809,16 @@ namespace cell
                         on_exit_signal();
                 }
                 plat::restore_console();
-                std::exit(signum);
+                logger::instance().flush();
+                std::fflush(nullptr);
+                // Deliberately NOT std::exit(): that would run static destructors in
+                // this (signal) thread while the REPL is still blocked on stdin and
+                // the worker / writer threads are still running, and the resulting
+                // race corrupted the heap — the exit then died with
+                // "out of memory (operator new failed)" instead of returning to the
+                // shell. Everything that must survive is already on disk (the hook
+                // plus the flushes above), so skip the teardown entirely.
+                std::_Exit(signum);
             }
         } // namespace detail
 
@@ -4895,11 +5840,12 @@ namespace cell
 #ifdef _WIN32
         // On Windows a "signal handler" runs on a thread the CRT creates, i.e. in
         // normal thread context, so the persistence hook is safe to call directly.
-        // The re-entrancy guard keeps a second Ctrl+C from running it twice.
+        // A second Ctrl+C (or a signal that lands while the hook is still saving)
+        // leaves immediately instead of being swallowed by the re-entrancy guard.
         inline void signal_handler(int signum)
         {
             if (detail::exit_hook_running.exchange(true))
-                return;
+                std::_Exit(signum);
             detail::pending_signal.store(signum, std::memory_order_relaxed);
             detail::run_exit_hook(signum);
         }
@@ -4946,8 +5892,10 @@ namespace cell
                                 int signum = 0;
                                 if (sigwait(&set, &signum) != 0)
                                     continue;
+                                // a second signal (or one that lands while the hook is
+                                // still saving) must not be swallowed: leave now
                                 if (detail::exit_hook_running.exchange(true))
-                                    continue;
+                                    std::_Exit(signum);
                                 detail::run_exit_hook(signum);
                             } })
                 .detach();
@@ -13395,6 +14343,13 @@ static void print_help()
     cell::sys::println("  /clear                      clear the current session context (keeps the session id)");
     cell::sys::println("  /new                        start a fresh session (old sessions are kept on disk)");
     cell::sys::println("  /exit | /quit               exit");
+    cell::sys::println("  keys (the prompt has line editing):");
+    cell::sys::println("    ←/→ or Ctrl+B/F move by character        Ctrl+←/→ or Alt+B/F move by word");
+    cell::sys::println("    Home/End or Ctrl+A/E jump to line ends   Backspace/Delete or Ctrl+D delete at the cursor");
+    cell::sys::println("    ↑/↓ or Ctrl+P/N walk the input history   Alt+< / Alt+> jump to the oldest / newest");
+    cell::sys::println("    Ctrl+W or Alt+Backspace kill word back   Alt+D kill word forward   Ctrl+U/K kill to start/end");
+    cell::sys::println("    Ctrl+Y yank the last kill   Ctrl+T transpose   Ctrl+L clear screen");
+    cell::sys::println("    Enter submit   Ctrl+C save & exit   Ctrl+D on an empty line exits   Esc cancels a running stream");
 }
 
 // parse tool arguments as JSON without throwing; false on any invalid input
@@ -14178,11 +15133,55 @@ static int run_selftest()
         R.expect(!cell::box::check_path(".docker/config.json"), "check_path blocks docker config");
         R.expect(!cell::box::check_path(".kube/config"), "check_path blocks kube config");
         R.expect(!cell::box::check_path(".m2/settings.xml"), "check_path blocks maven settings");
+        // symlinks (POSIX only: this toolchain cannot create links on Windows).
+        // A link into the runtime root must be blocked whether or not its target
+        // exists yet: the vault is created later in this run, and writing
+        // *through* a dangling link is exactly how the sensitive file would come
+        // into being.
         std::error_code sec;
         std::filesystem::create_symlink((cell::root / ".crypt").string(), "vault_symlink", sec);
         if (!sec)
             R.expect(!cell::box::check_path("vault_symlink"), "check_path resolves symlinks to sensitive targets");
         std::filesystem::remove("vault_symlink", sec);
+        sec.clear();
+        {
+            // the same check with a target that does exist (the resolution path)
+            std::filesystem::create_directories(cell::root, sec);
+            {
+                std::ofstream tgt(cell::root / "symlink-target.tmp");
+                tgt << "x";
+            }
+            std::filesystem::create_symlink((cell::root / "symlink-target.tmp").string(), "resolved_symlink", sec);
+            if (!sec)
+                R.expect(!cell::box::check_path("resolved_symlink"), "check_path blocks a symlink to an existing sensitive target");
+            std::filesystem::remove("resolved_symlink", sec);
+            std::filesystem::remove(cell::root / "symlink-target.tmp", sec);
+        }
+#ifdef _WIN32
+        // Windows junctions: creatable without admin rights, but this toolchain's
+        // std::filesystem can neither create one (create_symlink is unimplemented)
+        // nor recognize one (is_symlink is false), so the fixture shells out to
+        // mklink and the check must rely on the OS resolution.
+        {
+            std::error_code jec;
+            std::filesystem::remove("cell_junction", jec);
+            std::filesystem::create_directories(cell::root, jec);
+            std::string jout, jerr;
+            int jrc = -1;
+            bool launched = cell::plat::spawn_cmd("cmd /c mklink /J cell_junction " + cell::root.string(),
+                                                  10.0, jout, jrc, jerr);
+            if (launched && jrc == 0 && std::filesystem::exists("cell_junction", jec))
+            {
+                R.expect(!cell::box::check_path("cell_junction/logs/cell.log"),
+                         "sandbox: a junction into the runtime root is blocked");
+                R.expect(!cell::box::check_path("cell_junction/never-created.json"),
+                         "sandbox: a junction blocks a target that does not exist yet");
+                R.expect(cell::box::check_path("no_junction_here/whatever.txt"),
+                         "sandbox: an unrelated missing path is still allowed");
+            }
+            std::filesystem::remove("cell_junction", jec);
+        }
+#endif
     }
 
     // prompt-injection sanitizer
@@ -14224,6 +15223,216 @@ static int run_selftest()
         R.expect(cell::text::utf8_safe(bad_utf8, 4) == std::string("a\xE4\xB8\xAD"),
                  "utf8_safe keeps a complete sequence at the byte limit");
         R.expect(fixed_utf8.find('\xE4') != std::string::npos, "utf8_safe preserves valid multi-byte UTF-8");
+    }
+
+    // line editor internals: key decoding, UTF-8 cursor math, display width, history
+    {
+        using k = cell::plat::key_event::key;
+        auto decode = [](std::string_view b, size_t &used)
+        {
+            cell::plat::key_event ev;
+            used = cell::plat::decode_key(b, ev);
+            return ev;
+        };
+        size_t used = 0;
+        R.expect(decode("\x1b[A", used).k == k::up && used == 3, "decode_key: up arrow");
+        R.expect(decode("\x1b[B", used).k == k::down && used == 3, "decode_key: down arrow");
+        R.expect(decode("\x1b[C", used).k == k::right && used == 3, "decode_key: right arrow");
+        R.expect(decode("\x1b[D", used).k == k::left && used == 3, "decode_key: left arrow");
+        R.expect(decode("\x1b[H", used).k == k::home && used == 3, "decode_key: home");
+        R.expect(decode("\x1b[F", used).k == k::end && used == 3, "decode_key: end");
+        R.expect(decode("\x1b[1~", used).k == k::home && used == 4, "decode_key: home via 1~");
+        R.expect(decode("\x1b[4~", used).k == k::end && used == 4, "decode_key: end via 4~");
+        R.expect(decode("\x1b[3~", used).k == k::del && used == 4, "decode_key: delete");
+        R.expect(decode("\x1b[1;5C", used).k == k::word_right && used == 6, "decode_key: Ctrl+Right is word motion");
+        R.expect(decode("\x1b[1;5D", used).k == k::word_left && used == 6, "decode_key: Ctrl+Left is word motion");
+        R.expect(decode("\x1b[1;3C", used).k == k::word_right && used == 6, "decode_key: Alt+Right is word motion");
+        R.expect(decode("\x1b[1;2C", used).k == k::right && used == 6, "decode_key: Shift+Right stays a plain move");
+        R.expect(decode("\x1b[3;5~", used).k == k::kill_word_fwd && used == 6, "decode_key: Ctrl+Delete kills forward");
+        R.expect(decode("\x1bOA", used).k == k::up && used == 3, "decode_key: application-mode arrow");
+        R.expect(decode("\x1bOH", used).k == k::home && used == 3, "decode_key: application-mode home");
+        R.expect(decode("\x1b[2~", used).k == k::none && used == 4, "decode_key: Insert is ignored");
+        R.expect(decode("\x1b[5~", used).k == k::none && used == 4, "decode_key: page keys are ignored");
+        R.expect(decode("\x1b" "b", used).k == k::word_left && used == 2, "decode_key: Alt+B is word left");
+        R.expect(decode("\x1b" "f", used).k == k::word_right && used == 2, "decode_key: Alt+F is word right");
+        R.expect(decode("\x1b" "d", used).k == k::kill_word_fwd && used == 2, "decode_key: Alt+D kills the next word");
+        R.expect(decode("\x1b\x7f", used).k == k::kill_word_back && used == 2, "decode_key: Alt+Backspace kills the previous word");
+        R.expect(decode("\x1b<", used).k == k::hist_first && used == 2, "decode_key: Alt+< is the oldest entry");
+        R.expect(decode("\x1b>", used).k == k::hist_last && used == 2, "decode_key: Alt+> is the newest entry");
+        R.expect(decode("\x1bz", used).k == k::none && used == 2, "decode_key: unbound meta pairs are ignored");
+        R.expect(decode("\x1b\x1b[A", used).k == k::none && used == 1, "decode_key: ESC ESC drops one and keeps the rest");
+        used = 1;
+        R.expect(decode("\x1b[", used).k == k::none && used == 0, "decode_key: incomplete CSI waits for more bytes");
+        R.expect(decode("\x1b", used).k == k::none && used == 0, "decode_key: a bare Esc waits (dropped by the caller)");
+        R.expect(decode("\r", used).k == k::enter && used == 1, "decode_key: Enter");
+        R.expect(decode("\x7f", used).k == k::backspace && used == 1, "decode_key: backspace");
+        R.expect(decode("\x03", used).k == k::ctrl_c && used == 1, "decode_key: Ctrl+C");
+        R.expect(decode("\x04", used).k == k::ctrl_d && used == 1, "decode_key: Ctrl+D");
+        R.expect(decode("\x01", used).k == k::home && used == 1, "decode_key: Ctrl+A is home");
+        R.expect(decode("\x05", used).k == k::end && used == 1, "decode_key: Ctrl+E is end");
+        R.expect(decode("\x0b", used).k == k::kill_end && used == 1, "decode_key: Ctrl+K kills to the end");
+        R.expect(decode("\x15", used).k == k::kill_start && used == 1, "decode_key: Ctrl+U kills to the start");
+        R.expect(decode("\x17", used).k == k::kill_word_back && used == 1, "decode_key: Ctrl+W kills the previous word");
+        R.expect(decode("\x19", used).k == k::yank && used == 1, "decode_key: Ctrl+Y yanks");
+        R.expect(decode("\x14", used).k == k::transpose && used == 1, "decode_key: Ctrl+T transposes");
+        R.expect(decode("\x0c", used).k == k::clear_screen && used == 1, "decode_key: Ctrl+L clears the screen");
+        R.expect(decode("\x10", used).k == k::up && used == 1, "decode_key: Ctrl+P is history up");
+        R.expect(decode("\x0e", used).k == k::down && used == 1, "decode_key: Ctrl+N is history down");
+        R.expect(decode("\x07", used).k == k::none && used == 1, "decode_key: unbound control keys are ignored");
+        R.expect(decode("\x02", used).k == k::left && used == 1, "decode_key: Ctrl+B moves left");
+        R.expect(decode("\x06", used).k == k::right && used == 1, "decode_key: Ctrl+F moves right");
+        cell::plat::key_event ins = decode("\xE4\xB8\xADx", used);
+        R.expect(ins.k == k::insert && ins.text == std::string("\xE4\xB8\xAD") && used == 3,
+                 "decode_key: a CJK code point is one insert, the next char is untouched");
+        R.expect(decode("\xE4\xB8", used).text.empty() && used == 0, "decode_key: split UTF-8 waits for its tail");
+        R.expect(decode("ab", used).k == k::insert && used == 1, "decode_key: already-decoded keys leave the tail in place");
+
+        // word boundaries (shared by word motion and word kills)
+        R.expect(cell::plat::word_prev("one two", 7) == 4, "word_prev stops at the previous word");
+        R.expect(cell::plat::word_prev("one two", 4) == 0, "word_prev walks over the spaces in between");
+        R.expect(cell::plat::word_prev("one  ", 5) == 0, "word_prev skips trailing spaces");
+        R.expect(cell::plat::word_prev("abc", 0) == 0, "word_prev clamps at the start");
+        R.expect(cell::plat::word_next("one two", 0) == 3, "word_next stops at the end of the next word");
+        R.expect(cell::plat::word_next("one two", 3) == 7, "word_next skips the spaces in between");
+        R.expect(cell::plat::word_next("abc", 3) == 3, "word_next clamps at the end");
+        R.expect(cell::plat::word_next("\xE4\xB8\xAD x", 0) == 3, "word_next steps over a whole CJK code point");
+
+
+        std::string w = "a\xE4\xB8\xAD"
+                        "b"; // "a中b"
+        R.expect(cell::text::utf8_next(w, 0) == 1, "utf8_next steps over ASCII");
+        R.expect(cell::text::utf8_next(w, 1) == 4, "utf8_next steps over a 3-byte code point");
+        R.expect(cell::text::utf8_prev(w, 4) == 1, "utf8_prev steps back over a 3-byte code point");
+        R.expect(cell::text::utf8_prev(w, 0) == 0, "utf8_prev clamps at the start");
+        R.expect(cell::text::utf8_next(w, w.size()) == w.size(), "utf8_next clamps at the end");
+
+        R.expect(cell::text::display_width("abc") == 3, "display_width counts ASCII as one column");
+        R.expect(cell::text::display_width("a\xE4\xB8\xAD"
+                                           "b") == 4,
+                 "display_width counts CJK as two columns");
+        R.expect(cell::text::display_width("\xF0\x9F\x98\x80") == 2, "display_width counts emoji as two columns");
+        R.expect(cell::text::display_width("e\xCC\x81") == 1, "display_width counts combining marks as zero");
+        R.expect(cell::text::display_width("") == 0, "display_width of an empty string is zero");
+
+        std::vector<std::string> hist;
+        cell::plat::history_add(hist, "first");
+        cell::plat::history_add(hist, "first");
+        R.expect(hist.size() == 1, "history_add skips a repeated line");
+        cell::plat::history_add(hist, "");
+        R.expect(hist.size() == 1, "history_add skips an empty line");
+        cell::plat::history_add(hist, "second");
+        R.expect(hist.size() == 2 && hist.back() == "second", "history_add appends new lines");
+        for (int i = 0; i < 250; i++)
+            cell::plat::history_add(hist, std::format("cmd {}", i));
+        R.expect(hist.size() == 200, "history_add caps the history at 200 entries");
+        R.expect(hist.front() == "cmd 50" && hist.back() == "cmd 249", "history_add drops the oldest entries first");
+
+        // editing semantics (line_buffer::apply is pure, so it needs no terminal)
+        {
+            using ev_t = cell::plat::key_event;
+            cell::plat::line_buffer lb;
+            std::vector<std::string> h2;
+            cell::plat::history_add(h2, "older");
+            cell::plat::history_add(h2, "newer");
+            lb.hidx = h2.size();
+            auto press = [&](ev_t::key k, const std::string &txt = "")
+            {
+                ev_t e;
+                e.k = k;
+                e.text = txt;
+                return lb.apply(e, h2);
+            };
+            press(ev_t::key::insert, "ab");
+            R.expect(lb.text == "ab" && lb.cursor == 2, "line_buffer: typing inserts at the cursor");
+            press(ev_t::key::left);
+            press(ev_t::key::insert, "X");
+            R.expect(lb.text == "aXb" && lb.cursor == 2, "line_buffer: left + insert lands mid-line");
+            press(ev_t::key::backspace);
+            R.expect(lb.text == "ab" && lb.cursor == 1, "line_buffer: backspace removes before the cursor");
+            press(ev_t::key::del);
+            R.expect(lb.text == "a" && lb.cursor == 1, "line_buffer: delete removes at the cursor");
+            press(ev_t::key::insert, "\xE4\xB8\xAD"); // 中
+            R.expect(lb.text == "a\xE4\xB8\xAD" && lb.cursor == 4, "line_buffer: a CJK char is one insert");
+            press(ev_t::key::left);
+            R.expect(lb.cursor == 1, "line_buffer: left steps over a whole code point");
+            press(ev_t::key::end);
+            press(ev_t::key::backspace);
+            R.expect(lb.text == "a", "line_buffer: backspace never splits UTF-8");
+            press(ev_t::key::home);
+            press(ev_t::key::insert, "see ");
+            press(ev_t::key::kill_word_back);
+            R.expect(lb.text == "a" && lb.cursor == 0, "line_buffer: Ctrl+W kills the word before the cursor");
+            R.expect(lb.killed == "see ", "line_buffer: a kill fills the yank buffer");
+            press(ev_t::key::yank);
+            R.expect(lb.text == "see a" && lb.cursor == 4, "line_buffer: Ctrl+Y yanks the killed text back");
+            press(ev_t::key::kill_start);
+            R.expect(lb.text == "a" && lb.killed == "see ", "line_buffer: Ctrl+U also fills the yank buffer");
+            press(ev_t::key::end);
+            press(ev_t::key::insert, " one");
+            press(ev_t::key::kill_word_fwd);
+            R.expect(lb.text == "a one" && lb.cursor == 5, "line_buffer: Alt+D at the end of the line needs a next word");
+            press(ev_t::key::home);
+            press(ev_t::key::word_right);
+            R.expect(lb.cursor == 1, "line_buffer: word_right stops at the end of the first word");
+            press(ev_t::key::word_right);
+            R.expect(lb.cursor == 5, "line_buffer: word_right skips the spaces and the next word");
+            press(ev_t::key::word_left);
+            R.expect(lb.cursor == 2, "line_buffer: word_left jumps back to the word start");
+            press(ev_t::key::kill_word_fwd);
+            R.expect(lb.text == "a " && lb.killed == "one", "line_buffer: Alt+D kills to the end of the next word");
+            press(ev_t::key::yank);
+            R.expect(lb.text == "a one" && lb.cursor == 5, "line_buffer: yank restores what Alt+D killed");
+            press(ev_t::key::end);
+            press(ev_t::key::insert, " one two");
+            press(ev_t::key::kill_word_back);
+            R.expect(lb.text == "a one one " && lb.cursor == 10, "line_buffer: Ctrl+W stops at the previous space");
+            press(ev_t::key::kill_start);
+            R.expect(lb.text.empty() && lb.cursor == 0, "line_buffer: Ctrl+U kills to the start");
+            press(ev_t::key::insert, "keep clear");
+            press(ev_t::key::home);
+            press(ev_t::key::kill_end);
+            R.expect(lb.text.empty(), "line_buffer: Ctrl+K at the start clears the line");
+            press(ev_t::key::insert, "ab");
+            press(ev_t::key::home);
+            press(ev_t::key::right);
+            press(ev_t::key::transpose);
+            R.expect(lb.text == "ba" && lb.cursor == 2, "line_buffer: Ctrl+T swaps the characters around the cursor");
+            press(ev_t::key::end);
+            press(ev_t::key::transpose);
+            R.expect(lb.text == "ab" && lb.cursor == 2, "line_buffer: Ctrl+T at the end swaps the last two");
+            press(ev_t::key::insert, "\xE4\xB8\xAD"); // 中
+            press(ev_t::key::transpose);              // at the end: swaps the last two code points
+            R.expect(lb.text == "a\xE4\xB8\xAD"
+                                "b" && lb.cursor == 5,
+                     "line_buffer: Ctrl+T swaps whole code points, never bytes");
+            press(ev_t::key::clear_screen);
+            R.expect(lb.clear_screen, "line_buffer: Ctrl+L asks the caller to repaint");
+            lb.clear_screen = false;
+            R.expect(lb.text == "a\xE4\xB8\xAD"
+                                "b" && lb.cursor == 5,
+                     "line_buffer: Ctrl+L leaves the line and cursor alone");
+            press(ev_t::key::home);
+            press(ev_t::key::kill_end);
+            press(ev_t::key::up);
+            R.expect(lb.text == "newer" && lb.cursor == lb.text.size(), "line_buffer: up recalls the newest history entry");
+            press(ev_t::key::up);
+            R.expect(lb.text == "older", "line_buffer: up walks back through history");
+            press(ev_t::key::up);
+            R.expect(lb.text == "older", "line_buffer: up stops at the oldest entry");
+            press(ev_t::key::hist_first);
+            R.expect(lb.text == "older", "line_buffer: Alt+< stays at the oldest entry");
+            press(ev_t::key::hist_last);
+            R.expect(lb.text.empty(), "line_buffer: Alt+> jumps back to the draft");
+            press(ev_t::key::up);
+            press(ev_t::key::down);
+            R.expect(lb.text.empty(), "line_buffer: down returns to the stashed draft");
+            R.expect(press(ev_t::key::ctrl_d) == 2, "line_buffer: Ctrl+D on an empty line ends input");
+            press(ev_t::key::insert, "x");
+            press(ev_t::key::home);
+            R.expect(press(ev_t::key::ctrl_d) == 0 && lb.text.empty(), "line_buffer: Ctrl+D on text deletes instead of exiting");
+            R.expect(press(ev_t::key::ctrl_c) == 3, "line_buffer: Ctrl+C reports an interrupt");
+            R.expect(press(ev_t::key::enter) == 1, "line_buffer: Enter submits");
+        }
     }
 
     // sanitizer hardening: multi-line splits, word insertion, punctuation, homoglyphs, paraphrases
@@ -14744,6 +15953,16 @@ static int run_selftest()
         R.expect(!cell::box::is_sensitive_path("/home/u/.ssh/id_rsa_dir/x"),
                  "sensitive: name prefix is not a credential");
         R.expect(!cell::box::is_sensitive_path("/home/u/.ssh/id_rsa_backup"), "sensitive: suffixed file is not blocked");
+        // the rule set itself (also the test that every symlink hop runs)
+        R.expect(cell::box::sensitive_normalized("/x/.cell/config.json", "/x/.cell"), "sensitive rule: runtime root is off limits");
+        R.expect(cell::box::sensitive_normalized("/x/.cell", "/x/.cell"), "sensitive rule: the root path itself is off limits");
+        R.expect(!cell::box::sensitive_normalized("/x/.cell/skills/a.md", "/x/.cell"), "sensitive rule: skills stay readable");
+        R.expect(!cell::box::sensitive_normalized("/x/.celleta/c.json", "/x/.cell"), "sensitive rule: component boundary is respected");
+        R.expect(!cell::box::sensitive_normalized("/x/.cell2", "/x/.cell"), "sensitive rule: suffix is not the root");
+        R.expect(cell::box::sensitive_normalized("/home/u/.ssh/id_ed25519", "/x/.cell"), "sensitive rule: credential file");
+        R.expect(!cell::box::sensitive_normalized("/home/u/.ssh/id_rsa_backup", "/x/.cell"), "sensitive rule: credential suffix");
+        R.expect(!cell::box::sensitive_normalized("", "/x/.cell"), "sensitive rule: empty path");
+        R.expect(!cell::box::sensitive_normalized("/anything", ""), "sensitive rule: no root configured");
 
 #ifdef _WIN32
         // reserved DOS device names and alternate data streams
@@ -17333,6 +18552,18 @@ int main(int argc, char const *argv[])
             return 1;
         }
     }
+    // input history for the line editor, seeded from the transcript so prompts
+    // from earlier in this session (and from the previous run, which the session
+    // resumes) come back with the up arrow
+    std::vector<std::string> input_history;
+    if (interactive)
+        for (const auto &m : s->msg())
+            if (m.is_object() && m.value("role", "") == "user" && m.contains("content") && m["content"].is_string())
+            {
+                const std::string &c = m["content"].get_ref<const std::string &>();
+                if (c.size() <= 1024 && !c.empty() && c.find('\n') == std::string::npos && c[0] != '[' && c[0] != '<')
+                    cell::plat::history_add(input_history, c);
+            }
 
     // -------- phase: slash-command dispatcher (input starting with '/' is
     // handled locally and never sent to the model) --------
@@ -17358,9 +18589,16 @@ int main(int argc, char const *argv[])
             std::string input;
             if (interactive)
             {
-                cell::sys::print("> ");
-                if (!std::getline(std::cin, input))
+                cell::plat::read_result rr = cell::plat::read_line("> ", input_history, input);
+                if (rr == cell::plat::read_result::eof)
                     break;
+                if (rr == cell::plat::read_result::interrupt)
+                {
+                    // Ctrl+C at the prompt: leave through the same path as /exit,
+                    // so the guard below persists session + config as usual
+                    log.info("core", "interrupted at prompt (Ctrl+C)");
+                    break;
+                }
             }
             else
             {
