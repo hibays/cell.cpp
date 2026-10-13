@@ -1,0 +1,181 @@
+{
+  "version": 3,
+  "cmakeMinimumRequired": { "major": 3, "minor": 21, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release"
+      }
+    },
+    {
+      "name": "default",
+      "displayName": "Release — CLI + shared library (Ninja)",
+      "description": "Everyday build: cell executable, cell.dll/.so/.dylib, tests enabled.",
+      "inherits": "base",
+      "generator": "Ninja"
+    },
+    {
+      "name": "debug",
+      "displayName": "Debug (Ninja)",
+      "inherits": "base",
+      "generator": "Ninja",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug" }
+    },
+    {
+      "name": "ci",
+      "displayName": "CI — Release, warnings as errors, tests",
+      "description": "What .github/workflows/ci.yml runs on every platform.",
+      "inherits": "default",
+      "cacheVariables": {
+        "CELL_WARNINGS_AS_ERRORS": "ON",
+        "CELL_BUILD_STATIC": "ON"
+      }
+    },
+    {
+      "name": "asan",
+      "displayName": "Debug — AddressSanitizer + UBSan",
+      "description": "Development hardening preset. Needs a toolchain that ships libasan/libubsan (GCC/Clang on Linux/macOS) or MSVC (/fsanitize=address); the configure step refuses with guidance when the runtime is missing (e.g. MSYS2 UCRT64).",
+      "inherits": "base",
+      "generator": "Ninja",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CELL_ENABLE_ASAN": "ON"
+      }
+    },
+    {
+      "name": "release-lto",
+      "displayName": "Release — interprocedural optimization",
+      "description": "Packaging preset: LTO enabled, static library also built.",
+      "inherits": "default",
+      "cacheVariables": {
+        "CELL_ENABLE_LTO": "ON",
+        "CELL_BUILD_STATIC": "ON"
+      }
+    },
+    {
+      "name": "desktop-dll",
+      "displayName": "Desktop embedding — DLL only",
+      "description": "Build just the shared library + header for a desktop front-end. Also builds the smoke test that proves the C ABI works.",
+      "inherits": "base",
+      "cacheVariables": {
+        "CELL_BUILD_CLI": "OFF",
+        "CELL_BUILD_SHARED": "ON",
+        "CELL_BUILD_STATIC": "OFF",
+        "CELL_BUILD_TESTS": "ON"
+      }
+    },
+    {
+      "name": "static-embed",
+      "displayName": "Embedding — static library only",
+      "description": "For desktop apps that prefer to link cell statically (no DLL to ship).",
+      "inherits": "base",
+      "cacheVariables": {
+        "CELL_BUILD_CLI": "OFF",
+        "CELL_BUILD_SHARED": "OFF",
+        "CELL_BUILD_STATIC": "ON"
+      }
+    },
+    {
+      "name": "windows-msvc",
+      "displayName": "Windows — Visual Studio 2022 (MSVC)",
+      "description": "Run from a Developer Command Prompt, or let the preset do it. Requires VS 2022 17.10+; vcpkg manifest installs the dependencies.",
+      "generator": "Visual Studio 17 2022",
+      "architecture": { "value": "x64", "strategy": "set" },
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "toolchainFile": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
+      "cacheVariables": {
+        "CELL_BUILD_STATIC": "ON"
+      },
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Windows"
+      }
+    },
+    {
+      "name": "windows-msys2-gcc",
+      "displayName": "Windows — MSYS2 UCRT64 GCC (Ninja)",
+      "description": "Run 'cmake --preset windows-msys2-gcc' from the MSYS2 UCRT64 shell (or after adding D:/.../msys64/ucrt64/bin to PATH).",
+      "inherits": "base",
+      "generator": "Ninja",
+      "cacheVariables": {
+        "CC": "gcc",
+        "CXX": "g++"
+      },
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Windows"
+      }
+    },
+    {
+      "name": "windows-msys2-clang",
+      "displayName": "Windows — MSYS2 UCRT64 Clang (Ninja)",
+      "inherits": "windows-msys2-gcc",
+      "cacheVariables": {
+        "CC": "clang",
+        "CXX": "clang++"
+      }
+    },
+    {
+      "name": "macos-clang",
+      "displayName": "macOS — AppleClang",
+      "description": "Xcode 16.3+ (libc++ with <generator>). Dependencies via: brew install libsodium nlohmann-json",
+      "inherits": "base",
+      "generator": "Ninja",
+      "cacheVariables": {
+        "CELL_BUILD_STATIC": "ON"
+      },
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Darwin"
+      }
+    },
+    {
+      "name": "linux-gcc",
+      "displayName": "Linux — GCC (Ninja)",
+      "description": "Needs gcc-14+; on Ubuntu 24.04: apt install g++-14 libcurl4-openssl-dev libsodium-dev nlohmann-json3-dev",
+      "inherits": "base",
+      "generator": "Ninja",
+      "cacheVariables": {
+        "CELL_BUILD_STATIC": "ON"
+      },
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Linux"
+      }
+    }
+  ],
+  "buildPresets": [
+    { "name": "default", "configurePreset": "default" },
+    { "name": "debug", "configurePreset": "debug" },
+    { "name": "ci", "configurePreset": "ci" },
+    { "name": "asan", "configurePreset": "asan" },
+    { "name": "release-lto", "configurePreset": "release-lto" },
+    { "name": "desktop-dll", "configurePreset": "desktop-dll" },
+    { "name": "static-embed", "configurePreset": "static-embed" },
+    { "name": "windows-msvc", "configurePreset": "windows-msvc", "configuration": "Release" },
+    { "name": "windows-msys2-gcc", "configurePreset": "windows-msys2-gcc" },
+    { "name": "windows-msys2-clang", "configurePreset": "windows-msys2-clang" },
+    { "name": "macos-clang", "configurePreset": "macos-clang" },
+    { "name": "linux-gcc", "configurePreset": "linux-gcc" }
+  ],
+  "testPresets": [
+    {
+      "name": "default",
+      "configurePreset": "default",
+      "output": { "outputOnFailure": true }
+    },
+    {
+      "name": "ci",
+      "configurePreset": "ci",
+      "output": { "outputOnFailure": true },
+      "execution": { "noTestsAction": "error" }
+    }
+  ]
+}

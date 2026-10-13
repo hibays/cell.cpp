@@ -41,6 +41,7 @@
 #include <curl/curl.h>
 #include <nlohmann/json.hpp>
 #include <sodium.h>
+#include <fcntl.h>
 #include <cerrno>
 #include <cstdint>
 #ifdef _WIN32
@@ -56,6 +57,48 @@
 #include <fcntl.h>
 #include <poll.h>
 #endif
+
+// -----------------------------------------------------------------------------
+//  Embedding surface — build-time switches for the library / shared (DLL) and
+//  static builds. The plain single-file build (`g++ cell.cpp -o cell`) defines
+//  none of these macros: CELL_API expands to nothing, main() is emitted, and
+//  the file stays fully self-contained.
+//    CELL_BUILD_SHARED : compiling cell.cpp *into* a shared library (exports)
+//    CELL_USE_SHARED   : consuming the shared library (imports on Windows)
+//    CELL_NO_MAIN      : suppress main() so the library can be linked into a
+//                        host executable that owns its own entry point
+// -----------------------------------------------------------------------------
+#ifndef CELL_API
+#if defined(_WIN32)
+#if defined(CELL_BUILD_SHARED)
+#define CELL_API __declspec(dllexport)
+#elif defined(CELL_USE_SHARED)
+#define CELL_API __declspec(dllimport)
+#else
+#define CELL_API
+#endif
+#else
+#if defined(CELL_BUILD_SHARED)
+#define CELL_API __attribute__((visibility("default")))
+#else
+#define CELL_API
+#endif
+#endif
+#endif
+
+// The build system injects the version as a string literal; a raw single-file
+// compile falls back to a dev marker.
+#ifndef CELL_VERSION
+#define CELL_VERSION "0.0.0-dev"
+#endif
+
+// Thrown instead of std::exit() by CLI argument validation: a host process that
+// embeds the library must never be killed by cell_main() seeing a bad argument
+// list. Converted back into an exit code at the cell_main() boundary.
+struct cell_cli_exit
+{
+    int code;
+};
 
 // Parse JSON number or quoted numeric string; returns fallback on missing/invalid.
 // Never throws and never returns a wrapped-around value: strtoull reports ERANGE
@@ -18619,10 +18662,11 @@ private:
 
 // =============================================================================
 //  main — CLI argument parsing and global setup; the session itself runs in
-//  repl::run() below.
+//  repl::run() below. The body lives in cell_main_impl() so the shared-library
+//  entry point (cell_main, see below) and the executable main() share it.
 // =============================================================================
 
-int main(int argc, char const *argv[])
+static int cell_main_impl(int argc, char const *argv[])
 {
     // -------- phase: argument parsing (config load, then CLI overrides) --------
     bool selftest = false;
@@ -18643,7 +18687,7 @@ int main(int argc, char const *argv[])
             if (i + 1 >= (size_t)argc)
             {
                 cell::sys::error("missing value for {}", name);
-                std::exit(1);
+                throw cell_cli_exit{1};
             }
             std::string v = argv[++i];
             // `--key --model foo` must report the missing value instead of
@@ -18652,7 +18696,7 @@ int main(int argc, char const *argv[])
             {
                 cell::sys::error("missing value for {}", name);
                 print_usage(argv[0]);
-                std::exit(1);
+                throw cell_cli_exit{1};
             }
             return v;
         };
@@ -18720,6 +18764,249 @@ int main(int argc, char const *argv[])
              std::move(model_arg), std::move(proxy_arg), std::move(key_arg));
     return app.run();
 }
+
+// =============================================================================
+//  Embedding entry points — the stable C surface of the library / DLL build.
+//  cell_main() runs the exact CLI code path; cell_version()/cell_selftest()
+//  expose build identity and the self-test suite; cell_run_oneshot() is a
+//  convenience wrapper for host processes (desktop front-ends, tests) that want
+//  one message -> reply without owning a terminal. All entry points serialize
+//  on a process-wide lock: the CLI touches process-global state (signal
+//  handlers, console mode, stdio, config root), so concurrent calls from
+//  several threads would interleave them.
+// =============================================================================
+
+namespace
+{
+    std::atomic<bool> cell_entry_busy{false};
+
+    struct cell_entry_lock
+    {
+        bool acquired = false;
+        cell_entry_lock() : acquired(!cell_entry_busy.exchange(true, std::memory_order_acq_rel)) {}
+        ~cell_entry_lock()
+        {
+            if (acquired)
+                cell_entry_busy.store(false, std::memory_order_release);
+        }
+        cell_entry_lock(const cell_entry_lock &) = delete;
+        cell_entry_lock &operator=(const cell_entry_lock &) = delete;
+    };
+} // namespace
+
+extern "C"
+{
+    // Run the full command-line interface in-process. Blocks until the session
+    // ends and returns the exit code the standalone binary would have returned.
+    // Unlike the process entry point this never calls std::exit() on bad
+    // arguments; it also keeps main() free (CELL_NO_MAIN) for library builds.
+    CELL_API int cell_main(int argc, char const *argv[])
+    {
+        if (argc < 0 || (argc > 0 && argv == nullptr))
+            return 1;
+        cell_entry_lock lock;
+        if (!lock.acquired)
+            return 2;
+        try
+        {
+            return cell_main_impl(argc, argv);
+        }
+        catch (const cell_cli_exit &e)
+        {
+            return e.code;
+        }
+        catch (const std::exception &e)
+        {
+            cell::sys::error("fatal: {}", e.what());
+            return 1;
+        }
+    }
+
+    // Build identity, e.g. "0.1.0" (injected by the build system) or
+    // "0.0.0-dev" for a raw single-file compile.
+    CELL_API const char *cell_version(void)
+    {
+        return CELL_VERSION;
+    }
+
+    // Run the built-in self-test suite; 0 = every test passed.
+    CELL_API int cell_selftest(void)
+    {
+        cell_entry_lock lock;
+        if (!lock.acquired)
+            return 2;
+        return run_selftest();
+    }
+
+    // One-shot convenience API: feed one user message to a full agent turn and
+    // hand back everything the CLI printed (stdout + stderr combined).
+    //   - blocks until the turn completes and never opens an interactive prompt
+    //   - stdin/stdout/stderr are redirected for the duration of the call, so
+    //     only invoke it from a thread the host controls exclusively (enforced
+    //     by the process-wide entry lock) and do not write to stdout from other
+    //     threads while it runs
+    //   - the agent runs against the *current working directory* (config root,
+    //     session store, skills, workspace); set the process cwd before calling
+    //   - Policy::Ask tool approvals are refused (stdin is not a terminal, the
+    //     sandbox fails closed): enable /autoallow for full-access runs, or use
+    //     cell_main() when interactive approvals are required
+    // Returns 0 = turn completed, 1 = the CLI reported an error, 2 = call
+    // rejected (busy / bad arguments), 3 = internal I/O failure.
+    // On 0 and 1, *reply receives a malloc'd NUL-terminated UTF-8 string that
+    // the caller owns (release with cell_free(); it is never NULL for 0/1).
+    // On 2 and 3, *reply may stay NULL.
+    CELL_API int cell_run_oneshot(const char *message, char **reply)
+    {
+        if (message == nullptr || reply == nullptr)
+            return 2;
+        *reply = nullptr;
+        cell_entry_lock lock;
+        if (!lock.acquired)
+            return 2;
+
+        std::error_code ec;
+        std::filesystem::path tmp = std::filesystem::temp_directory_path(ec);
+        if (ec)
+            return 3;
+        static std::atomic<unsigned long long> seq{0};
+        std::string stamp = std::to_string(static_cast<unsigned long long>(
+                                std::chrono::steady_clock::now().time_since_epoch().count())) +
+                            "-" + std::to_string(seq.fetch_add(1, std::memory_order_relaxed));
+        std::filesystem::path in_path = tmp / ("cell-oneshot-in-" + stamp + ".txt");
+        std::filesystem::path out_path = tmp / ("cell-oneshot-out-" + stamp + ".txt");
+        {
+            std::ofstream f(in_path, std::ios::binary);
+            if (!f)
+                return 3;
+            f.write(message, static_cast<std::streamsize>(std::strlen(message)));
+        }
+
+        // save the host's stdio, then point fd 0/1/2 at the scratch files at
+        // the descriptor level (deterministic, unlike freopen which may move a
+        // stream to a different descriptor on some C runtimes)
+        std::fflush(nullptr);
+#ifdef _WIN32
+        int saved_in = _dup(_fileno(stdin));
+        int saved_out = _dup(_fileno(stdout));
+        int saved_err = _dup(_fileno(stderr));
+        int fd_in = _open(in_path.string().c_str(), _O_RDONLY | _O_BINARY);
+        int fd_out = _open(out_path.string().c_str(), _O_WRONLY | _O_CREAT | _O_TRUNC | _O_BINARY, _S_IREAD | _S_IWRITE);
+        int fd_err = _open(out_path.string().c_str(), _O_WRONLY | _O_CREAT | _O_APPEND | _O_BINARY, _S_IREAD | _S_IWRITE);
+        const bool redir_ok = saved_in >= 0 && saved_out >= 0 && saved_err >= 0 && fd_in >= 0 && fd_out >= 0 && fd_err >= 0;
+        if (redir_ok)
+        {
+            _dup2(fd_in, _fileno(stdin));
+            _dup2(fd_out, _fileno(stdout));
+            _dup2(fd_err, _fileno(stderr));
+        }
+        if (fd_in >= 0)
+            _close(fd_in);
+        if (fd_out >= 0)
+            _close(fd_out);
+        if (fd_err >= 0)
+            _close(fd_err);
+#else
+        int saved_in = dup(fileno(stdin));
+        int saved_out = dup(fileno(stdout));
+        int saved_err = dup(fileno(stderr));
+        int fd_in = ::open(in_path.string().c_str(), O_RDONLY);
+        int fd_out = ::open(out_path.string().c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        int fd_err = ::open(out_path.string().c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
+        const bool redir_ok = saved_in >= 0 && saved_out >= 0 && saved_err >= 0 && fd_in >= 0 && fd_out >= 0 && fd_err >= 0;
+        if (redir_ok)
+        {
+            dup2(fd_in, fileno(stdin));
+            dup2(fd_out, fileno(stdout));
+            dup2(fd_err, fileno(stderr));
+        }
+        if (fd_in >= 0)
+            ::close(fd_in);
+        if (fd_out >= 0)
+            ::close(fd_out);
+        if (fd_err >= 0)
+            ::close(fd_err);
+#endif
+        std::clearerr(stdin);
+        std::clearerr(stdout);
+        std::clearerr(stderr);
+
+        int rc = 3;
+        if (redir_ok)
+        {
+            const char *argv[] = {"cell", "--no-color", nullptr};
+            rc = cell_main_impl(2, argv);
+            std::fflush(nullptr);
+        }
+
+        // restore the host's stdio before anything else can observe it
+#ifdef _WIN32
+        if (saved_out >= 0)
+            _dup2(saved_out, _fileno(stdout));
+        if (saved_err >= 0)
+            _dup2(saved_err, _fileno(stderr));
+        if (saved_in >= 0)
+            _dup2(saved_in, _fileno(stdin));
+        if (saved_in >= 0)
+            _close(saved_in);
+        if (saved_out >= 0)
+            _close(saved_out);
+        if (saved_err >= 0)
+            _close(saved_err);
+#else
+        if (saved_out >= 0)
+            dup2(saved_out, fileno(stdout));
+        if (saved_err >= 0)
+            dup2(saved_err, fileno(stderr));
+        if (saved_in >= 0)
+            dup2(saved_in, fileno(stdin));
+        if (saved_in >= 0)
+            ::close(saved_in);
+        if (saved_out >= 0)
+            ::close(saved_out);
+        if (saved_err >= 0)
+            ::close(saved_err);
+#endif
+        std::clearerr(stdin);
+        std::clearerr(stdout);
+        std::clearerr(stderr);
+
+        // hand the captured output back; the caller owns the buffer
+        std::string text;
+        {
+            std::ifstream f(out_path, std::ios::binary);
+            text.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+        }
+        char *buf = static_cast<char *>(std::malloc(text.size() + 1));
+        if (buf != nullptr)
+        {
+            std::memcpy(buf, text.c_str(), text.size() + 1);
+            *reply = buf;
+        }
+        else
+        {
+            rc = 3;
+        }
+        std::filesystem::remove(in_path, ec);
+        std::filesystem::remove(out_path, ec);
+        return rc;
+    }
+
+    // Release strings returned by cell_run_oneshot(). Lives in this library so
+    // the allocation and the free always use the same C runtime.
+    CELL_API void cell_free(void *ptr)
+    {
+        std::free(ptr);
+    }
+} // extern "C"
+
+#if !defined(CELL_NO_MAIN)
+// Process entry point for the executable build; the real work is shared with
+// the library entry point above.
+int main(int argc, char const *argv[])
+{
+    return cell_main(argc, argv);
+}
+#endif
 
 int repl::run()
 {

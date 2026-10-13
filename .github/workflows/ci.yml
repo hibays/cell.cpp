@@ -1,0 +1,164 @@
+# =============================================================================
+#  CI — build + test cell.cpp on every supported platform / toolchain
+#
+#  Jobs
+#    linux-gcc     Ubuntu 24.04 · GCC 14          (warnings-as-errors, static too)
+#    linux-asan    Ubuntu 24.04 · GCC 14          ASan + UBSan over the self-test
+#    windows-msvc  Windows Server 2022 · MSVC     via the preinstalled vcpkg (manifest)
+#    windows-msys2 Windows Server 2022 · GCC      MSYS2 UCRT64, pacman dependencies
+#    macos         macOS 15 · AppleClang          needs Xcode 16.3+ (libc++ <generator>)
+#
+#  Every job runs the same three steps: configure -> build -> ctest. The tests
+#  are the binary's built-in self-test suite plus the embedding smoke test that
+#  links the shared library through include/cell.h.
+# =============================================================================
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ---------------------------------------------------------------------------
+  linux-gcc:
+    name: Linux · GCC 14
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            ninja-build g++-14 \
+            libcurl4-openssl-dev libsodium-dev nlohmann-json3-dev
+
+      - name: Configure
+        run: >
+          cmake -S . -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_CXX_COMPILER=g++-14
+          -DCELL_BUILD_STATIC=ON
+          -DCELL_WARNINGS_AS_ERRORS=ON
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+  # ---------------------------------------------------------------------------
+  linux-asan:
+    name: Linux · ASan + UBSan
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            ninja-build g++-14 \
+            libcurl4-openssl-dev libsodium-dev nlohmann-json3-dev
+
+      - name: Configure
+        run: >
+          cmake -S . -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=Debug
+          -DCMAKE_CXX_COMPILER=g++-14
+          -DCELL_ENABLE_ASAN=ON
+          -DCELL_BUILD_CLI=ON -DCELL_BUILD_SHARED=ON
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Test (fail hard on the first sanitizer finding)
+        env:
+          # the agent keeps long-lived pools/handles alive on purpose; leak
+          # reporting is therefore off, memory errors and UB are not
+          ASAN_OPTIONS: detect_leaks=0:abort_on_error=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: ctest --test-dir build --output-on-failure
+
+  # ---------------------------------------------------------------------------
+  windows-msvc:
+    name: Windows · MSVC (vcpkg manifest)
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+
+      # The runner image ships vcpkg; the bundled vcpkg.json manifest installs
+      # curl / nlohmann-json / libsodium automatically during configure.
+      - name: Configure
+        shell: pwsh
+        run: >
+          cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+          -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
+          -DCELL_BUILD_STATIC=ON
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      - name: Test
+        run: ctest --test-dir build -C Release --output-on-failure
+
+  # ---------------------------------------------------------------------------
+  windows-msys2:
+    name: Windows · MSYS2 UCRT64 GCC
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-cmake
+            mingw-w64-ucrt-x86_64-ninja
+            mingw-w64-ucrt-x86_64-curl
+            mingw-w64-ucrt-x86_64-libsodium
+            mingw-w64-ucrt-x86_64-nlohmann-json
+
+      - name: Configure
+        shell: msys2 {0}
+        run: >
+          cmake -S . -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DCELL_BUILD_STATIC=ON
+
+      - name: Build
+        shell: msys2 {0}
+        run: cmake --build build --parallel
+
+      - name: Test
+        shell: msys2 {0}
+        run: ctest --test-dir build --output-on-failure
+
+  # ---------------------------------------------------------------------------
+  macos:
+    name: macOS · AppleClang
+    runs-on: macos-15 # ships Xcode 16.x; cell.cpp needs Xcode 16.3+ (libc++ <generator>)
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: brew install ninja libsodium nlohmann-json
+
+      - name: Configure
+        run: >
+          cmake -S . -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DCELL_BUILD_STATIC=ON
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure

@@ -1,0 +1,21 @@
+# =============================================================================
+#  cell — CMake package configuration (find_package(cell CONFIG))
+#
+#  Generated from cmake/cell-config.cmake.in by the CMake build. Imported
+#  targets provided to consumers:
+#
+#    cell::shared   — the shared library (cell.dll / libcell.so / libcell.dylib)
+#    cell::static   — the static library (when CELL_BUILD_STATIC=ON)
+#
+#  Both carry the include directory that holds cell.h, so a consumer only needs
+#
+#      find_package(cell CONFIG REQUIRED)
+#      target_link_libraries(app PRIVATE cell::shared)
+# =============================================================================
+@PACKAGE_INIT@
+
+@CELL_PACKAGE_DEPENDENCIES@
+
+include("${CMAKE_CURRENT_LIST_DIR}/cell-targets.cmake")
+
+check_required_components(cell)

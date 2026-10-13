@@ -1,0 +1,13 @@
+{
+  "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
+  "name": "cell-cpp",
+  "version-string": "0.1.0",
+  "description": "A single-file AI coding agent in modern C++26",
+  "homepage": "https://github.com/",
+  "license": "MIT",
+  "dependencies": [
+    "curl",
+    "nlohmann-json",
+    "libsodium"
+  ]
+}

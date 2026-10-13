@@ -1,0 +1,486 @@
+# =============================================================================
+#  cell.cpp — CMake build
+#
+#  Design goals (in order):
+#    1. Multi-platform   — Windows (MSVC / MinGW / Clang), Linux, macOS
+#    2. Multi-toolchain  — GCC, Clang, MSVC, AppleClang, MinGW; any generator
+#    3. CI-first         — non-interactive, hermetic options, ctest wired in
+#    4. Quick to adopt   — one configure+build command per platform; a vcpkg
+#                          manifest and CMakePresets.json ship in the repo
+#    5. Robust           — capability probes instead of version guessing,
+#                          clear failure messages, dependency fallback chains
+#
+#  Targets:
+#    cell          (CLI executable,      CELL_BUILD_CLI=ON,    default ON)
+#    cell::shared  (DLL / .so / .dylib,  CELL_BUILD_SHARED=ON, default ON)
+#    cell::static  (static library,      CELL_BUILD_STATIC=ON, default OFF)
+#
+#  The single-file contract stays intact: `g++ -std=c++26 -O2 cell.cpp -o cell
+#  -lcurl -lsodium` still works with no CMake involved. Everything below is an
+#  additive build harness (and the only place that defines CELL_* macros).
+# =============================================================================
+cmake_minimum_required(VERSION 3.21)
+
+project(cell
+    VERSION 0.1.0
+    DESCRIPTION "A single-file AI coding agent in modern C++26"
+    LANGUAGES CXX)
+
+list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
+
+# -----------------------------------------------------------------------------
+#  Options
+# -----------------------------------------------------------------------------
+option(CELL_BUILD_CLI            "Build the cell command-line executable"                    ON)
+option(CELL_BUILD_SHARED         "Build cell as a shared library (DLL / .so / .dylib)"       ON)
+option(CELL_BUILD_STATIC         "Build cell as a static library"                            OFF)
+option(CELL_BUILD_TESTS          "Register ctest tests (self-test + embedding smoke test)"   ON)
+option(CELL_INSTALL              "Generate install rules and a CMake package (find_package)" ON)
+option(CELL_FETCH_DEPS           "Allow fetching header-only deps when not installed"        ON)
+option(CELL_ENABLE_WARNINGS      "Enable the recommended warning set"                        ON)
+option(CELL_WARNINGS_AS_ERRORS   "Promote warnings to errors (recommended in CI)"            OFF)
+option(CELL_ENABLE_LTO           "Enable interprocedural optimization in Release"            OFF)
+option(CELL_ENABLE_ASAN          "Build with Address/UndefinedBehavior sanitizers"           OFF)
+option(CELL_TOOLCHAIN_CHECKS     "Probe the toolchain and fail fast when features are missing" ON)
+option(CELL_MINGW_STATIC_RUNTIME "MinGW: link libgcc/libstdc++ statically into the binaries" ON)
+
+set(CELL_CXX_STANDARD 26 CACHE STRING "C++ standard level (26 recommended; 23 on exotic toolchains)")
+
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+    set_property(CACHE CMAKE_BUILD_TYPE PROPERTY STRINGS Debug Release RelWithDebInfo MinSizeRel)
+endif()
+
+# -----------------------------------------------------------------------------
+#  C++ standard
+#
+#  CMake >= 3.30 knows "26" natively; older CMake (still common on LTS distros)
+#  does not, so the flag is injected directly there. Both paths end up with the
+#  same compiler flag, which the capability probe below then verifies for real.
+# -----------------------------------------------------------------------------
+if(MSVC)
+    set(CELL_CXX_FLAG "/std:c++latest") # MSVC spells C++26 "latest"
+else()
+    set(CELL_CXX_FLAG "-std=c++${CELL_CXX_STANDARD}")
+endif()
+
+if(CMAKE_VERSION VERSION_GREATER_EQUAL 3.30)
+    set(CMAKE_CXX_STANDARD ${CELL_CXX_STANDARD})
+    set(CMAKE_CXX_STANDARD_REQUIRED ON)
+    set(CMAKE_CXX_EXTENSIONS OFF)
+else()
+    message(STATUS "CMake ${CMAKE_VERSION} predates C++${CELL_CXX_STANDARD} support; injecting '${CELL_CXX_FLAG}' directly")
+    string(APPEND CMAKE_CXX_FLAGS " ${CELL_CXX_FLAG}")
+endif()
+
+# -----------------------------------------------------------------------------
+#  Toolchain capability probe
+#
+#  The authoritative check is a compile test of the exact standard-library
+#  features cell.cpp uses — version numbers are only used to produce friendlier
+#  messages beforehand (no false negatives from version heuristics).
+# -----------------------------------------------------------------------------
+if(CELL_TOOLCHAIN_CHECKS)
+    if(MSVC AND MSVC_VERSION LESS 1940)
+        message(WARNING
+            "MSVC ${MSVC_VERSION} detected; cell.cpp needs the C++23/26 library set of "
+            "Visual Studio 2022 17.10+ (recommended: 17.12+). The feature probe below is authoritative.")
+    elseif(GNU AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS 14)
+        message(WARNING
+            "GCC ${CMAKE_CXX_COMPILER_VERSION} detected; cell.cpp needs <generator>/<format>/"
+            "<expected> from GCC 14+ (recommended: 15+). The feature probe below is authoritative.")
+    elseif(Clang AND NOT AppleClang AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS 17)
+        message(WARNING
+            "Clang ${CMAKE_CXX_COMPILER_VERSION} detected; cell.cpp needs Clang 17+ with a "
+            "recent libstdc++/libc++ (recommended: 19+). The feature probe below is authoritative.")
+    elseif(AppleClang AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS 16)
+        message(WARNING
+            "AppleClang ${CMAKE_CXX_COMPILER_VERSION} detected; cell.cpp needs Xcode 16.3+ "
+            "(libc++ with <generator>). The feature probe below is authoritative.")
+    endif()
+
+    include(CheckCXXSourceCompiles)
+    set(_cell_saved_required_flags "${CMAKE_REQUIRED_FLAGS}")
+    set(CMAKE_REQUIRED_FLAGS "${CMAKE_REQUIRED_FLAGS} ${CELL_CXX_FLAG}")
+    check_cxx_source_compiles([[
+        #include <format>
+        #include <expected>
+        #include <generator>
+        #include <span>
+        #include <concepts>
+        #include <functional>
+        #include <string>
+        std::generator<int> cell_probe_generator() { co_yield 1; }
+        int main()
+        {
+            std::move_only_function<void(std::span<const char>)> fn = [](std::span<const char>) {};
+            std::expected<int, std::string> value = 1;
+            auto text = std::format("{}", value.value());
+            (void)text;
+            (void)fn;
+            return 0;
+        }
+    ]] CELL_STDLIB_HAS_REQUIRED_FEATURES)
+
+    # Known toolchain quirk, handled automatically: libstdc++ gates
+    # std::generator on __cpp_sized_deallocation, which GCC defines by default
+    # but Clang does not. Ask for it explicitly and re-probe.
+    if(NOT CELL_STDLIB_HAS_REQUIRED_FEATURES AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+        set(CMAKE_REQUIRED_FLAGS "${CMAKE_REQUIRED_FLAGS} -fsized-deallocation")
+        check_cxx_source_compiles([[
+            #include <format>
+            #include <expected>
+            #include <generator>
+            #include <span>
+            #include <concepts>
+            #include <functional>
+            #include <string>
+            std::generator<int> cell_probe_generator() { co_yield 1; }
+            int main()
+            {
+                std::move_only_function<void(std::span<const char>)> fn = [](std::span<const char>) {};
+                std::expected<int, std::string> value = 1;
+                auto text = std::format("{}", value.value());
+                (void)text;
+                (void)fn;
+                return 0;
+            }
+        ]] CELL_STDLIB_HAS_REQUIRED_FEATURES_CLANG_FLAG)
+        if(CELL_STDLIB_HAS_REQUIRED_FEATURES_CLANG_FLAG)
+            set(CELL_STDLIB_HAS_REQUIRED_FEATURES TRUE)
+            string(APPEND CMAKE_CXX_FLAGS " -fsized-deallocation")
+            message(STATUS "Clang needs -fsized-deallocation for libstdc++ <generator>; adding it")
+        endif()
+    endif()
+    set(CMAKE_REQUIRED_FLAGS "${_cell_saved_required_flags}")
+
+    if(NOT CELL_STDLIB_HAS_REQUIRED_FEATURES)
+        message(FATAL_ERROR
+            "The toolchain cannot compile the C++${CELL_CXX_STANDARD} standard library features cell.cpp requires "
+            "(<format>, <expected>, <generator>, <span>, <concepts>, std::move_only_function).\n"
+            "  Compiler: ${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION}\n"
+            "  Flag tried: ${CELL_CXX_FLAG}\n"
+            "Minimum known-good toolchains:\n"
+            "  * GCC 14+ (recommended 15+)          e.g. MSYS2 UCRT64, Ubuntu gcc-14\n"
+            "  * Clang 17+ with libstdc++ 14+       add -fsized-deallocation (libc++: 19+ for std::generator)\n"
+            "  * MSVC 19.40+ (VS 2022 17.10+)       /std:c++latest\n"
+            "  * AppleClang 16.3+ (Xcode 16.3+)     libc++\n"
+            "Set -DCELL_TOOLCHAIN_CHECKS=OFF to skip this probe and try anyway.")
+    endif()
+endif()
+
+# -----------------------------------------------------------------------------
+#  Compiler launcher (ccache / sccache) — keeps iterative and CI builds fast
+# -----------------------------------------------------------------------------
+if(NOT CMAKE_CXX_COMPILER_LAUNCHER)
+    find_program(CELL_CCACHE ccache)
+    find_program(CELL_SCCACHE sccache)
+    if(CELL_CCACHE)
+        set(CMAKE_CXX_COMPILER_LAUNCHER "${CELL_CCACHE}")
+        message(STATUS "Using ccache: ${CELL_CCACHE}")
+    elseif(CELL_SCCACHE)
+        set(CMAKE_CXX_COMPILER_LAUNCHER "${CELL_SCCACHE}")
+        message(STATUS "Using sccache: ${CELL_SCCACHE}")
+    endif()
+endif()
+
+# -----------------------------------------------------------------------------
+#  Dependencies: libcurl, libsodium, nlohmann/json (header-only)
+# -----------------------------------------------------------------------------
+find_package(Threads REQUIRED)
+
+# keep every artifact in one place: bin/ (runtime) and lib/ (link-time), which
+# also means Windows finds cell.dll next to the test binaries with no PATH work.
+# (must be set before any target is created so the targets inherit them)
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib")
+foreach(_cfg IN ITEMS DEBUG RELEASE RELWITHDEBINFO MINSIZEREL)
+    set(CMAKE_RUNTIME_OUTPUT_DIRECTORY_${_cfg} "${CMAKE_BINARY_DIR}/bin")
+    set(CMAKE_LIBRARY_OUTPUT_DIRECTORY_${_cfg} "${CMAKE_BINARY_DIR}/bin")
+    set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY_${_cfg} "${CMAKE_BINARY_DIR}/lib")
+endforeach()
+
+# ---- libcurl / libsodium / nlohmann-json ------------------------------------
+# Resolution logic lives in cmake/cell-deps.cmake because the installed package
+# config (cell-config.cmake) includes the very same module: a consumer of the
+# static library resolves identical targets.
+include(${CMAKE_CURRENT_LIST_DIR}/cmake/cell-deps.cmake)
+
+# the main build may additionally fetch the header-only json library
+if(NOT CELL_JSON AND CELL_FETCH_DEPS)
+    include(FetchContent)
+    message(STATUS "nlohmann/json not installed; fetching v3.12.0 (header-only)")
+    if(CMAKE_VERSION VERSION_GREATER_EQUAL 3.24)
+        FetchContent_Declare(nlohmann_json
+            URL https://github.com/nlohmann/json/releases/download/v3.12.0/json.tar.xz
+            DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+            FIND_PACKAGE_ARGS NAMES nlohmann_json)
+    else()
+        FetchContent_Declare(nlohmann_json
+            URL https://github.com/nlohmann/json/releases/download/v3.12.0/json.tar.xz)
+    endif()
+    FetchContent_MakeAvailable(nlohmann_json)
+    if(NOT TARGET nlohmann_json::nlohmann_json)
+        message(FATAL_ERROR "nlohmann/json fetch succeeded but the expected target is missing")
+    endif()
+    set(CELL_JSON nlohmann_json::nlohmann_json)
+endif()
+
+foreach(_dep IN ITEMS CELL_CURL CELL_SODIUM CELL_JSON)
+    if(NOT ${_dep})
+        message(FATAL_ERROR "${_dep} could not be resolved; see the messages above for install hints")
+    endif()
+endforeach()
+
+# -----------------------------------------------------------------------------
+#  Sanitizers (development / CI hardening)
+#
+#  Defined before any target so the directory-scoped compile/link options apply.
+#  Needs a toolchain that ships the sanitizer runtime: GCC/Clang on Linux and
+#  macOS, MSVC (/fsanitize=address) — some MinGW distributions (e.g. MSYS2
+#  UCRT64) do not ship libasan, so the option is a no-op-to-loud-error there.
+# -----------------------------------------------------------------------------
+if(CELL_ENABLE_ASAN)
+    if(MSVC)
+        set(_cell_asan_flags "/fsanitize=address")
+        set(_cell_asan_link_flags "/INCREMENTAL:NO")
+    else()
+        set(_cell_asan_flags "-fsanitize=address,undefined -fno-omit-frame-pointer -g")
+        set(_cell_asan_link_flags "-fsanitize=address,undefined")
+    endif()
+
+    # Probe the *link* step: a toolchain without the sanitizer runtime would
+    # otherwise fail later with hundreds of undefined __asan_* references.
+    include(CheckCXXSourceCompiles)
+    set(_cell_saved_required_flags "${CMAKE_REQUIRED_FLAGS}")
+    set(CMAKE_REQUIRED_FLAGS "${CMAKE_REQUIRED_FLAGS} ${_cell_asan_flags}")
+    check_cxx_source_compiles("int main() { return 0; }" CELL_TOOLCHAIN_SUPPORTS_SANITIZERS)
+    set(CMAKE_REQUIRED_FLAGS "${_cell_saved_required_flags}")
+
+    if(NOT CELL_TOOLCHAIN_SUPPORTS_SANITIZERS)
+        message(FATAL_ERROR
+            "CELL_ENABLE_ASAN=ON, but this toolchain cannot link the sanitizer runtime.\n"
+            "  Compiler: ${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION}\n"
+            "  Flags tried: ${_cell_asan_flags}\n"
+            "GCC/Clang on Linux and macOS ship libasan/libubsan; MSVC supports "
+            "/fsanitize=address; some MinGW distributions (e.g. MSYS2 UCRT64) do not "
+            "ship the sanitizer runtime at all.")
+    endif()
+
+    add_compile_options(${_cell_asan_flags})
+    add_link_options(${_cell_asan_link_flags})
+    message(STATUS "Sanitizers enabled (ASan + UBSan)")
+endif()
+
+# -----------------------------------------------------------------------------
+#  Shared target configuration
+# -----------------------------------------------------------------------------
+function(cell_configure_target target)
+    target_compile_definitions(${target} PRIVATE CELL_VERSION="${CELL_VERSION_STRING}")
+    target_link_libraries(${target} PRIVATE ${CELL_CURL} ${CELL_SODIUM} ${CELL_JSON} Threads::Threads)
+
+    if(CELL_ENABLE_WARNINGS)
+        if(MSVC)
+            target_compile_options(${target} PRIVATE /W4 /permissive-)
+        else()
+            target_compile_options(${target} PRIVATE -Wall -Wextra)
+        endif()
+    endif()
+    if(CELL_WARNINGS_AS_ERRORS)
+        if(MSVC)
+            target_compile_options(${target} PRIVATE /WX)
+        else()
+            target_compile_options(${target} PRIVATE -Werror)
+        endif()
+    endif()
+
+    if(MINGW AND CELL_MINGW_STATIC_RUNTIME)
+        # Ship a self-contained DLL/exe: no libstdc++-6.dll / libgcc_s_*.dll to
+        # copy next to the binary. (libwinpthread, curl and sodium still follow
+        # their own linkage; build those statically to go fully standalone.)
+        # Debug builds are excluded: the MinGW linker fails silently when a
+        # large debug object (tens of MB) is combined with libstdc++.a, and a
+        # development build wants the dynamic runtime anyway.
+        target_link_options(${target} PRIVATE
+            $<$<NOT:$<CONFIG:Debug>>:-static-libgcc>
+            $<$<NOT:$<CONFIG:Debug>>:-static-libstdc++>)
+    endif()
+
+    if(CELL_ENABLE_LTO)
+        set_target_properties(${target} PROPERTIES INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE)
+    endif()
+endfunction()
+
+set(CELL_VERSION_STRING "${PROJECT_VERSION}" CACHE STRING
+    "Version string compiled into cell_version(); CI may inject a tag or commit")
+
+# ---- shared library (DLL / .so / .dylib) ------------------------------------
+if(CELL_BUILD_SHARED)
+    add_library(cell_shared SHARED cell.cpp)
+    add_library(cell::shared ALIAS cell_shared)
+    target_compile_definitions(cell_shared PRIVATE CELL_BUILD_SHARED CELL_NO_MAIN)
+    # consumers import from the shared library (cell.h picks __declspec(dllimport))
+    target_compile_definitions(cell_shared INTERFACE CELL_USE_SHARED)
+    target_include_directories(cell_shared PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        $<INSTALL_INTERFACE:include>)
+    set_target_properties(cell_shared PROPERTIES
+        OUTPUT_NAME cell
+        EXPORT_NAME shared         # find_package consumers link cell::shared
+        POSITION_INDEPENDENT_CODE ON
+        CXX_VISIBILITY_PRESET hidden
+        VISIBILITY_INLINES_HIDDEN ON
+        SOVERSION ${PROJECT_VERSION_MAJOR}
+        VERSION ${PROJECT_VERSION})
+    if(WIN32)
+        # MinGW would otherwise emit libcell.dll; keep the name identical to the
+        # MSVC output so desktop integrators see one convention: cell.dll
+        set_target_properties(cell_shared PROPERTIES PREFIX "")
+    endif()
+    cell_configure_target(cell_shared)
+endif()
+
+# ---- static library ---------------------------------------------------------
+if(CELL_BUILD_STATIC)
+    add_library(cell_static STATIC cell.cpp)
+    add_library(cell::static ALIAS cell_static)
+    target_compile_definitions(cell_static PRIVATE CELL_NO_MAIN)
+    target_include_directories(cell_static PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        $<INSTALL_INTERFACE:include>)
+    if(MSVC)
+        # cell.lib is already the import library of the DLL; keep them apart
+        set_target_properties(cell_static PROPERTIES OUTPUT_NAME cell-static)
+    else()
+        set_target_properties(cell_static PROPERTIES OUTPUT_NAME cell)
+    endif()
+    set_target_properties(cell_static PROPERTIES
+        EXPORT_NAME static         # find_package consumers link cell::static
+        POSITION_INDEPENDENT_CODE ON)
+    cell_configure_target(cell_static)
+    # note: a STATIC library already records its PRIVATE link dependencies as
+    # $<LINK_ONLY:...> in its interface — nothing extra to add here
+endif()
+
+# ---- CLI executable ---------------------------------------------------------
+if(CELL_BUILD_CLI)
+    add_executable(cell_cli cell.cpp)
+    add_executable(cell::cli ALIAS cell_cli)
+    set_target_properties(cell_cli PROPERTIES OUTPUT_NAME cell)
+    cell_configure_target(cell_cli)
+endif()
+
+if(NOT CELL_BUILD_CLI AND NOT CELL_BUILD_SHARED AND NOT CELL_BUILD_STATIC)
+    message(FATAL_ERROR "Nothing to build: enable at least one of CELL_BUILD_CLI / CELL_BUILD_SHARED / CELL_BUILD_STATIC")
+endif()
+
+# -----------------------------------------------------------------------------
+#  Tests
+# -----------------------------------------------------------------------------
+if(CELL_BUILD_TESTS)
+    enable_testing()
+
+    if(CELL_BUILD_CLI)
+        # the built-in self-test suite, run in a scratch working directory so
+        # the test never touches the source tree
+        add_test(NAME cell.selftest COMMAND cell_cli --selftest)
+        set_tests_properties(cell.selftest PROPERTIES
+            WORKING_DIRECTORY "${CMAKE_BINARY_DIR}/ctest-selftest"
+            TIMEOUT 900)
+        file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/ctest-selftest")
+    endif()
+
+    if(CELL_BUILD_SHARED OR CELL_BUILD_STATIC)
+        add_executable(cell_smoke tests/smoke.cpp)
+        if(CELL_BUILD_SHARED)
+            target_link_libraries(cell_smoke PRIVATE cell_shared)
+        else()
+            target_link_libraries(cell_smoke PRIVATE cell_static)
+        endif()
+        add_test(NAME cell.embed_smoke COMMAND cell_smoke)
+        set_tests_properties(cell.embed_smoke PROPERTIES
+            WORKING_DIRECTORY "${CMAKE_BINARY_DIR}/ctest-smoke"
+            TIMEOUT 120)
+        file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/ctest-smoke")
+    endif()
+endif()
+
+# -----------------------------------------------------------------------------
+#  Install + CMake package export  (find_package(cell) -> cell::shared/static)
+# -----------------------------------------------------------------------------
+if(CELL_INSTALL)
+    include(GNUInstallDirs)
+    include(CMakePackageConfigHelpers)
+
+    set(CELL_INSTALL_TARGETS "")
+    if(CELL_BUILD_SHARED)
+        list(APPEND CELL_INSTALL_TARGETS cell_shared)
+    endif()
+    if(CELL_BUILD_STATIC)
+        list(APPEND CELL_INSTALL_TARGETS cell_static)
+    endif()
+
+    if(CELL_INSTALL_TARGETS)
+        install(TARGETS ${CELL_INSTALL_TARGETS}
+            EXPORT cell-targets
+            RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+            LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+            ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+            INCLUDES DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+    endif()
+    if(CELL_BUILD_CLI)
+        install(TARGETS cell_cli RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+    endif()
+
+    install(FILES include/cell.h DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+
+    if(CELL_INSTALL_TARGETS)
+        # Dependency block for the package config: a static library propagates
+        # its link requirements (as $<LINK_ONLY:...> entries), so consumers must
+        # be able to resolve them. The same resolution module the main build
+        # uses is installed alongside the config file.
+        set(CELL_PACKAGE_DEPENDENCIES "include(CMakeFindDependencyMacro)\n")
+        if(CELL_BUILD_STATIC)
+            string(APPEND CELL_PACKAGE_DEPENDENCIES
+                "find_dependency(Threads)\n"
+                "include(\"\${CMAKE_CURRENT_LIST_DIR}/cell-deps.cmake\")\n")
+        endif()
+
+        install(EXPORT cell-targets
+            NAMESPACE cell::
+            FILE cell-targets.cmake
+            DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/cell)
+
+        configure_package_config_file(
+            cmake/cell-config.cmake.in
+            "${CMAKE_CURRENT_BINARY_DIR}/cell-config.cmake"
+            INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/cell)
+        write_basic_package_version_file(
+            "${CMAKE_CURRENT_BINARY_DIR}/cell-config-version.cmake"
+            VERSION ${PROJECT_VERSION}
+            COMPATIBILITY SameMajorVersion)
+        install(FILES
+            "${CMAKE_CURRENT_BINARY_DIR}/cell-config.cmake"
+            "${CMAKE_CURRENT_BINARY_DIR}/cell-config-version.cmake"
+            "${CMAKE_CURRENT_SOURCE_DIR}/cmake/cell-deps.cmake"
+            DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/cell)
+    endif()
+endif()
+
+# -----------------------------------------------------------------------------
+#  Summary
+# -----------------------------------------------------------------------------
+if(CELL_JSON)
+    set(_cell_json_state "found")
+else()
+    set(_cell_json_state "missing")
+endif()
+message(STATUS "")
+message(STATUS "cell ${PROJECT_VERSION} — ${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION}")
+message(STATUS "  standard    : ${CELL_CXX_FLAG}")
+message(STATUS "  build type  : ${CMAKE_BUILD_TYPE}")
+message(STATUS "  targets     : cli=${CELL_BUILD_CLI} shared=${CELL_BUILD_SHARED} static=${CELL_BUILD_STATIC}")
+message(STATUS "  dependencies: curl=${CURL_VERSION_STRING} sodium=${CELL_SODIUM} json=${_cell_json_state}")
+message(STATUS "  outputs     : ${CMAKE_BINARY_DIR}/bin  ${CMAKE_BINARY_DIR}/lib")
+message(STATUS "")
