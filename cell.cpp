@@ -15009,37 +15009,44 @@ static std::pair<std::unordered_map<std::string, std::shared_ptr<cell::tools::to
         });
     {
         nlohmann::json props = {
-            {"operation", str_prop("new | run | edit | remove | reuse | list | history | report | reports | workflow")},
-            {"work-type", str_prop("serial | parallel (default serial); ignored when a workflow is given")},
-            {"list", {{"type", "array"}, {"description", "Child agents: [{works: task text, background?: none|prolegomena, editable?: [\"file\", ...] (existing files the main agent lets this child modify), edit_rules?: constraint text (REQUIRED with editable — it is what every modification is reviewed against), provider?: name, model?: name, think?: off|low|med|high|max, reuse?: 'tw-ID/worker_N' or a same-job worker name, reuse_context?: bool, name?: string}]"}}},
-            {"workflow", {{"type", "object"}, {"description", "Optional stage plan: {name?, stages: [{name?, mode?: serial|parallel, gate?: bool, provider?/model?/think?: stage defaults, agents: [{works, ...}]}]}. Stages run in order; gated stages pause the job for supervisor review; agents may reuse earlier same-job workers by bare name."}}},
-            {"path", str_prop("new/workflow: load the job config (or a bare {stages:[...]}) from this JSON file; relative to the working directory")},
-            {"id", str_prop("job id (run/edit/remove/report/reports, format tw-TIMESTAMP-N)")},
-            {"from", str_prop("reuse source: 'tw-ID' or 'tw-ID/worker_N'")},
-            {"worker", str_prop("child-agent name filter (report/reports/history)")},
+            {"operation", str_prop("the action to perform: new | run | edit | remove | reuse | list | history | report | reports | workflow ('jobs' is accepted as an alias of list); see the tool description for what each operation needs and returns")},
+            {"work-type", str_prop("serial | parallel (default serial) — whether children run one at a time or concurrently; ignored when a workflow is given")},
+            {"list", {{"type", "array"}, {"description", "Child agents for new/edit/run: [{works: task text, background?: none|prolegomena (prolegomena also passes the main conversation's foreground context to the child), editable?: [\"file\", ...] (existing files the main agent lets this child modify), edit_rules?: constraint text (REQUIRED with editable — it is what every modification is reviewed against), provider?: name, model?: name, think?: off|low|med|high|max, reuse?: 'tw-ID/worker_N' or a same-job worker name, reuse_context?: bool (replay the reused child's conversation, default true), name?: explicit child-agent name}]"}}},
+            {"workflow", {{"type", "object"}, {"description", "Inline stage plan for new/edit/run: {name?, stages: [{name?, mode?: serial|parallel, gate?: bool, provider?/model?/think?: stage defaults, agents: [{works, ...}]}]}. Stages run in order; gated stages pause the job for supervisor review; agents may reuse earlier same-job workers by bare name."}}},
+            {"path", str_prop("new/edit/workflow: load the job config (or a bare {stages:[...]}) from this JSON file (relative to the working directory); inline fields override what the file provides")},
+            {"id", str_prop("job id (format tw-TIMESTAMP-N, as returned by new/reuse/workflow or shown by list): required by run/edit/remove/report, optional filter for reports")},
+            {"from", str_prop("reuse source: 'tw-ID' or 'tw-ID/worker_N' (required by reuse)")},
+            {"worker", str_prop("child-agent name: required by report, optional filter for reports/history")},
             {"provider", str_prop("provider for the job or the reused child (default: active provider)")},
             {"model", str_prop("model for the job or the reused child (default: active model)")},
             {"think", str_prop("chain-of-thought for children: off|low|med|high|max or 0..4")},
-            {"works", str_prop("task text override when reuse is used")},
-            {"name", str_prop("explicit child-agent name (reuse)")},
-            {"reuse_context", bool_prop("when reusing, replay the previous child's conversation (default true)")},
-            {"limit", num_prop("max rows shown by list/history/reports (default 20)")},
-            {"full", bool_prop("print full report bodies instead of a truncated summary (reports)")},
-            {"background", bool_prop("run: execute the job in the background and return immediately; progress arrives as notices (the notice tool's wait blocks token-free)")},
-            {"all", bool_prop("query every session of this working directory, not just the current one")},
+            {"works", str_prop("reuse: task text for the new child (default: the reused child's original task)")},
+            {"name", str_prop("reuse: child-agent name for the new job")},
+            {"reuse_context", bool_prop("reuse: replay the reused child's conversation (default true)")},
+            {"limit", num_prop("history/reports: max rows shown (default 20, clamped to 1..200)")},
+            {"full", bool_prop("reports: print full report bodies instead of a truncated summary")},
+            {"background", bool_prop("run: execute the job in the background and return immediately; progress then arrives as notices (the notice tool's wait blocks token-free). Job-level switch — distinct from the per-child 'background' field inside list items")},
+            {"all", bool_prop("list/history/reports: query every session of this working directory, not just the current one")},
             {"editable", {{"type", "array"}, {"description", "job-level default: existing files every child may modify"}}},
             {"edit_rules", str_prop("job-level default: the constraint such modifications are reviewed against (required whenever editable is given)")}};
         add("tw", "Manage Teamwork child-agent jobs — supervised child agents that run as a workflow of stages.\n"
-                  "new: create a job. Either work-type=serial|parallel with list=[{works, editable?, edit_rules?, background?, provider?, model?, think?, reuse?}], or workflow={stages:[{name?, mode?, gate?, agents:[...]}]} for a multi-stage plan, or path=\"file.json\" to load the config (or a bare {stages:[...]}) from the working directory.\n"
-                  "File access for children: they may always create NEW files (a file a child creates belongs to it). To let a child modify EXISTING files, list them in 'editable' together with 'edit_rules' (required) — the constraint every single modification is then reviewed against before it runs; a refused change comes back as the tool result with the reason so the child can correct it.\n"
-                  "run: execute a job by id and return its consolidated report. Stages run in order; a gated stage pauses the job (status waiting) — run it again to resume after review. Progress is posted to the session notice queue (the notice tool / /notices wait idles token-free).\n"
-                  "edit: replace the configuration of an uncompleted job.\n"
-                  "remove: delete a pending/failed job.\n"
-                  "reuse: create a new job from a previously executed child (from='tw-ID/worker_N').\n"
-                  "list: list jobs (all=true also scans the other sessions of this working directory).\n"
-                  "history: list past child-agent tasks with status, rounds, tool calls and model.\n"
-                  "report: return one child's report (needs id + worker).\n"
-                  "reports: return several child reports (id/worker are optional filters; limit/full control output).",
+                  "Operations (operation):\n"
+                  "  new — create a job. Provide one of: (a) work-type=serial|parallel with list=[{works, ...}] (see the 'list' parameter), (b) an inline workflow={stages:[{name?, mode?, gate?, agents:[...]}]} for a multi-stage plan, or (c) path=\"file.json\" to load the config (or a bare {stages:[...]}) from the working directory. Returns the new job id.\n"
+                  "  run — execute a job by id and return its consolidated report; a gated stage pauses the job (status waiting) — run it again to resume after review. Progress is posted to the session notice queue (the notice tool / /notices wait idles token-free).\n"
+                  "  edit — replace the configuration of a job that is not running and not completed (requires id plus the new config, inline or via path).\n"
+                  "  remove — delete a pending/failed job (requires id).\n"
+                  "  reuse — create a new job with one child continuing a previously executed child (from='tw-ID/worker_N'; optional overrides: works, provider, model, think, name, reuse_context). Returns the new job id.\n"
+                  "  list — list jobs (all=true also scans the other sessions of this working directory).\n"
+                  "  history — list past child-agent tasks with status, rounds, tool calls and model.\n"
+                  "  report — return one child's report (requires id + worker).\n"
+                  "  reports — return several child reports (id/worker are optional filters; limit/full control output).\n"
+                  "  workflow — create a job from a workflow file (path) or an inline workflow object (a file must hold a 'workflow' object or a bare 'stages' array); otherwise identical to new with workflow/path. Returns the new job id.\n"
+                  "Rules:\n"
+                  "  1. Job ids (tw-TIMESTAMP-N) are returned by new/reuse/workflow and shown by list — capture the id from the result and pass it as 'id' to run/edit/remove/report/reports. Never invent or guess a job id.\n"
+                  "  2. File access for children: they may always create NEW files (a file a child creates belongs to it). To let a child modify EXISTING files, list them in 'editable' together with 'edit_rules' (required) — the constraint every single modification is then reviewed against before it runs; a refused change comes back as the tool result with the reason so the child can correct it.\n"
+                  "  3. Configuration may be given inline and/or via 'path' (inline wins); passing config fields to run/edit replaces the whole job configuration — refused while the job is running or completed.\n"
+                  "  4. new only creates a job — reports exist only after run; for a long job use background=true and collect progress with the notice tool (wait consumes no tokens).\n"
+                  "  5. Every tw call may require user approval; a declined call comes back rejected with the reason — adjust the request or ask the user instead of retrying the same call.\n",
             props, {"operation"}, Policy::Ask, ToolKind::Teamwork, [](const nlohmann::json &j, const cell::tools::runtime &rt) -> cell::ToolOutput
             {
                 cell::ToolOutput out;
