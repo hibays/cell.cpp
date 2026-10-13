@@ -5282,24 +5282,40 @@ namespace cell
             return true;
         }
 
+        // process-global libcurl lifecycle. After the global cleanup every easy
+        // handle is dead; client objects that live until static teardown (the
+        // LLM client cache at file scope) still run their destructors afterwards,
+        // and curl_easy_cleanup on a torn-down libcurl segfaults. They consult
+        // this flag and skip their per-handle cleanup instead.
+        inline std::atomic<bool> curl_global_is_down_{false};
+        inline bool curl_global_is_down() { return curl_global_is_down_.load(std::memory_order_relaxed); }
+        inline void curl_global_shutdown()
+        {
+            curl_global_is_down_.store(true, std::memory_order_relaxed);
+            curl_global_cleanup();
+        }
+
         bool CURL_post(CURL *curl, const char *url, const std::string &data, std::string &buf,
-                       const std::vector<std::string> &headers, std::string *err = nullptr, const char *proxy = nullptr)
+                       const std::vector<std::string> &headers, std::string *err = nullptr, const char *proxy = nullptr,
+                       long *http_status = nullptr)
         {
             long code = 0;
             bool ok = perform(curl, url, data.c_str(), (curl_off_t)data.size(), proxy, headers, &buf,
                               nullptr, nullptr, nullptr, &code, err);
+            if (http_status)
+                *http_status = code;
             if (ok && code >= 300)
             {
                 ok = false;
                 if (err)
                 {
                     if (code < 400)
-                        *err = std::format("HTTP {} (redirected — no redirect is followed here; check the provider base URL, a missing or extra trailing slash is the usual cause)", code);
+                        *err = std::format("HTTP {} (redirected — no redirect is followed here; check the provider base URL, a missing or extra trailing slash is the usual cause) [{}]", code, url);
                     else
                     {
                         *err = error_message(buf);
                         if (err->empty())
-                            *err = std::format("HTTP error {}", code);
+                            *err = std::format("HTTP error {} (POST {})", code, url);
                     }
                 }
             }
@@ -7284,6 +7300,20 @@ namespace cell
                 {
                     std::string role = m.value("role", "");
 
+                    // a Responses-format transcript (a session that used that API)
+                    // stores role-less top-level items; Chat Completions needs
+                    // role-tagged messages
+                    if (role.empty())
+                    {
+                        if (m.value("type", "") == "function_call_output")
+                            out.push_back({{"role", "tool"},
+                                           {"tool_call_id", m.value("call_id", "")},
+                                           {"content", string_content(m.contains("output") ? m["output"] : nlohmann::json())}});
+                        else
+                            out.push_back(m);
+                        continue;
+                    }
+
                     // Legacy Anthropic-format results can occur after a session is
                     // reused with an OpenAI-style provider. Convert them to the
                     // tool result shape before they reach the wire.
@@ -7312,6 +7342,52 @@ namespace cell
                     nlohmann::json item = m;
                     bool has_tool_calls = item.contains("tool_calls") && item["tool_calls"].is_array() &&
                                           !item["tool_calls"].empty();
+                    // Anthropic-format assistant turns keep tool calls as content
+                    // blocks; Chat Completions wants them as a tool_calls array or
+                    // the role=tool results that follow would dangle (a 400)
+                    if (role == "assistant" && !has_tool_calls && item.contains("content") && item["content"].is_array())
+                    {
+                        nlohmann::json converted = nlohmann::json::array();
+                        for (auto &b : item["content"])
+                            if (b.is_object() && b.value("type", "") == "tool_use")
+                            {
+                                nlohmann::json tc;
+                                tc["id"] = b.value("id", "");
+                                tc["type"] = "function";
+                                tc["function"]["name"] = b.value("name", "");
+                                tc["function"]["arguments"] = b.contains("input") ? b["input"].dump() : "{}";
+                                converted.push_back(std::move(tc));
+                            }
+                        if (!converted.empty())
+                        {
+                            item["tool_calls"] = std::move(converted);
+                            has_tool_calls = true;
+                        }
+                    }
+                    // Chat Completions tool messages accept text parts only; a
+                    // tool-produced image/audio must ride in a follow-up user
+                    // message instead (strict servers reject media in role=tool)
+                    nlohmann::json tool_media = nlohmann::json::array();
+                    if (role == "tool" && item.contains("content") && item["content"].is_array())
+                    {
+                        std::string text;
+                        for (auto &part : item["content"])
+                        {
+                            std::string pt = part.is_object() ? part.value("type", "") : "";
+                            if (pt == "image_url" || pt == "input_audio")
+                                tool_media.push_back(part);
+                            else if (part.is_string())
+                                text += part.get_ref<const std::string &>();
+                            else if (part.is_object())
+                            {
+                                std::string t = part.value("type", "");
+                                if ((t == "text" || t == "input_text" || t == "output_text") &&
+                                    part.contains("text") && part["text"].is_string())
+                                    text += part["text"].get_ref<const std::string &>();
+                            }
+                        }
+                        item["content"] = std::move(text);
+                    }
                     if (item.contains("content") && item["content"].is_array())
                     {
                         // Preserve multimodal content arrays (image_url, input_audio, etc.)
@@ -7335,6 +7411,9 @@ namespace cell
                     else if (role == "assistant" && item["content"].is_null() && !has_tool_calls)
                         item["content"] = "";
                     out.push_back(std::move(item));
+                    // the tool media split out above follows as a user message
+                    if (!tool_media.empty())
+                        out.push_back({{"role", "user"}, {"content", std::move(tool_media)}});
                 }
                 return out;
             }
@@ -7355,17 +7434,17 @@ namespace cell
 
         public:
             OpenAI(const std::string &api_base) : api_base(api_base) {}
-            ~OpenAI() { curl_easy_cleanup(curl); }
+            ~OpenAI() { if (!net::curl_global_is_down()) curl_easy_cleanup(curl); }
             void set_proxy(std::string proxy) { proxy_ = std::move(proxy); }
 
-            bool chat(const encrypt::secure_string &api_key, const std::string &model, const nlohmann::json &messages, const nlohmann::json &tools, nlohmann::json &reply, nlohmann::json &tool_calls, nlohmann::json &usage, std::string &err)
+            bool chat(const encrypt::secure_string &api_key, const std::string &model, const nlohmann::json &messages, const nlohmann::json &tools, nlohmann::json &reply, nlohmann::json &tool_calls, nlohmann::json &usage, std::string &err, long *http_status = nullptr)
             {
                 tool_calls = nlohmann::json::array();
                 usage = nlohmann::json::object();
                 std::string buf;
                 std::string url = api_base + "/chat/completions";
                 std::vector<std::string> hdrs = headers(api_key);
-                bool ok = net::CURL_post(curl, url.c_str(), body(model, messages, tools, false).dump(-1, ' ', false, nlohmann::json::error_handler_t::replace), buf, hdrs, &err, proxy_.c_str());
+                bool ok = net::CURL_post(curl, url.c_str(), body(model, messages, tools, false).dump(-1, ' ', false, nlohmann::json::error_handler_t::replace), buf, hdrs, &err, proxy_.c_str(), http_status);
                 for (auto &h : hdrs)
                     encrypt::wipe(h);
                 if (!ok)
@@ -7389,19 +7468,27 @@ namespace cell
                 }
             }
 
-            bool chat_stream(const encrypt::secure_string &api_key, const std::string &model, const nlohmann::json &messages, const nlohmann::json &tools, net::StreamCallback on_token, net::StreamCallback on_reason, nlohmann::json &reply, nlohmann::json &tool_calls, nlohmann::json &usage, std::string &err, net::XferCallback on_xfer = nullptr, void *xfer_data = nullptr)
+            bool chat_stream(const encrypt::secure_string &api_key, const std::string &model, const nlohmann::json &messages, const nlohmann::json &tools, net::StreamCallback on_token, net::StreamCallback on_reason, nlohmann::json &reply, nlohmann::json &tool_calls, nlohmann::json &usage, std::string &err, net::XferCallback on_xfer = nullptr, void *xfer_data = nullptr, long *http_status = nullptr)
             {
                 tool_calls = nlohmann::json::array();
                 usage = nlohmann::json::object();
                 std::string text;
                 std::string reasoning;
                 std::string sse_buf;
+                std::string stream_err;
                 size_t sse_base = 0;
                 std::string url = api_base + "/chat/completions";
                 net::StreamCallback cb = [&](std::span<const char> data)
                 {
                     auto handle = [&](const nlohmann::json &j)
                     {
+                        // some OpenAI-compatible servers report mid-stream failures
+                        // as an error chunk instead of a failing HTTP status
+                        if (j.contains("error") && j["error"].is_object())
+                        {
+                            stream_err = j["error"].value("message", "provider stream error");
+                            return;
+                        }
                         if (j.contains("usage") && j["usage"].is_object())
                             usage = j["usage"];
                         // const operator[] asserts on a missing key, and this
@@ -7458,13 +7545,23 @@ namespace cell
                 bool ok = net::CURL_stream_post(curl, url.c_str(), body(model, messages, tools, true).dump(-1, ' ', false, nlohmann::json::error_handler_t::replace), hdrs, std::move(cb), on_xfer, xfer_data, &http, proxy_.c_str());
                 for (auto &h : hdrs)
                     encrypt::wipe(h);
+                if (http_status)
+                    *http_status = http;
                 if (ok && http >= 400)
                 {
                     ok = false;
                     sse_finish(sse_buf, sse_base);
                     err = net::error_message(sse_buf);
                     if (err.empty())
-                        err = std::format("HTTP error {}", http);
+                        err = std::format("HTTP error {} (POST {})", http, url);
+                }
+                // a mid-stream error event (anthropic "error", responses
+                // "response.failed", chat error chunks) must fail the round even
+                // though the HTTP status was 200
+                if (ok && !stream_err.empty())
+                {
+                    ok = false;
+                    err = std::move(stream_err);
                 }
                 if (!ok && err.empty())
                     err = "stream request failed";
@@ -7617,6 +7714,7 @@ namespace cell
                     else if (role == "assistant")
                     {
                         nlohmann::json content = nlohmann::json::array();
+                        nlohmann::json block_calls = nlohmann::json::array();
                         if (m.contains("content") && m["content"].is_string())
                             content.push_back({{"type", "output_text"}, {"text", m["content"].get_ref<const std::string &>()}});
                         else if (m.contains("content") && m["content"].is_array())
@@ -7628,6 +7726,19 @@ namespace cell
                                     content.push_back({{"type", "output_text"}, {"text", b["text"]}});
                                 else if (bt == "output_text")
                                     content.push_back(b);
+                                else if (bt == "tool_use")
+                                {
+                                    // Anthropic-format tool calls live in content
+                                    // blocks; the Responses wire wants top-level
+                                    // function_call items (their call_id pairs with
+                                    // the function_call_output built for tool_result)
+                                    nlohmann::json fc;
+                                    fc["type"] = "function_call";
+                                    fc["call_id"] = b.value("id", "");
+                                    fc["name"] = b.value("name", "");
+                                    fc["arguments"] = b.contains("input") ? b["input"].dump() : "{}";
+                                    block_calls.push_back(std::move(fc));
+                                }
                                 else if (bt == "reasoning")
                                     continue;
                             }
@@ -7639,6 +7750,8 @@ namespace cell
                             item["content"] = std::move(content);
                             input.push_back(std::move(item));
                         }
+                        for (auto &fc : block_calls)
+                            input.push_back(std::move(fc));
                         if (m.contains("tool_calls") && m["tool_calls"].is_array())
                         {
                             // Tool calls and their outputs are top-level Responses
@@ -7682,6 +7795,9 @@ namespace cell
                 b["stream"] = stream;
                 // Responses API reports usage via the response.completed event; it
                 // does not accept the Chat-Completions-only stream_options field.
+                // store=false: the client manages its own transcript, so the server
+                // must not retain the response (the API default is to store it)
+                b["store"] = false;
                 return b;
             }
 
@@ -7750,17 +7866,17 @@ namespace cell
 
         public:
             OpenAIResponses(const std::string &api_base) : api_base(api_base) {}
-            ~OpenAIResponses() { curl_easy_cleanup(curl); }
+            ~OpenAIResponses() { if (!net::curl_global_is_down()) curl_easy_cleanup(curl); }
             void set_proxy(std::string proxy) { proxy_ = std::move(proxy); }
 
-            bool chat(const encrypt::secure_string &api_key, const std::string &model, const nlohmann::json &messages, const nlohmann::json &tools, nlohmann::json &reply, nlohmann::json &tool_calls, nlohmann::json &usage, std::string &err)
+            bool chat(const encrypt::secure_string &api_key, const std::string &model, const nlohmann::json &messages, const nlohmann::json &tools, nlohmann::json &reply, nlohmann::json &tool_calls, nlohmann::json &usage, std::string &err, long *http_status = nullptr)
             {
                 tool_calls = nlohmann::json::array();
                 usage = nlohmann::json::object();
                 std::string buf;
                 std::string url = api_base + "/responses";
                 std::vector<std::string> hdrs = headers(api_key);
-                bool ok = net::CURL_post(curl, url.c_str(), body(model, messages, tools, false).dump(-1, ' ', false, nlohmann::json::error_handler_t::replace), buf, hdrs, &err, proxy_.c_str());
+                bool ok = net::CURL_post(curl, url.c_str(), body(model, messages, tools, false).dump(-1, ' ', false, nlohmann::json::error_handler_t::replace), buf, hdrs, &err, proxy_.c_str(), http_status);
                 for (auto &h : hdrs)
                     encrypt::wipe(h);
                 if (!ok)
@@ -7778,7 +7894,7 @@ namespace cell
                 }
             }
 
-            bool chat_stream(const encrypt::secure_string &api_key, const std::string &model, const nlohmann::json &messages, const nlohmann::json &tools, net::StreamCallback on_token, net::StreamCallback on_reason, nlohmann::json &reply, nlohmann::json &tool_calls, nlohmann::json &usage, std::string &err, net::XferCallback on_xfer = nullptr, void *xfer_data = nullptr)
+            bool chat_stream(const encrypt::secure_string &api_key, const std::string &model, const nlohmann::json &messages, const nlohmann::json &tools, net::StreamCallback on_token, net::StreamCallback on_reason, nlohmann::json &reply, nlohmann::json &tool_calls, nlohmann::json &usage, std::string &err, net::XferCallback on_xfer = nullptr, void *xfer_data = nullptr, long *http_status = nullptr)
             {
                 (void)on_reason; // Responses API uses encrypted reasoning, not plaintext deltas
                 tool_calls = nlohmann::json::array();
@@ -7786,6 +7902,7 @@ namespace cell
                 std::string text;
                 std::string reasoning; // accumulated reasoning summary text
                 std::string sse_buf;
+                std::string stream_err;
                 size_t sse_base = 0;
                 // track function_call deltas by item_id (OpenAI Responses streaming
                 // keys the argument deltas with item_id; the call_id that the
@@ -7793,6 +7910,14 @@ namespace cell
                 std::unordered_map<std::string, std::string> func_call_args;    // item_id -> accumulated arguments
                 std::unordered_map<std::string, std::string> func_call_names;   // item_id -> function name
                 std::unordered_map<std::string, std::string> func_call_callids; // item_id -> call_id
+                // first-seen order of the calls: assembly must not depend on
+                // unordered_map iteration order (tools execute in this order)
+                std::vector<std::string> func_call_order;
+                auto remember_call = [&](const std::string &iid)
+                {
+                    if (!iid.empty() && std::find(func_call_order.begin(), func_call_order.end(), iid) == func_call_order.end())
+                        func_call_order.push_back(iid);
+                };
                 std::string url = api_base + "/responses";
                 net::StreamCallback cb = [&](std::span<const char> data)
                 {
@@ -7816,6 +7941,7 @@ namespace cell
                                         std::string cid = item.value("call_id", "");
                                         if (!iid.empty())
                                         {
+                                            remember_call(iid);
                                             func_call_names[iid] = item.value("name", "");
                                             if (!cid.empty())
                                                 func_call_callids[iid] = cid;
@@ -7853,6 +7979,7 @@ namespace cell
                                 std::string iid = item.value("id", "");
                                 if (!iid.empty())
                                 {
+                                    remember_call(iid);
                                     func_call_names[iid] = item.value("name", "");
                                     std::string cid = item.value("call_id", "");
                                     if (!cid.empty())
@@ -7881,14 +8008,31 @@ namespace cell
                         {
                             // OpenAI keys these deltas by item_id, not call_id
                             std::string iid = ev.value("item_id", ev.value("call_id", ""));
+                            remember_call(iid);
                             if (!iid.empty() && ev.contains("delta") && ev["delta"].is_string())
                                 func_call_args[iid] += ev["delta"].get_ref<const std::string &>();
                         }
                         else if (type == "response.function_call_arguments.done")
                         {
                             std::string iid = ev.value("item_id", ev.value("call_id", ""));
+                            remember_call(iid);
                             if (!iid.empty() && ev.contains("arguments") && ev["arguments"].is_string())
                                 func_call_args[iid] = ev["arguments"].get_ref<const std::string &>();
+                        }
+                        else if (type == "response.failed" || type == "error")
+                        {
+                            // a 200-status stream can still carry a terminal failure
+                            // (rate limit, content filter, server fault): surface it
+                            // instead of silently keeping the partial reply
+                            std::string msg;
+                            if (ev.contains("response") && ev["response"].is_object() &&
+                                ev["response"].contains("error") && ev["response"]["error"].is_object())
+                                msg = ev["response"]["error"].value("message", "");
+                            if (msg.empty() && ev.contains("message") && ev["message"].is_string())
+                                msg = ev["message"].get<std::string>();
+                            if (msg.empty() && ev.contains("code") && ev["code"].is_string())
+                                msg = ev["code"].get<std::string>();
+                            stream_err = msg.empty() ? "provider stream error" : std::move(msg);
                         }
                     };
                     sse_feed(sse_buf, sse_base, data, handle);
@@ -7898,13 +8042,23 @@ namespace cell
                 bool ok = net::CURL_stream_post(curl, url.c_str(), body(model, messages, tools, true).dump(-1, ' ', false, nlohmann::json::error_handler_t::replace), hdrs, std::move(cb), on_xfer, xfer_data, &http, proxy_.c_str());
                 for (auto &h : hdrs)
                     encrypt::wipe(h);
+                if (http_status)
+                    *http_status = http;
                 if (ok && http >= 400)
                 {
                     ok = false;
                     sse_finish(sse_buf, sse_base);
                     err = net::error_message(sse_buf);
                     if (err.empty())
-                        err = std::format("HTTP error {}", http);
+                        err = std::format("HTTP error {} (POST {})", http, url);
+                }
+                // a mid-stream error event (anthropic "error", responses
+                // "response.failed", chat error chunks) must fail the round even
+                // though the HTTP status was 200
+                if (ok && !stream_err.empty())
+                {
+                    ok = false;
+                    err = std::move(stream_err);
                 }
                 if (!ok && err.empty())
                     err = "stream request failed";
@@ -7947,15 +8101,23 @@ namespace cell
                 // assemble tool_calls from accumulated deltas. func_call_args is keyed
                 // by item_id; resolve the function name and the call_id (used by the
                 // tool_result's function_call_output) through the mappings built above.
-                for (auto &[item_id, args] : func_call_args)
+                // Emit in first-seen order, not unordered_map order.
+                auto push_call = [&](const std::string &item_id)
                 {
                     nlohmann::json tc;
                     tc["id"] = func_call_callids.count(item_id) ? func_call_callids[item_id] : item_id;
                     tc["type"] = "function";
                     tc["function"]["name"] = func_call_names.count(item_id) ? func_call_names[item_id] : "";
-                    tc["function"]["arguments"] = args;
+                    tc["function"]["arguments"] = func_call_args[item_id];
                     tool_calls.push_back(std::move(tc));
-                }
+                };
+                for (auto &item_id : func_call_order)
+                    if (func_call_args.count(item_id))
+                        push_call(item_id);
+                // safety net for calls that never appeared in an ordering event
+                for (auto &[item_id, args] : func_call_args)
+                    if (std::find(func_call_order.begin(), func_call_order.end(), item_id) == func_call_order.end())
+                        push_call(item_id);
                 if (!tool_calls.empty())
                     reply["tool_calls"] = tool_calls;
                 return ok;
@@ -7988,15 +8150,150 @@ namespace cell
                     b["thinking"] = {{"type", "enabled"}, {"budget_tokens", budget}};
                 nlohmann::json sys = nlohmann::json::array();
                 nlohmann::json msgs = nlohmann::json::array();
+                // a user message whose content is a non-empty array of tool_result
+                // blocks only
+                auto tool_result_only = [](const nlohmann::json &m)
+                {
+                    if (m.value("role", "") != "user" || !m.contains("content") || !m["content"].is_array() || m["content"].empty())
+                        return false;
+                    for (auto &blk : m["content"])
+                        if (!blk.is_object() || blk.value("type", "") != "tool_result")
+                            return false;
+                    return true;
+                };
+                // tool call arguments travel as a JSON string in the Chat Completions
+                // and Responses formats and as an object in Anthropic's
+                auto parse_args = [](const nlohmann::json &v)
+                {
+                    if (v.is_object())
+                        return v;
+                    if (v.is_string())
+                    {
+                        auto j = nlohmann::json::parse(v.get_ref<const std::string &>(), nullptr, false);
+                        if (j.is_object())
+                            return j;
+                    }
+                    return nlohmann::json::object();
+                };
+                // a session that used another style stores Chat-Completions shapes
+                // (assistant.tool_calls + role=tool results) or Responses items
+                // (function_call_output); the native API only knows content blocks,
+                // so translate them instead of shipping invalid roles/types
+                auto needs_normalize = [](const nlohmann::json &m)
+                {
+                    std::string role = m.value("role", "");
+                    if (role.empty())
+                        return m.value("type", "") == "function_call_output";
+                    if (role == "tool")
+                        return true;
+                    if (role != "assistant")
+                        return false;
+                    if (m.contains("tool_calls") && m["tool_calls"].is_array() && !m["tool_calls"].empty())
+                        return true;
+                    // a chat-style reasoning array is request-local persistence and
+                    // must never reach the native wire as a block type
+                    if (m.contains("content") && m["content"].is_array())
+                        for (auto &blk : m["content"])
+                            if (blk.is_object() && blk.value("type", "") == "reasoning")
+                                return true;
+                    return false;
+                };
+                auto normalize = [&](const nlohmann::json &m) -> nlohmann::json
+                {
+                    std::string role = m.value("role", "");
+                    if (role.empty() && m.value("type", "") == "function_call_output")
+                        return {{"role", "user"},
+                                {"content", nlohmann::json::array({{{"type", "tool_result"},
+                                                                    {"tool_use_id", m.value("call_id", "")},
+                                                                    {"content", string_content(m.contains("output") ? m["output"] : nlohmann::json())}}})}};
+                    if (role == "tool")
+                        return {{"role", "user"},
+                                {"content", nlohmann::json::array({{{"type", "tool_result"},
+                                                                    {"tool_use_id", m.value("tool_call_id", "")},
+                                                                    {"content", string_content(m.contains("content") ? m["content"] : nlohmann::json())}}})}};
+                    if (role == "assistant")
+                    {
+                        // already native (tool calls live in content blocks): keep as-is
+                        if (m.contains("content") && m["content"].is_array())
+                            for (auto &blk : m["content"])
+                                if (blk.is_object() && blk.value("type", "") == "tool_use")
+                                    return m;
+                        nlohmann::json blocks = nlohmann::json::array();
+                        std::string text;
+                        append_content_text(m.value("content", nlohmann::json()), text);
+                        if (!text.empty())
+                            blocks.push_back({{"type", "text"}, {"text", std::move(text)}});
+                        if (m.contains("tool_calls") && m["tool_calls"].is_array())
+                            for (auto &tc : m["tool_calls"])
+                                blocks.push_back({{"type", "tool_use"},
+                                                  {"id", tc.value("id", "")},
+                                                  {"name", tc.contains("function") ? tc["function"].value("name", "") : ""},
+                                                  {"input", tc.contains("function") ? parse_args(tc["function"].value("arguments", nlohmann::json())) : nlohmann::json::object()}});
+                        if (blocks.empty())
+                            return m; // nothing convertible (e.g. reasoning-only): keep as-is
+                        return {{"role", "assistant"}, {"content", std::move(blocks)}};
+                    }
+                    return m;
+                };
                 for (auto &m : messages)
                 {
                     // system goes out as text blocks, not bare strings: the native API
                     // accepts both, strict anthropic-compatible servers (DeepSeek)
                     // only deserialize blocks
                     if (m.value("role", "") == "system")
+                    {
                         sys.push_back({{"type", "text"}, {"text", m.value("content", "")}});
-                    else
-                        msgs.push_back(m);
+                        continue;
+                    }
+                    // cross-style normalization copies only the rare converted
+                    // messages; native ones pass through by reference
+                    const nlohmann::json *cur = &m;
+                    nlohmann::json converted;
+                    if (needs_normalize(m))
+                    {
+                        converted = normalize(m);
+                        cur = &converted;
+                    }
+                    // when extended thinking is off, history thinking blocks are
+                    // omitted from the wire: the native API strips them anyway, and
+                    // keeping them breaks strict validation when the thinking
+                    // configuration changed across sessions; a message that carries
+                    // nothing else is kept intact (the server degrades it)
+                    if (!think_enabled && cur->value("role", "") == "assistant" &&
+                        cur->contains("content") && (*cur)["content"].is_array())
+                    {
+                        const auto &content = (*cur)["content"];
+                        bool has_thinking = false, has_other = false;
+                        for (auto &blk : content)
+                        {
+                            bool th = blk.is_object() && (blk.value("type", "") == "thinking" || blk.value("type", "") == "redacted_thinking");
+                            has_thinking = has_thinking || th;
+                            has_other = has_other || !th;
+                        }
+                        if (has_thinking && has_other)
+                        {
+                            nlohmann::json filtered = nlohmann::json::array();
+                            for (auto &blk : content)
+                                if (!(blk.is_object() && (blk.value("type", "") == "thinking" || blk.value("type", "") == "redacted_thinking")))
+                                    filtered.push_back(blk);
+                            nlohmann::json copy = *cur;
+                            copy["content"] = std::move(filtered);
+                            converted = std::move(copy);
+                            cur = &converted;
+                        }
+                    }
+                    // every tool_use block of an assistant message must be answered by
+                    // tool_result blocks in the IMMEDIATELY following message; the
+                    // transcript stores one tool_result message per executed tool, so
+                    // runs of them are folded into the first here (the native API and
+                    // DeepSeek both reject multi-tool rounds otherwise)
+                    if (tool_result_only(*cur) && !msgs.empty() && tool_result_only(msgs.back()))
+                    {
+                        for (auto &blk : (*cur)["content"])
+                            msgs.back()["content"].push_back(blk);
+                        continue;
+                    }
+                    msgs.push_back(*cur);
                 }
                 if (!sys.empty())
                     b["system"] = sys;
@@ -8008,17 +8305,17 @@ namespace cell
             }
 
             Anthropic(const std::string &api_base) : api_base(api_base) {}
-            ~Anthropic() { curl_easy_cleanup(curl); }
+            ~Anthropic() { if (!net::curl_global_is_down()) curl_easy_cleanup(curl); }
             void set_proxy(std::string proxy) { proxy_ = std::move(proxy); }
 
-            bool chat(const encrypt::secure_string &api_key, const std::string &model, const nlohmann::json &messages, const nlohmann::json &tools, nlohmann::json &reply, nlohmann::json &tool_calls, nlohmann::json &usage, std::string &err, int think_level = 0)
+            bool chat(const encrypt::secure_string &api_key, const std::string &model, const nlohmann::json &messages, const nlohmann::json &tools, nlohmann::json &reply, nlohmann::json &tool_calls, nlohmann::json &usage, std::string &err, int think_level = 0, long *http_status = nullptr)
             {
                 tool_calls = nlohmann::json::array();
                 usage = nlohmann::json::object();
                 std::string buf;
                 std::string url = api_base + "/v1/messages";
                 std::vector<std::string> hdrs = headers(api_key);
-                bool ok = net::CURL_post(curl, url.c_str(), body(model, messages, tools, false, think_level).dump(-1, ' ', false, nlohmann::json::error_handler_t::replace), buf, hdrs, &err, proxy_.c_str());
+                bool ok = net::CURL_post(curl, url.c_str(), body(model, messages, tools, false, think_level).dump(-1, ' ', false, nlohmann::json::error_handler_t::replace), buf, hdrs, &err, proxy_.c_str(), http_status);
                 for (auto &h : hdrs)
                     encrypt::wipe(h);
                 if (!ok)
@@ -8052,12 +8349,13 @@ namespace cell
                 }
             }
 
-            bool chat_stream(const encrypt::secure_string &api_key, const std::string &model, const nlohmann::json &messages, const nlohmann::json &tools, net::StreamCallback on_token, net::StreamCallback on_reason, nlohmann::json &reply, nlohmann::json &tool_calls, nlohmann::json &usage, std::string &err, int think_level = 0, net::XferCallback on_xfer = nullptr, void *xfer_data = nullptr)
+            bool chat_stream(const encrypt::secure_string &api_key, const std::string &model, const nlohmann::json &messages, const nlohmann::json &tools, net::StreamCallback on_token, net::StreamCallback on_reason, nlohmann::json &reply, nlohmann::json &tool_calls, nlohmann::json &usage, std::string &err, int think_level = 0, net::XferCallback on_xfer = nullptr, void *xfer_data = nullptr, long *http_status = nullptr)
             {
                 tool_calls = nlohmann::json::array();
                 usage = nlohmann::json::object();
                 std::vector<nlohmann::json> blocks;
                 std::string sse_buf;
+                std::string stream_err;
                 size_t sse_base = 0;
                 std::string url = api_base + "/v1/messages";
                 net::StreamCallback cb = [&](std::span<const char> data)
@@ -8072,6 +8370,13 @@ namespace cell
                         }
                         else if (type == "message_delta" && ev.contains("usage"))
                             usage["output_tokens"] = (long long)num_arg(ev["usage"], "output_tokens", 0);
+                        else if (type == "error" && ev.contains("error"))
+                        {
+                            // an error event can arrive mid-stream (200 status) and
+                            // must fail the round instead of silently ending it
+                            auto &e = ev["error"];
+                            stream_err = e.is_object() ? e.value("message", "provider stream error") : "provider stream error";
+                        }
                         // a delta without an index belongs to the current block,
                         // and an index must never decide how far we grow
                         size_t idx = blocks.empty() ? 0 : blocks.size() - 1;
@@ -8137,13 +8442,23 @@ namespace cell
                 bool ok = net::CURL_stream_post(curl, url.c_str(), body(model, messages, tools, true, think_level).dump(-1, ' ', false, nlohmann::json::error_handler_t::replace), hdrs, std::move(cb), on_xfer, xfer_data, &http, proxy_.c_str());
                 for (auto &h : hdrs)
                     encrypt::wipe(h);
+                if (http_status)
+                    *http_status = http;
                 if (ok && http >= 400)
                 {
                     ok = false;
                     sse_finish(sse_buf, sse_base);
                     err = net::error_message(sse_buf);
                     if (err.empty())
-                        err = std::format("HTTP error {}", http);
+                        err = std::format("HTTP error {} (POST {})", http, url);
+                }
+                // a mid-stream error event (anthropic "error", responses
+                // "response.failed", chat error chunks) must fail the round even
+                // though the HTTP status was 200
+                if (ok && !stream_err.empty())
+                {
+                    ok = false;
+                    err = std::move(stream_err);
                 }
                 if (!ok && err.empty())
                     err = "stream request failed";
@@ -10040,6 +10355,27 @@ details{break-inside:avoid}
         // tool_call — otherwise the provider rejects the transcript on reload. An
         // interrupt (Ctrl+C, exception, cancel) can leave the pairing incomplete, so
         // before persisting we synthesise a result for every missing id.
+        // Whether a transcript message is a real user turn: transcript-rewriting
+        // paths (compact) may keep or emit it as "the user message". Anthropic-
+        // format tool results also ride in role=user messages, and a tool_result
+        // carrier is NOT a user turn — kept without its assistant tool_use it
+        // would orphan every subsequent request.
+        static bool is_user_turn(const nlohmann::json &m)
+        {
+            if (!m.is_object() || m.value("role", "") != "user")
+                return false;
+            auto it = m.find("content");
+            if (it == m.end() || it->is_null())
+                return false;
+            if (it->is_string())
+                return !it->get_ref<const std::string &>().empty();
+            if (!it->is_array() || it->empty())
+                return false;
+            for (auto &b : *it)
+                if (b.is_object() && b.value("type", "") == "tool_result")
+                    return false;
+            return true;
+        }
         static void repair_tool_pairing(nlohmann::json &messages)
         {
             for (size_t i = 0; i < messages.size(); i++)
@@ -16870,6 +17206,166 @@ static int run_selftest()
             anthropic_system_inside |= m.value("role", "") == "system";
         R.expect(!anthropic_system_inside && anthropic["messages"].size() == messages.size() - 1,
                  "anthropic pulls system messages out of the transcript");
+
+        // strict servers (native Anthropic, DeepSeek) require that every tool_use
+        // block of an assistant message is answered by tool_result blocks in the
+        // IMMEDIATELY following message; the transcript keeps one tool_result
+        // message per executed tool, so body() must fold consecutive ones
+        nlohmann::json multi_tool = nlohmann::json::array({
+            {{"role", "user"}, {"content", "do both"}},
+            {{"role", "assistant"},
+             {"content", nlohmann::json::array({
+                            {{"type", "tool_use"}, {"id", "tu_1"}, {"name", "read"}, {"input", nlohmann::json::object()}},
+                            {{"type", "tool_use"}, {"id", "tu_2"}, {"name", "ls"}, {"input", nlohmann::json::object()}},
+                        })}},
+            {{"role", "user"}, {"content", nlohmann::json::array({{{"type", "tool_result"}, {"tool_use_id", "tu_1"}, {"content", "file body"}}})}},
+            {{"role", "user"}, {"content", nlohmann::json::array({{{"type", "tool_result"}, {"tool_use_id", "tu_2"}, {"content", "names"}}})}},
+            {{"role", "user"}, {"content", "thanks"}},
+        });
+        auto folded = cell::llm::Anthropic::body("m", multi_tool, nlohmann::json::array(), false);
+        auto &folded_msgs = folded["messages"];
+        R.expect(folded_msgs.size() == 4, "anthropic folds consecutive tool_result messages");
+        R.expect(folded_msgs[2].value("role", "") == "user" && folded_msgs[2]["content"].size() == 2 &&
+                     folded_msgs[2]["content"][0].value("tool_use_id", "") == "tu_1" &&
+                     folded_msgs[2]["content"][1].value("tool_use_id", "") == "tu_2",
+                 "anthropic keeps folded tool results in order");
+        R.expect(folded_msgs[3].value("role", "") == "user" && folded_msgs[3]["content"] == "thanks",
+                 "anthropic does not fold plain user messages");
+
+        // chat/responses-format turns must be translated for the Anthropic wire:
+        // role=tool and function_call_output become tool_result blocks, and an
+        // assistant.tool_calls key becomes tool_use blocks (otherwise the strict
+        // servers reject the request with an invalid role / dangling tool call)
+        nlohmann::json cross = nlohmann::json::array({
+            {{"role", "user"}, {"content", "go"}},
+            {{"role", "assistant"},
+             {"content", nlohmann::json::array({{{"type", "reasoning"}, {"reasoning", "hidden"}}, {{"type", "text"}, {"text", "working"}}})},
+             {"tool_calls", nlohmann::json::array({{{"id", "c1"}, {"type", "function"}, {"function", {{"name", "read"}, {"arguments", "{\"path\":\"a\"}"}}}}})}},
+            {{"role", "tool"}, {"tool_call_id", "c1"}, {"content", "body text"}},
+            {{"type", "function_call_output"}, {"call_id", "c2"}, {"output", nlohmann::json::array({{{"type", "input_text"}, {"text", "second result"}}})}},
+        });
+        auto crossw = cell::llm::Anthropic::body("m", cross, nlohmann::json::array(), false);
+        auto &cross_msgs = crossw["messages"];
+        R.expect(cross_msgs.size() == 3, "anthropic folds converted chat/responses tool results");
+        R.expect(cross_msgs[1].value("role", "") == "assistant" && !cross_msgs[1].contains("tool_calls") &&
+                     cross_msgs[1]["content"].size() == 2 &&
+                     cross_msgs[1]["content"][0].value("type", "") == "text" &&
+                     cross_msgs[1]["content"][0].value("text", "") == "working" &&
+                     cross_msgs[1]["content"][1].value("type", "") == "tool_use" &&
+                     cross_msgs[1]["content"][1].value("id", "") == "c1" &&
+                     cross_msgs[1]["content"][1].value("name", "") == "read" &&
+                     cross_msgs[1]["content"][1]["input"].value("path", "") == "a",
+                 "anthropic converts chat-style assistant tool_calls to tool_use blocks");
+        R.expect(cross_msgs[2].value("role", "") == "user" && cross_msgs[2]["content"].size() == 2 &&
+                     cross_msgs[2]["content"][0].value("type", "") == "tool_result" &&
+                     cross_msgs[2]["content"][0].value("tool_use_id", "") == "c1" &&
+                     cross_msgs[2]["content"][0].value("content", "") == "body text" &&
+                     cross_msgs[2]["content"][1].value("tool_use_id", "") == "c2" &&
+                     cross_msgs[2]["content"][1].value("content", "") == "second result",
+                 "anthropic folds role=tool and function_call_output into one tool_result message");
+
+        // the reverse direction: an Anthropic-format turn replayed through the other
+        // two styles must surface its tool_use blocks as tool calls, or the results
+        // that follow would dangle
+        nlohmann::json anthropic_turn = nlohmann::json::array({
+            {{"role", "user"}, {"content", "list files"}},
+            {{"role", "assistant"},
+             {"content", nlohmann::json::array({{{"type", "thinking"}, {"thinking", "hidden"}},
+                                                {{"type", "tool_use"}, {"id", "tu_9"}, {"name", "ls"}, {"input", {{"path", "."}}}}})}},
+            {{"role", "user"}, {"content", nlohmann::json::array({{{"type", "tool_result"}, {"tool_use_id", "tu_9"}, {"content", "file.txt"}}})}},
+        });
+        auto chat2 = cell::llm::OpenAI::body("m", anthropic_turn, nlohmann::json::array(), false);
+        auto &chat2_msgs = chat2["messages"];
+        R.expect(chat2_msgs[1].contains("tool_calls") && chat2_msgs[1]["tool_calls"].size() == 1 &&
+                     chat2_msgs[1]["tool_calls"][0].value("id", "") == "tu_9" &&
+                     chat2_msgs[1]["tool_calls"][0]["function"].value("name", "") == "ls" &&
+                     chat2_msgs[1]["tool_calls"][0]["function"].value("arguments", "") == "{\"path\":\".\"}" &&
+                     chat2_msgs[1]["content"].is_null(),
+                 "openai chat converts Anthropic tool_use blocks to tool_calls");
+        R.expect(chat2_msgs[2].value("role", "") == "tool" && chat2_msgs[2].value("tool_call_id", "") == "tu_9",
+                 "openai chat pairs converted tool_calls with the tool result");
+        auto resp2 = cell::llm::OpenAIResponses::body("m", anthropic_turn, nlohmann::json::array(), false);
+        auto &resp2_input = resp2["input"];
+        bool resp_call = false, resp_call_output = false;
+        for (auto &it : resp2_input)
+        {
+            if (it.value("type", "") == "function_call" && it.value("call_id", "") == "tu_9" &&
+                it.value("name", "") == "ls" && it.value("arguments", "") == "{\"path\":\".\"}")
+                resp_call = true;
+            if (it.value("type", "") == "function_call_output" && it.value("call_id", "") == "tu_9")
+                resp_call_output = true;
+        }
+        R.expect(resp_call, "responses converts Anthropic tool_use blocks to function_call items");
+        R.expect(resp_call_output, "responses pairs the converted function_call with its output");
+        R.expect(resp2.contains("store") && resp2["store"] == false,
+                 "responses opts out of server-side storage");
+
+        // extended thinking off: history thinking blocks are omitted from the wire
+        // (kept when thinking is on; an all-thinking message stays intact)
+        nlohmann::json think_hist = nlohmann::json::array({
+            {{"role", "user"}, {"content", "q"}},
+            {{"role", "assistant"},
+             {"content", nlohmann::json::array({{{"type", "thinking"}, {"thinking", "reasoning"}, {"signature", "sig"}},
+                                                {{"type", "text"}, {"text", "answer"}}})}},
+        });
+        auto think_off = cell::llm::Anthropic::body("m", think_hist, nlohmann::json::array(), false, 0);
+        R.expect(think_off["messages"][1]["content"].size() == 1 &&
+                     think_off["messages"][1]["content"][0].value("type", "") == "text",
+                 "anthropic drops thinking blocks when thinking is off");
+        auto think_on = cell::llm::Anthropic::body("m", think_hist, nlohmann::json::array(), false, 1);
+        R.expect(think_on["messages"][1]["content"].size() == 2 &&
+                     think_on["messages"][1]["content"][0].value("type", "") == "thinking",
+                 "anthropic keeps thinking blocks when thinking is on");
+        nlohmann::json think_only = nlohmann::json::array({
+            {{"role", "user"}, {"content", "q"}},
+            {{"role", "assistant"}, {"content", nlohmann::json::array({{{"type", "thinking"}, {"thinking", "r"}}})}},
+        });
+        auto think_keep = cell::llm::Anthropic::body("m", think_only, nlohmann::json::array(), false, 0);
+        R.expect(think_keep["messages"][1]["content"].size() == 1 &&
+                     think_keep["messages"][1]["content"][0].value("type", "") == "thinking",
+                 "anthropic keeps an all-thinking message intact");
+
+        // a chat-style reasoning array without tool calls must still be translated
+        nlohmann::json reason_only = nlohmann::json::array({
+            {{"role", "assistant"}, {"content", nlohmann::json::array({{{"type", "reasoning"}, {"reasoning", "hidden"}}, {{"type", "text"}, {"text", "visible"}}})}},
+        });
+        auto reason_wire = cell::llm::Anthropic::body("m", reason_only, nlohmann::json::array(), false);
+        R.expect(reason_wire["messages"][0]["content"].size() == 1 &&
+                     reason_wire["messages"][0]["content"][0].value("type", "") == "text" &&
+                     reason_wire["messages"][0]["content"][0].value("text", "") == "visible",
+                 "anthropic drops chat-style reasoning blocks");
+
+        // a Responses-format transcript replayed through Chat Completions: the
+        // role-less function_call_output items need role-tagged tool messages
+        nlohmann::json responses_turn = nlohmann::json::array({
+            {{"role", "user"}, {"content", "hi"}},
+            {{"type", "function_call_output"}, {"call_id", "c9"}, {"output", nlohmann::json::array({{{"type", "input_text"}, {"text", "tool says"}}})}},
+        });
+        auto chat3 = cell::llm::OpenAI::body("m", responses_turn, nlohmann::json::array(), false);
+        auto &chat3_msgs = chat3["messages"];
+        R.expect(chat3_msgs.size() == 2 && chat3_msgs[1].value("role", "") == "tool" &&
+                     chat3_msgs[1].value("tool_call_id", "") == "c9" &&
+                     chat3_msgs[1].value("content", "") == "tool says",
+                 "openai chat converts Responses function_call_output items to tool messages");
+
+        // Chat Completions tool messages accept text parts only: a tool-produced
+        // image must ride in a follow-up user message
+        nlohmann::json media_tool = nlohmann::json::array({
+            {{"role", "tool"},
+             {"tool_call_id", "mc1"},
+             {"content", nlohmann::json::array({
+                            {{"type", "text"}, {"text", "screenshot:"}},
+                            {{"type", "image_url"}, {"image_url", {{"url", "data:image/png;base64,AA=="}}}},
+                        })}},
+        });
+        auto media_chat = cell::llm::OpenAI::body("m", media_tool, nlohmann::json::array(), false);
+        auto &media_msgs = media_chat["messages"];
+        R.expect(media_msgs.size() == 2 &&
+                     media_msgs[0].value("role", "") == "tool" && media_msgs[0]["content"] == "screenshot:" &&
+                     media_msgs[1].value("role", "") == "user" &&
+                     media_msgs[1]["content"][0].value("type", "") == "image_url" &&
+                     media_msgs[1]["content"][0]["image_url"].value("url", "") == "data:image/png;base64,AA==",
+                 "openai chat moves tool images to a follow-up user message");
     }
 
     // log rotation: trim_log keeps only the tail of an over-cap log file
@@ -17142,6 +17638,23 @@ static int run_selftest()
         // the notice names the reason (it is what /reload replays)
         R.expect(cell::chat::interrupt_notice("interrupted by the user (Esc)").find("interrupted by the user (Esc)") != std::string::npos,
                  "interrupt notice carries the reason");
+
+        // is_user_turn: a tool_result carrier (role=user in the Anthropic
+        // format) is not a user turn; keeping it as compact's trailing user
+        // message orphaned the transcript (DeepSeek 400 "tool_use_id found in
+        // tool_result blocks without a corresponding tool_use")
+        R.expect(cell::chat::is_user_turn({{"role", "user"}, {"content", "hello"}}),
+                 "user turn: string content counts");
+        R.expect(cell::chat::is_user_turn({{"role", "user"}, {"content", nlohmann::json::array({{{"type", "text"}, {"text", "hi"}}})}}),
+                 "user turn: text blocks count");
+        R.expect(!cell::chat::is_user_turn({{"role", "user"}, {"content", nlohmann::json::array({{{"type", "tool_result"}, {"tool_use_id", "x"}, {"content", "r"}}})}}),
+                 "user turn: a tool_result carrier does not count");
+        R.expect(!cell::chat::is_user_turn({{"role", "user"}, {"content", nlohmann::json::array({{{"type", "tool_result"}, {"tool_use_id", "x"}, {"content", "r"}}, {{"type", "text"}, {"text", "after"}}})}}),
+                 "user turn: a mixed tool_result message does not count");
+        R.expect(!cell::chat::is_user_turn({{"role", "assistant"}, {"content", "x"}}),
+                 "user turn: assistant content does not count");
+        R.expect(!cell::chat::is_user_turn({{"role", "user"}, {"content", nlohmann::json::array()}}),
+                 "user turn: an empty content array does not count");
 
         // session state injected mid-conversation (notices, skills, interrupt
         // notes, compaction summaries) must end up in the leading system block:
@@ -17949,7 +18462,8 @@ int repl::run()
                        const nlohmann::json *override_tools, nlohmann::json &reply,
                        nlohmann::json &tc, nlohmann::json &usage, std::string &err,
                        bool with_tools = true, int think_level = 0,
-                       cell::net::XferCallback on_xfer = nullptr, void *xfer_data = nullptr) -> bool
+                       cell::net::XferCallback on_xfer = nullptr, void *xfer_data = nullptr,
+                       long *http_status = nullptr) -> bool
     {
         nlohmann::json no_tools = nlohmann::json::array();
         if (p.api_style == "anthropic")
@@ -17958,8 +18472,8 @@ int repl::run()
             auto &client = cache.a(p.base);
             client.set_proxy(p.proxy);
             if (stream)
-                return client.chat_stream(key, model, msgs, tools, std::move(on_tok), std::move(on_reason), reply, tc, usage, err, think_level, on_xfer, xfer_data);
-            return client.chat(key, model, msgs, tools, reply, tc, usage, err, think_level);
+                return client.chat_stream(key, model, msgs, tools, std::move(on_tok), std::move(on_reason), reply, tc, usage, err, think_level, on_xfer, xfer_data, http_status);
+            return client.chat(key, model, msgs, tools, reply, tc, usage, err, think_level, http_status);
         }
         if (p.api_style == "openai-responses")
         {
@@ -17967,16 +18481,16 @@ int repl::run()
             auto &client = cache.r(p.base);
             client.set_proxy(p.proxy);
             if (stream)
-                return client.chat_stream(key, model, msgs, tools, std::move(on_tok), std::move(on_reason), reply, tc, usage, err, on_xfer, xfer_data);
-            return client.chat(key, model, msgs, tools, reply, tc, usage, err);
+                return client.chat_stream(key, model, msgs, tools, std::move(on_tok), std::move(on_reason), reply, tc, usage, err, on_xfer, xfer_data, http_status);
+            return client.chat(key, model, msgs, tools, reply, tc, usage, err, http_status);
         }
         // default: openai-chat (Chat Completions)
         const nlohmann::json &tools = override_tools ? *override_tools : (with_tools ? tool_defs_openai : no_tools);
         auto &client = cache.o(p.base);
         client.set_proxy(p.proxy);
         if (stream)
-            return client.chat_stream(key, model, msgs, tools, std::move(on_tok), std::move(on_reason), reply, tc, usage, err, on_xfer, xfer_data);
-        return client.chat(key, model, msgs, tools, reply, tc, usage, err);
+            return client.chat_stream(key, model, msgs, tools, std::move(on_tok), std::move(on_reason), reply, tc, usage, err, on_xfer, xfer_data, http_status);
+        return client.chat(key, model, msgs, tools, reply, tc, usage, err, http_status);
     };
 
     auto trunc = [](const std::string &s, size_t n) -> std::string
@@ -18185,9 +18699,11 @@ int repl::run()
         }
         else if (u.contains("cache_read_input_tokens") && u["cache_read_input_tokens"].is_number_integer())
         {
+            // Anthropic: input_tokens excludes both cache reads and cache writes
+            // (cache_creation_input_tokens), so the prompt total is their sum
             cached = u["cache_read_input_tokens"].get<long long>();
             if (u.contains("input_tokens") && u["input_tokens"].is_number_integer())
-                total = cached + u["input_tokens"].get<long long>();
+                total = cached + u["input_tokens"].get<long long>() + (long long)num_arg(u, "cache_creation_input_tokens", 0);
         }
         if (cached < 0 || total <= 0)
             return std::nullopt;
@@ -18218,7 +18734,8 @@ int repl::run()
         else
             cell::sys::println("cwd -> {}", cell::workdir().string());
     }
-    // async connectivity probes (boot): joined on exit so curl_global_cleanup is safe
+    // async connectivity probes (boot): joined on exit so the global curl
+    // teardown is safe (the wrapper only calls curl_global_cleanup)
     std::vector<std::thread> probe_threads;
     // RAII exit guard: persists the session + config and cleans up libcurl no matter how
     // main leaves this scope (normal /exception / Ctrl+C graceful exit).
@@ -18245,7 +18762,7 @@ int repl::run()
         for (auto &t : probe_threads) // curl handles may be in flight on these threads
             if (t.joinable())
                 t.join();
-        curl_global_cleanup(); });
+        cell::net::curl_global_shutdown(); });
     auto skills_all = cell::skills::list();
     std::string skills_prompt = cell::skills::metadata_prompt(skills_all);
     auto ensure_prompt = [&](cell::chat::session &sess)
@@ -18669,11 +19186,13 @@ int repl::run()
         // a chat template also needs at least one real turn left: replacing the
         // whole conversation with system messages alone is rejected ("No user
         // query found in messages"), and a caller that compacted on a context
-        // overflow would have nothing to re-send. The most recent user message
-        // therefore survives next to the summary.
+        // overflow would have nothing to re-send. The most recent REAL user
+        // message therefore survives next to the summary — never a tool_result
+        // carrier (role=user in the Anthropic format): keeping one without its
+        // assistant tool_use would make every provider reject the transcript.
         const nlohmann::json *tail_user = nullptr;
         for (size_t i = rest.size(); i-- > 0;)
-            if (rest[i].is_object() && rest[i].value("role", "") == "user")
+            if (cell::chat::is_user_turn(rest[i]))
             {
                 tail_user = &rest[i];
                 break;
@@ -18932,6 +19451,7 @@ int repl::run()
                 bool ok = false;
                 std::string err;
                 int attempt = 0;
+                long http_status = 0;
                 bool compacted_this_round = false;
                 while (attempt < kMaxRetries)
                 {
@@ -19038,7 +19558,8 @@ int repl::run()
                     // (a notice, a skill, an interrupt, an old transcript read
                     // back from disk) must not leave it behind the conversation
                     cell::chat::fold_system_messages(h.now().msg());
-                    ok = do_chat(*p, key, cfg.current_model, h.now().msg(), true, std::move(tok_cb), std::move(reason_cb), nullptr, reply, tool_calls, usage, err, cfg.tools, cfg.think_level, xfer_cb, &ui);
+                    http_status = 0;
+                    ok = do_chat(*p, key, cfg.current_model, h.now().msg(), true, std::move(tok_cb), std::move(reason_cb), nullptr, reply, tool_calls, usage, err, cfg.tools, cfg.think_level, xfer_cb, &ui, &http_status);
                     if (ui.timer_line || ui.tok_line)
                     {
                         if (cell::sys::detail::color_enabled)
@@ -19103,24 +19624,29 @@ int repl::run()
                                                     tool_calls.size(), attempt + 1));
                         break;
                     }
-                    // request failed
-                    if (attempt < kMaxRetries - 1)
+                    // request failed: retry only transient failures. A 4xx other
+                    // than 408/409/429 is deterministic (bad request, model or
+                    // base, auth, validation) — retrying it only burns 5s per
+                    // attempt; transport aborts report 0 here and stay retryable
+                    bool retryable = !(http_status >= 400 && http_status < 500 &&
+                                       http_status != 408 && http_status != 409 && http_status != 429);
+                    if (retryable && attempt < kMaxRetries - 1)
                     {
                         log.warn("llm", std::format("request_failed model={} round={} attempt={}/{} err={} -> retrying", cfg.model_label(), rounds, attempt + 1, kMaxRetries, err.empty() ? "n/a" : err));
                         attempt++;
                     }
                     else
                     {
-                        // final attempt failed: the reply assembled so far is kept
-                        // (do_chat assembles it even after an aborted transfer) and
-                        // the turn is recorded as interrupted, so the user can
-                        // /reload instead of retyping the request
+                        // final attempt failed or a non-retryable client error: the
+                        // reply assembled so far is kept (do_chat assembles it even
+                        // after an aborted transfer) and the turn is recorded as
+                        // interrupted, so the user can /reload instead of retyping
                         double final_sec = cell::sys::elapsed_ms(t0) / 1000.0;
-                        log.error("llm", std::format("request_failed model={} round={} ctx_msgs={} time={:.2f}s err={} attempts={}", cfg.model_label(), rounds, (long long)h.now().msg().size(), final_sec, err.empty() ? "n/a" : err, kMaxRetries));
+                        log.error("llm", std::format("request_failed model={} round={} ctx_msgs={} time={:.2f}s err={} attempts={}", cfg.model_label(), rounds, (long long)h.now().msg().size(), final_sec, err.empty() ? "n/a" : err, attempt + 1));
                         cell::sys::println();
-                        cell::sys::error("[llm error after {} attempts] {}", kMaxRetries, err.empty() ? "request failed" : err);
+                        cell::sys::error("[llm error after {} attempt(s)] {}", attempt + 1, err.empty() ? "request failed" : err);
                         cell::chat::record_interrupt(h.now(), reply,
-                                                     std::format("LLM client error after {} attempts: {}", kMaxRetries,
+                                                     std::format("LLM client error after {} attempt(s): {}", attempt + 1,
                                                                  trunc(err.empty() ? "request failed" : err, 300)));
                         cell::sys::println("[interrupted] partial output kept, pending tool calls cancelled - /reload resumes the turn");
                         done = true;
