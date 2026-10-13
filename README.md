@@ -479,7 +479,7 @@ or `/teamworks workflow [FILE]` from the REPL.
 | `provider` / `model` | run **this child** on a specific provider/model |
 | `think` | chain-of-thought level for this child |
 | `reuse` | `tw-ID/worker_N` for a past job, or a bare `worker_N` for an earlier-stage worker of the same job — inherits the task config and, by default, the transcript |
-| `reuse_context` | `true` (default): replay the earlier conversation; `false`: config only |
+| `reuse_context` | `true` (default): carry the earlier child's completion report — or a summary of its transcript when no report exists; the raw messages are never carried; `false`: config only |
 | `name` | explicit child name (sanitized for use as a file name) |
 | `editable` | existing files the main agent lets this child modify — see [File lease](#file-lease-and-supervisor-review) |
 | `edit_rules` | the constraint those modifications are reviewed against; **required whenever `editable` is given** |
@@ -550,7 +550,7 @@ across all its rounds, so parallel children never share a curl handle.
 | `run` | `id` (+ optional config override, `background` for a background run) | runs the job / resumes a waiting one, returns the consolidated report |
 | `edit` | `id` + new `work-type`/`list`/`workflow` | replaces the config of an uncompleted job (progress resets) |
 | `remove` | `id` | deletes a job (agents may not delete completed jobs) |
-| `reuse` | `from:"tw-ID/worker_N"`, optional `works`/`provider`/`model`/`think`/`name` | creates a new job seeded from a past child |
+| `reuse` | `from:"tw-ID/worker_N"`, optional `works`/`provider`/`model`/`think`/`name` | creates a new job seeded from a past child (its completion report or a summary is carried, not its raw messages) |
 | `list` | `all` | lists jobs of this session (or of every session in this working directory) |
 | `history` | `id`, `worker`, `limit`, `all` | lists past child tasks: status, provider, model, rounds, tool calls, created |
 | `report` | `id` + `worker` | prints one child's report |
@@ -598,8 +598,14 @@ text, so results stay recoverable.
   pool-hosted run can never deadlock, and are joined at exit.
 - A child that throws is captured and reported as `failed`; a job never gets stuck in `running`
   across restarts (boot recovery marks interrupted runs `failed`). Jobs also carry
-  `ok / incomplete / failed / stopped` per child, where `incomplete` means the child hit the
-  8-round limit without producing a final answer.
+  `ok / failed / stopped` per child.
+- **No round cap, self-compacting children.** A child continues until it answers without tool
+  calls, is stopped, or fails. When its transcript outgrows the model's context window — or
+  passes 500 messages — the child's own output is summarized into its leading system block (the
+  carried background is never compacted), the raw transcript is archived into the job directory
+  (`<worker>.compact-<UTC>.jsonl`) before the rewrite, and a `compact` notice tells the
+  supervisor it may stop the job if the child should not continue. A summarization that fails
+  leaves the transcript exactly as it was.
 - Child runs count toward usage statistics with their real token counts, keyed
   `<job-id>-<child-name>`.
 
