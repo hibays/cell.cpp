@@ -5,3 +5,10 @@ etc
 bin
 .workbuddy
 build/
+agent-gui-api-assessment.html
+
+# frontend (bun / vite)
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+*.tsbuildinfo

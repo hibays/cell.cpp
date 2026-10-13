@@ -31,10 +31,10 @@
  *                         a GUI to talk to the agent without a terminal
  *   cell_free()         — release strings returned by cell_run_oneshot()
  *
- * Not yet available (roadmap, see docs/RESTful.md): structured event streams
- * (token/tool_call/tool_result), remote approvals, session enumeration. Those
- * arrive with the service layer; until then cell_run_oneshot() returns the
- * rendered text of a whole turn.
+ * Not exposed here (they need the HTTP transport): structured event streams,
+ * remote approvals and session enumeration are served by `cell --serve` —
+ * see docs/RESTful.md — which a desktop front-end can drive in a second
+ * process, or reach through the same binary via a loopback connection.
  */
 #ifndef CELL_H
 #define CELL_H

@@ -178,11 +178,15 @@ vcpkg install curl nlohmann-json libsodium
 ### Build
 
 ```bash
-# POSIX / MSYS2
+# POSIX / MSYS2 (ws2_32 is needed on Windows for the built-in `--serve` HTTP server)
 g++ -std=c++26 -O2 -o bin/cell cell.cpp -lcurl -lsodium
+g++ -std=c++26 -O2 -o bin/cell cell.cpp -lcurl -lsodium -lws2_32   # Windows
 
 # MSVC
-cl /std:c++latest /O2 /EHsc cell.cpp /Fe:bin\cell.exe /I<deps>\include /link libcurl.lib libsodium.lib
+cl /std:c++latest /O2 /EHsc cell.cpp /Fe:bin\cell.exe /I<deps>\include /link libcurl.lib libsodium.lib ws2_32.lib
+
+# CMake (multi-platform, shared library / DLL, CI, presets — see docs/BUILDING.md)
+cmake --preset default && cmake --build --preset default && ctest --preset default
 ```
 
 ### Run
@@ -199,6 +203,9 @@ bin/cell --base http://localhost:11434/v1 --model qwen2.5-coder
 
 # non-interactive: stdin is one message, reply is printed, then exit
 echo "explain what this repo does" | bin/cell
+
+# RESTful service layer: HTTP + SSE for GUI front-ends (docs/RESTful.md)
+bin/cell --serve --port 8737
 
 # verify the build
 bin/cell --selftest

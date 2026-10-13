@@ -14,6 +14,7 @@
 #    cell          (CLI executable,      CELL_BUILD_CLI=ON,    default ON)
 #    cell::shared  (DLL / .so / .dylib,  CELL_BUILD_SHARED=ON, default ON)
 #    cell::static  (static library,      CELL_BUILD_STATIC=ON, default OFF)
+#    cellui        (WebUI desktop shell, CELL_BUILD_WEBUI=ON,  default ON)
 #
 #  The single-file contract stays intact: `g++ -std=c++26 -O2 cell.cpp -o cell
 #  -lcurl -lsodium` still works with no CMake involved. Everything below is an
@@ -24,7 +25,7 @@ cmake_minimum_required(VERSION 3.21)
 project(cell
     VERSION 0.1.0
     DESCRIPTION "A single-file AI coding agent in modern C++26"
-    LANGUAGES CXX)
+    LANGUAGES C CXX) # C for the vendored WebUI / civetweb sources
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 
@@ -34,6 +35,8 @@ list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 option(CELL_BUILD_CLI            "Build the cell command-line executable"                    ON)
 option(CELL_BUILD_SHARED         "Build cell as a shared library (DLL / .so / .dylib)"       ON)
 option(CELL_BUILD_STATIC         "Build cell as a static library"                            OFF)
+option(CELL_BUILD_WEBUI          "Build cellui (WebUI desktop shell, single binary)"         ON)
+option(CELL_EMBED_WEBUI          "Embed the built front-end (frontend/dist) into cellui"     ON)
 option(CELL_BUILD_TESTS          "Register ctest tests (self-test + embedding smoke test)"   ON)
 option(CELL_INSTALL              "Generate install rules and a CMake package (find_package)" ON)
 option(CELL_FETCH_DEPS           "Allow fetching header-only deps when not installed"        ON)
@@ -278,7 +281,31 @@ endif()
 # -----------------------------------------------------------------------------
 function(cell_configure_target target)
     target_compile_definitions(${target} PRIVATE CELL_VERSION="${CELL_VERSION_STRING}")
-    target_link_libraries(${target} PRIVATE ${CELL_CURL} ${CELL_SODIUM} ${CELL_JSON} Threads::Threads)
+
+    if(WIN32)
+        # the built-in HTTP server of `cell --serve` uses Winsock 2
+        target_link_libraries(${target} PRIVATE ws2_32)
+    endif()
+
+    # ---- dependency linkage -------------------------------------------------
+    # MinGW + CELL_STATIC_DEPS: Release links `-static` with the pkg-config
+    # dependency set (curl, sodium and curl's transitive static deps) — that is
+    # what makes the shipped binaries portable single files. The shared curl
+    # target is deliberately NOT linked there: its imported location points at
+    # the import library, which `-static` cannot override.
+    if(MINGW AND CELL_STATIC_DEPS AND CELL_MINGW_STATIC_LINK)
+        # the curl/sodium headers must drop their dllimport decoration or the
+        # objects reference __imp_* symbols the static archives do not define
+        target_compile_definitions(${target} PRIVATE CURL_STATICLIB SODIUM_STATIC)
+        target_link_options(${target} PRIVATE $<$<NOT:$<CONFIG:Debug>>:-static>)
+        target_link_libraries(${target} PRIVATE
+            $<$<CONFIG:Debug>:${CELL_CURL}>
+            $<$<CONFIG:Debug>:${CELL_SODIUM}>
+            $<$<NOT:$<CONFIG:Debug>>:${CELL_MINGW_STATIC_LINK}>)
+    else()
+        target_link_libraries(${target} PRIVATE ${CELL_CURL} ${CELL_SODIUM})
+    endif()
+    target_link_libraries(${target} PRIVATE ${CELL_JSON} Threads::Threads)
 
     if(CELL_ENABLE_WARNINGS)
         if(MSVC)
@@ -295,16 +322,23 @@ function(cell_configure_target target)
         endif()
     endif()
 
-    if(MINGW AND CELL_MINGW_STATIC_RUNTIME)
+    if(MINGW AND CELL_MINGW_STATIC_RUNTIME AND NOT (CELL_STATIC_DEPS AND CELL_MINGW_STATIC_LINK))
         # Ship a self-contained DLL/exe: no libstdc++-6.dll / libgcc_s_*.dll to
-        # copy next to the binary. (libwinpthread, curl and sodium still follow
-        # their own linkage; build those statically to go fully standalone.)
+        # copy next to the binary. (In the CELL_STATIC_DEPS path `-static`
+        # already covers these, so the flags are only needed here.)
         # Debug builds are excluded: the MinGW linker fails silently when a
         # large debug object (tens of MB) is combined with libstdc++.a, and a
         # development build wants the dynamic runtime anyway.
         target_link_options(${target} PRIVATE
             $<$<NOT:$<CONFIG:Debug>>:-static-libgcc>
             $<$<NOT:$<CONFIG:Debug>>:-static-libstdc++>)
+    endif()
+
+    # cellui compiles cell.cpp in a TU that already includes the WebUI headers;
+    # that combination makes GCC's -Wsubobject-linkage fire on pre-existing
+    # internal-linkage lambdas. It is cosmetic (the CLI/shared TUs are clean).
+    if(CELL_BUILD_WEBUI AND NOT MSVC)
+        target_compile_options(${target} PRIVATE -Wno-subobject-linkage)
     endif()
 
     if(CELL_ENABLE_LTO)
@@ -371,8 +405,80 @@ if(CELL_BUILD_CLI)
     cell_configure_target(cell_cli)
 endif()
 
-if(NOT CELL_BUILD_CLI AND NOT CELL_BUILD_SHARED AND NOT CELL_BUILD_STATIC)
-    message(FATAL_ERROR "Nothing to build: enable at least one of CELL_BUILD_CLI / CELL_BUILD_SHARED / CELL_BUILD_STATIC")
+# ---- vendored WebUI (the desktop shell driver) ------------------------------
+# third_party/webui carries the WebUI sources (webui.c + civetweb + the
+# WebView2/WKWebView backends). On Windows the WebView2 loader is linked
+# statically (third_party/webui/lib/WebView2LoaderStatic.lib), so the shell
+# binary needs no runtime DLLs next to it.
+if(CELL_BUILD_WEBUI)
+    set(WEBUI_DIR ${CMAKE_CURRENT_SOURCE_DIR}/third_party/webui)
+    if(NOT EXISTS ${WEBUI_DIR}/include/webui.h)
+        message(FATAL_ERROR "third_party/webui is missing (expected ${WEBUI_DIR}/include/webui.h)")
+    endif()
+
+    add_library(webui STATIC
+        ${WEBUI_DIR}/src/webui.c
+        ${WEBUI_DIR}/src/civetweb/civetweb.c)
+    if(WIN32)
+        target_sources(webui PRIVATE ${WEBUI_DIR}/src/webview/win32_wv2.cpp)
+    elseif(APPLE)
+        enable_language(OBJC)
+        target_sources(webui PRIVATE ${WEBUI_DIR}/src/webview/wkwebview.m)
+        find_library(COCOA_FRAMEWORK Cocoa REQUIRED)
+        find_library(WEBKIT_FRAMEWORK WebKit REQUIRED)
+        target_link_libraries(webui PUBLIC ${COCOA_FRAMEWORK} ${WEBKIT_FRAMEWORK})
+    endif()
+    target_include_directories(webui PUBLIC ${WEBUI_DIR}/include)
+    target_include_directories(webui PRIVATE
+        ${WEBUI_DIR}/src
+        ${WEBUI_DIR}/src/civetweb
+        ${WEBUI_DIR}/src/webview
+        ${WEBUI_DIR}/bridge)
+    # compile-time behaviour of the vendored sources — never leak into consumers
+    target_compile_definitions(webui PRIVATE NO_CACHING NO_CGI USE_WEBSOCKET NO_SSL)
+    if(WIN32)
+        target_link_libraries(webui PUBLIC ws2_32 user32 shell32 ole32 uuid oleaut32 comdlg32 advapi32)
+        # static WebView2 loader (the runtime itself is provided by the OS)
+        if(EXISTS ${WEBUI_DIR}/lib/WebView2LoaderStatic.lib)
+            target_link_libraries(webui PRIVATE ${WEBUI_DIR}/lib/WebView2LoaderStatic.lib)
+        else()
+            message(WARNING "WebView2LoaderStatic.lib not found in ${WEBUI_DIR}/lib — the shell will need WebView2Loader.dll at runtime")
+        endif()
+    endif()
+    set_target_properties(webui PROPERTIES POSITION_INDEPENDENT_CODE ON)
+endif()
+
+# ---- desktop shell (cellui) ---------------------------------------------------
+if(CELL_BUILD_WEBUI)
+    add_executable(cellui cellui.cpp)
+    add_executable(cell::ui ALIAS cellui)
+    target_include_directories(cellui PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_BINARY_DIR})
+    # cell.cpp is linked into the shell; cellui.cpp itself defines CELL_NO_MAIN
+    # and owns main(). Dependencies come from cell_configure_target (so the
+    # static-dependency switch applies here exactly as it does to the CLI).
+    target_link_libraries(cellui PRIVATE webui)
+    cell_configure_target(cellui)
+
+    # embed the built front-end (frontend/dist/index.html -> cellui_web.h)
+    if(CELL_EMBED_WEBUI)
+        find_program(CELL_WEB_BUILDER NAMES bun node nodejs)
+        if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/frontend/dist/index.html AND CELL_WEB_BUILDER)
+            add_custom_command(
+                OUTPUT ${CMAKE_BINARY_DIR}/cellui_web.h
+                COMMAND ${CELL_WEB_BUILDER} ${CMAKE_CURRENT_SOURCE_DIR}/scripts/embed_webui.mjs ${CMAKE_BINARY_DIR}
+                WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+                COMMENT "embedding the built front-end into the cellui binary"
+                VERBATIM)
+            add_custom_target(cellui_web DEPENDS ${CMAKE_BINARY_DIR}/cellui_web.h)
+            add_dependencies(cellui cellui_web)
+        else()
+            message(STATUS "cellui: front-end not built (or no node/bun) — the binary falls back to a built-in placeholder page")
+        endif()
+    endif()
+endif()
+
+if(NOT CELL_BUILD_CLI AND NOT CELL_BUILD_SHARED AND NOT CELL_BUILD_STATIC AND NOT CELL_BUILD_WEBUI)
+    message(FATAL_ERROR "Nothing to build: enable at least one of CELL_BUILD_CLI / CELL_BUILD_SHARED / CELL_BUILD_STATIC / CELL_BUILD_WEBUI")
 endif()
 
 # -----------------------------------------------------------------------------
@@ -432,6 +538,9 @@ if(CELL_INSTALL)
     if(CELL_BUILD_CLI)
         install(TARGETS cell_cli RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
     endif()
+    if(CELL_BUILD_WEBUI)
+        install(TARGETS cellui RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+    endif()
 
     install(FILES include/cell.h DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 
@@ -480,7 +589,7 @@ message(STATUS "")
 message(STATUS "cell ${PROJECT_VERSION} — ${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION}")
 message(STATUS "  standard    : ${CELL_CXX_FLAG}")
 message(STATUS "  build type  : ${CMAKE_BUILD_TYPE}")
-message(STATUS "  targets     : cli=${CELL_BUILD_CLI} shared=${CELL_BUILD_SHARED} static=${CELL_BUILD_STATIC}")
+message(STATUS "  targets     : cli=${CELL_BUILD_CLI} shared=${CELL_BUILD_SHARED} static=${CELL_BUILD_STATIC} webui=${CELL_BUILD_WEBUI}")
 message(STATUS "  dependencies: curl=${CURL_VERSION_STRING} sodium=${CELL_SODIUM} json=${_cell_json_state}")
 message(STATUS "  outputs     : ${CMAKE_BINARY_DIR}/bin  ${CMAKE_BINARY_DIR}/lib")
 message(STATUS "")

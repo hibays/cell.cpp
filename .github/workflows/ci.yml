@@ -2,15 +2,19 @@
 #  CI — build + test cell.cpp on every supported platform / toolchain
 #
 #  Jobs
-#    linux-gcc     Ubuntu 24.04 · GCC 14          (warnings-as-errors, static too)
-#    linux-asan    Ubuntu 24.04 · GCC 14          ASan + UBSan over the self-test
-#    windows-msvc  Windows Server 2022 · MSVC     via the preinstalled vcpkg (manifest)
-#    windows-msys2 Windows Server 2022 · GCC      MSYS2 UCRT64, pacman dependencies
-#    macos         macOS 15 · AppleClang          needs Xcode 16.3+ (libc++ <generator>)
+#    linux-gcc        Ubuntu 24.04 · GCC 14         warnings-as-errors, static lib,
+#                                                   service-layer E2E (mock provider)
+#    linux-asan       Ubuntu 24.04 · GCC 14         ASan + UBSan over the self-test
+#    windows-msvc     Windows Server 2022 · MSVC    via the preinstalled vcpkg (manifest)
+#    windows-msys2    Windows Server 2022 · GCC     MSYS2 UCRT64, pacman dependencies
+#    windows-desktop  Windows Server 2022 · GCC     front-end (bun) + cellui shell,
+#                                                   portable-single-file check
+#    macos            macOS 15 · AppleClang         needs Xcode 16.3+ (libc++ <generator>)
 #
-#  Every job runs the same three steps: configure -> build -> ctest. The tests
-#  are the binary's built-in self-test suite plus the embedding smoke test that
-#  links the shared library through include/cell.h.
+#  Every C++ job runs the same three steps: configure -> build -> ctest. The
+#  tests are the binary's built-in self-test suite plus the embedding smoke test
+#  that links the shared library through include/cell.h. The service-layer job
+#  additionally drives tests/serve_e2e/run.sh against a mock OpenAI server.
 # =============================================================================
 name: CI
 
@@ -35,7 +39,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            ninja-build g++-14 \
+            ninja-build g++-14 python3 \
             libcurl4-openssl-dev libsodium-dev nlohmann-json3-dev
 
       - name: Configure
@@ -51,6 +55,12 @@ jobs:
 
       - name: Test
         run: ctest --test-dir build --output-on-failure
+
+      - name: Service-layer end-to-end (REST + SSE + approvals)
+        env:
+          CELL_BIN: ${{ github.workspace }}/build/bin/cell
+          PYTHON: python3
+        run: bash tests/serve_e2e/run.sh
 
   # ---------------------------------------------------------------------------
   linux-asan:
@@ -122,6 +132,7 @@ jobs:
             mingw-w64-ucrt-x86_64-gcc
             mingw-w64-ucrt-x86_64-cmake
             mingw-w64-ucrt-x86_64-ninja
+            mingw-w64-ucrt-x86_64-pkgconf
             mingw-w64-ucrt-x86_64-curl
             mingw-w64-ucrt-x86_64-libsodium
             mingw-w64-ucrt-x86_64-nlohmann-json
@@ -142,6 +153,78 @@ jobs:
         run: ctest --test-dir build --output-on-failure
 
   # ---------------------------------------------------------------------------
+  windows-desktop:
+    name: Windows · desktop shell (cellui)
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-cmake
+            mingw-w64-ucrt-x86_64-ninja
+            mingw-w64-ucrt-x86_64-pkgconf
+            mingw-w64-ucrt-x86_64-curl
+            mingw-w64-ucrt-x86_64-libsodium
+            mingw-w64-ucrt-x86_64-nlohmann-json
+
+      - name: Front-end — install, lint, build
+        working-directory: frontend
+        run: |
+          bun install --frozen-lockfile
+          bun run lint
+          bun run build
+
+      - name: Configure (shell + static dependency set)
+        shell: msys2 {0}
+        run: >
+          cmake -S . -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DCELL_BUILD_CLI=ON
+          -DCELL_BUILD_WEBUI=ON
+          -DCELL_STATIC_DEPS=ON
+          -DCELL_BUILD_TESTS=ON
+
+      - name: Build
+        shell: msys2 {0}
+        run: cmake --build build --parallel
+
+      - name: Test
+        shell: msys2 {0}
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Portable-single-file check (no runtime DLLs beyond the system)
+        shell: msys2 {0}
+        run: |
+          set -e
+          deps=$(objdump -p build/bin/cellui.exe | grep 'DLL Name' | awk '{print $3}' | sort -u)
+          echo "$deps"
+          for banned in libcurl libsodium libstdc++ libgcc_s libwinpthread WebView2Loader; do
+            if echo "$deps" | grep -qi "$banned"; then
+              echo "::error::cellui.exe depends on $banned — the portable single-file promise is broken"
+              exit 1
+            fi
+          done
+          echo "cellui.exe links only system DLLs"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: cell-desktop-windows
+          path: |
+            build/bin/cell.exe
+            build/bin/cellui.exe
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
   macos:
     name: macOS · AppleClang
     runs-on: macos-15 # ships Xcode 16.x; cell.cpp needs Xcode 16.3+ (libc++ <generator>)
@@ -156,6 +239,7 @@ jobs:
           cmake -S . -B build -G Ninja
           -DCMAKE_BUILD_TYPE=Release
           -DCELL_BUILD_STATIC=ON
+          -DCELL_BUILD_WEBUI=OFF
 
       - name: Build
         run: cmake --build build --parallel

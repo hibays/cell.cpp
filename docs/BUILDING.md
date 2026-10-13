@@ -100,7 +100,11 @@ cmake --build build && ctest --test-dir build --output-on-failure
 ### One-liner without CMake (still supported)
 
 ```bash
+# Linux / macOS
 g++ -std=c++26 -O2 -o cell cell.cpp -lcurl -lsodium
+
+# Windows (MinGW): + ws2_32 for the built-in HTTP server of `cell --serve`
+g++ -std=c++26 -O2 -o cell cell.cpp -lcurl -lsodium -lws2_32
 ```
 
 ---
@@ -235,7 +239,7 @@ int main(void)
 
 The MinGW build links libgcc/libstdc++ statically
 (`CELL_MINGW_STATIC_RUNTIME=ON`, optimized configurations only — Debug builds
-keep the dynamic runtime, see §9) and picks up the static curl/sodium archives
+keep the dynamic runtime, see §11) and picks up the static curl/sodium archives
 that MSYS2's `curl`/`libsodium` packages install, so `cell.dll` depends on **only
 Windows system DLLs**. That was verified with `objdump -p cell.dll`:
 `KERNEL32`, `ADVAPI32`, `api-ms-win-crt-*` — no `libcurl.dll`, no
@@ -262,7 +266,101 @@ cmake -S . -B build -G "Visual Studio 17 2022" -A x64 ^
 
 ---
 
-## 6. Verified toolchain matrix
+## 6. Service layer (`cell --serve`)
+
+The same binary can host the RESTful service layer described in
+[RESTful.md](RESTful.md) — a dependency-free HTTP/1.1 + SSE server with bearer
+token auth, session management, turn streaming and HTTP approvals:
+
+```bash
+cell --serve                      # 127.0.0.1:8737, random token
+cell --serve --port 0             # pick a free port (prints it; useful for tests)
+cell --serve --host 0.0.0.0 --token "$MY_TOKEN"
+```
+
+* Discovery file: `.cell/server.json` **next to the binary** (the runtime root
+  is portable and follows the executable, not the working directory).
+* On Windows the server uses **Winsock 2**, so the raw single-file build needs
+  one more library:
+
+  ```bash
+  # Windows (MinGW / MSYS2)
+  g++ -std=c++26 -O2 -o cell cell.cpp -lcurl -lsodium -lws2_32
+
+  # Linux / macOS (sockets live in libc — unchanged)
+  g++ -std=c++26 -O2 -o cell cell.cpp -lcurl -lsodium
+  ```
+
+  The CMake build links `ws2_32` automatically (`cell_configure_target`).
+* No new dependencies, no new targets: `--serve` is a mode of the same
+  executable, and the library/embedding builds (`cell.dll`, `cell_static`)
+  carry the same code.
+
+---
+
+## 7. Desktop front-end (cellui)
+
+`cellui` is the desktop shell: one portable binary that hosts the agent in a
+native window.
+
+| Piece | Where | Notes |
+| --- | --- | --- |
+| WebUI driver | `third_party/webui/` (vendored sources) | compiled from source; **WebView2 with a statically linked loader** on Windows (`third_party/webui/lib/WebView2LoaderStatic.lib`), WKWebView on macOS, webui's browser backend on Linux |
+| Native bridge | `cellui.cpp` | starts the service layer in-process (`cell_main("--serve")` on a worker thread), binds `cell_*` functions to JS, and bridges the **internal** HTML exporter for session/batch/full exports |
+| Front-end | `frontend/` (Vue 3 + TS + Vite) | built to a single HTML file and **embedded into the binary** (`scripts/embed_webui.mjs` → `cellui_web.h`) |
+
+```bash
+# 1. build the front-end (once, or on every UI change)
+bun --cwd frontend install
+bun --cwd frontend run build
+
+# 2. configure + build (the embed step runs automatically)
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build build
+
+# result: one self-contained executable
+build/bin/cellui          # cellui.exe on Windows
+```
+
+`cellui` accepts `--size WxH`, `--port N`, `--host ADDR`, `--no-serve` (open the
+window without the agent, e.g. to iterate on the UI alone). If the front-end has
+not been built, the binary still runs and shows a built-in placeholder page.
+
+### The native bridge (JS ↔ C++)
+
+| JS call (`window.cell.*`) | Native behaviour |
+| --- | --- |
+| `cell_bootstrap()` | version, loopback API base URL + bearer token, platform |
+| `cell_export_session(id, path?)` | renders one session through cell.cpp's own HTML exporter (Teamwork panes included) |
+| `cell_export_batch([ids])` | batch export — one file per session |
+| `cell_export_all()` | every session on disk |
+| `cell_reveal(path)` | show an exported file in the file manager |
+| `cell_open_external(url)` | open a URL in the default browser |
+| `cell_native_capabilities()` | what the native layer provides today |
+| `cell_notify(text)` | placeholder for native notifications (the web UI shows its own toast) |
+
+These are the **internal interface bridge** the GUI builds on: exports never
+leave the process, and the placeholders (`cell_native_capabilities`,
+`cell_notify`) reserve the seam for a future native shell (menus, tray,
+notifications) without changing the web layer.
+
+### Front-end workflow
+
+```bash
+bun --cwd frontend run dev        # dev server on :5173 (browser mode, no bridge)
+bun --cwd frontend run lint       # oxlint --type-aware
+bun --cwd frontend run fmt        # oxfmt
+```
+
+Vue 3.6's **vapor mode** is enabled automatically by `vite.config.ts` once the
+installed `vue` is ≥ 3.6 (the published 3.5.x compiler has no vapor flag); the
+build log states which mode is active. See `frontend/README.md` for the layout,
+the store/API split and the human-touch feature list (command palette,
+onboarding, approval cards, toasts, shortcuts).
+
+---
+
+## 8. Verified toolchain matrix
 
 The build was exercised end-to-end on the toolchains below while this
 documentation was written; CI runs the same three steps (configure → build →
@@ -274,9 +372,12 @@ ctest) on every platform.
 | Static library + install | same, `-DCELL_BUILD_STATIC=ON` + `cmake --install` | ✅ `libcell.a`, `cell.dll` + `cell.h` + `cell-config.cmake` installed |
 | `find_package(cell)` consumer | separate CMake project using the installed prefix | ✅ `cell::shared` and `cell::static` both compile, link and run |
 | Clang build | MSYS2 UCRT64 **Clang 22** (auto-added `-fsized-deallocation`) | ✅ builds, `ctest` 2/2 |
-| Debug build | same GCC, `-DCMAKE_BUILD_TYPE=Debug` | ✅ builds (dynamic libstdc++, see §9) |
+| Debug build | same GCC, `-DCMAKE_BUILD_TYPE=Debug` | ✅ builds (dynamic libstdc++, see §11) |
 | Desktop preset | `cmake --preset desktop-dll` (DLL + smoke test only) | ✅ DLL produced in 23 s, smoke test passes |
 | End-to-end agent run | local mock OpenAI-compatible SSE server | ✅ CLI one-shot replies; a **pure-C program** linking `cell.dll` gets the same reply through `cell_run_oneshot()` with `rc=0` |
+| Service layer E2E | `tests/serve_e2e/run.sh` (mock provider + `cell --serve`) | ✅ all checks: auth, sessions, JSON + SSE turns, config, providers, notices, usages, skills, approvals (allow *and* deny), interrupt/resume, graceful shutdown |
+| Desktop shell (`cellui`) | GCC 16.2, `-DCELL_BUILD_WEBUI=ON`, front-end embedded | ✅ single binary links; WebView2 window opens (probe); **no `WebView2Loader.dll` dependency** (static loader); `objdump` shows only system DLLs |
+| Vendored WebUI from source | `third_party/webui` (webui.c + civetweb + win32_wv2.cpp) | ✅ compiles with MinGW + MSVC defines; static loader links with both |
 | DLL export table | `objdump -p cell.dll` | ✅ exactly 5 exports: `cell_main`, `cell_version`, `cell_selftest`, `cell_run_oneshot`, `cell_free` |
 | AddressSanitizer | not available in MSYS2 UCRT64 (no sanitizer runtime shipped) | ⚠️ configure refuses with guidance; ASan is covered by the Linux CI job |
 
@@ -284,7 +385,7 @@ MSVC / Linux-GCC / macOS-AppleClang are covered by `.github/workflows/ci.yml`.
 
 ---
 
-## 7. Tests
+## 9. Tests
 
 ```bash
 ctest --test-dir build --output-on-failure
@@ -292,8 +393,19 @@ ctest --test-dir build --output-on-failure
 
 | Test | What it checks |
 | --- | --- |
-| `cell.selftest` | the binary's built-in suite (sandbox, sanitizer, editor, crypto, config, sessions, skills, stats, tool registry) — runs in a scratch cwd |
+| `cell.selftest` | the binary's built-in suite (sandbox, sanitizer, editor, crypto, config, sessions, skills, stats, tool registry, serve transport helpers) — runs in a scratch cwd |
 | `cell.embed_smoke` | links the **shared library** through `include/cell.h`: exports resolve, `cell_version()` answers, `cell_main("--help")` returns 0, bad argument lists return an error code instead of exiting |
+
+Optional end-to-end harness for the **service layer** (not wired into ctest: it
+needs Python and starts a mock provider on loopback):
+
+```bash
+CELL_BIN=build/default/bin/cell PYTHON=python3 bash tests/serve_e2e/run.sh
+```
+
+It drives a real `cell --serve` process over HTTP/SSE: auth, sessions,
+JSON + SSE turns, config patches, providers, notices, usages, skills, the
+approval round-trip (allow *and* deny), interrupt/resume and graceful shutdown.
 
 Run the self-test directly any time:
 
@@ -303,7 +415,7 @@ build/bin/cell --selftest
 
 ---
 
-## 8. CI
+## 10. CI
 
 `.github/workflows/ci.yml` runs five jobs — Linux GCC 14 (warnings-as-errors),
 Linux ASan+UBSan, Windows MSVC via the preinstalled vcpkg, Windows MSYS2 UCRT64
@@ -320,7 +432,7 @@ cmake --preset ci && cmake --build --preset ci && ctest --preset ci
 
 ---
 
-## 9. Troubleshooting
+## 11. Troubleshooting
 
 **`<generator> file not found` / `std::generator` errors**
 Your standard library is too old. See the table in §1; on Windows the easiest
@@ -370,7 +482,7 @@ and the build picks it up automatically; keep `CELL_ENABLE_LTO=OFF` (default).
 
 ---
 
-## 10. Build-time macros
+## 12. Build-time macros
 
 Only the CMake build defines these; the raw single-file build defines none of
 them and keeps working unchanged.

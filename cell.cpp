@@ -45,6 +45,10 @@
 #include <cerrno>
 #include <cstdint>
 #ifdef _WIN32
+// winsock2 must precede windows.h (windows.h would otherwise pull in the
+// incompatible winsock 1.1 headers)
+#include <winsock2.h>
+#include <ws2tcpip.h>
 #include <conio.h>
 #include <io.h>
 #include <windows.h>
@@ -56,6 +60,9 @@
 #include <termios.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 #endif
 
 // -----------------------------------------------------------------------------
@@ -15067,6 +15074,1002 @@ details{break-inside:avoid}
         }
     } // namespace teamwork
 
+    // =========================================================================
+    //  serve — the RESTful service layer (`cell --serve`): a dependency-free
+    //  HTTP/1.1 server (Winsock on Windows, BSD sockets elsewhere) plus the
+    //  bridge between the HTTP worker threads and the single-threaded core
+    //  (the agent loop in repl::run()).
+    //
+    //  State rules:
+    //    * the core thread exclusively owns the live session and the
+    //      configuration; requests that need them are posted as jobs and the
+    //      worker blocks until the core produced a response;
+    //    * control endpoints (health, version, approvals, notices, usages,
+    //      skills, interrupt, shutdown) are answered directly by the worker;
+    //    * exactly one turn runs at a time; a pending Policy::Ask approval is
+    //      answered over HTTP while the core thread is blocked inside the turn.
+    //
+    //  The wire contract lives in docs/RESTful.md.
+    // =========================================================================
+    namespace serve
+    {
+        // ---- platform socket layer ------------------------------------------
+#ifdef _WIN32
+        using socket_t = SOCKET;
+        using sock_len_t = int;
+        inline constexpr socket_t kInvalidSocket = INVALID_SOCKET;
+        inline int last_socket_error() { return WSAGetLastError(); }
+        inline void close_socket(socket_t s) { ::closesocket(s); }
+        inline std::string socket_error_text(int e) { return std::format("winsock error {}", e); }
+        inline bool ensure_socket_layer()
+        {
+            static std::once_flag once;
+            static bool ok = false;
+            std::call_once(once, []()
+                           {
+                               WSADATA wsa{};
+                               ok = (::WSAStartup(MAKEWORD(2, 2), &wsa) == 0);
+                           });
+            return ok;
+        }
+#else
+        using socket_t = int;
+        using sock_len_t = socklen_t;
+        inline constexpr socket_t kInvalidSocket = -1;
+        inline int last_socket_error() { return errno; }
+        inline void close_socket(socket_t s) { ::close(s); }
+        inline std::string socket_error_text(int e) { return std::strerror(e); }
+        inline bool ensure_socket_layer() { return true; }
+#endif
+
+        inline bool send_all(socket_t s, const char *data, size_t len)
+        {
+            while (len > 0)
+            {
+                auto chunk = (int)std::min<size_t>(len, 1u << 20);
+#ifdef _WIN32
+                int n = ::send(s, data, chunk, 0);
+#else
+                ssize_t n = ::send(s, data, (size_t)chunk, MSG_NOSIGNAL);
+#endif
+                if (n <= 0)
+                {
+                    int e = last_socket_error();
+#ifdef _WIN32
+                    if (e == WSAEINTR)
+                        continue;
+#else
+                    if (e == EINTR)
+                        continue;
+#endif
+                    return false;
+                }
+                data += n;
+                len -= (size_t)n;
+            }
+            return true;
+        }
+
+        inline int recv_into(socket_t s, char *buf, size_t len)
+        {
+#ifdef _WIN32
+            return ::recv(s, buf, (int)len, 0);
+#else
+            ssize_t n = ::recv(s, buf, len, 0);
+            return (int)n;
+#endif
+        }
+
+        inline void shutdown_write(socket_t s)
+        {
+#ifdef _WIN32
+            ::shutdown(s, SD_SEND);
+#else
+            ::shutdown(s, SHUT_WR);
+#endif
+        }
+
+        inline void set_socket_timeouts(socket_t s, int ms)
+        {
+#ifdef _WIN32
+            DWORD t = (DWORD)ms;
+            ::setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char *)&t, sizeof t);
+            ::setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (const char *)&t, sizeof t);
+#else
+            timeval tv{};
+            tv.tv_sec = ms / 1000;
+            tv.tv_usec = (ms % 1000) * 1000;
+            ::setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+            ::setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+#endif
+        }
+
+        // poll a socket for readability; the acceptor uses it so shutdown never
+        // has to close a socket another thread is blocked in
+        inline bool wait_readable(socket_t s, int ms)
+        {
+#ifdef _WIN32
+            fd_set fds;
+            FD_ZERO(&fds);
+            FD_SET(s, &fds);
+            timeval tv{};
+            tv.tv_sec = ms / 1000;
+            tv.tv_usec = (ms % 1000) * 1000;
+            return ::select(0, &fds, nullptr, nullptr, &tv) > 0;
+#else
+            pollfd p{};
+            p.fd = s;
+            p.events = POLLIN;
+            return ::poll(&p, 1, ms) > 0;
+#endif
+        }
+
+        // ---- tiny HTTP plumbing ---------------------------------------------
+
+        inline std::string url_decode(std::string_view in)
+        {
+            auto hex = [](char ch) -> int
+            {
+                if (ch >= '0' && ch <= '9')
+                    return ch - '0';
+                if (ch >= 'a' && ch <= 'f')
+                    return ch - 'a' + 10;
+                if (ch >= 'A' && ch <= 'F')
+                    return ch - 'A' + 10;
+                return -1;
+            };
+            std::string out;
+            out.reserve(in.size());
+            for (size_t i = 0; i < in.size(); i++)
+            {
+                char c = in[i];
+                if (c == '+')
+                    out.push_back(' ');
+                else if (c == '%' && i + 2 < in.size())
+                {
+                    int hi = hex(in[i + 1]), lo = hex(in[i + 2]);
+                    if (hi >= 0 && lo >= 0)
+                    {
+                        out.push_back((char)((hi << 4) | lo));
+                        i += 2;
+                        continue;
+                    }
+                    out.push_back(c);
+                }
+                else
+                    out.push_back(c);
+            }
+            return out;
+        }
+
+        inline void parse_query(std::string_view raw, std::unordered_map<std::string, std::string> &out)
+        {
+            size_t pos = 0;
+            while (pos <= raw.size())
+            {
+                size_t amp = raw.find('&', pos);
+                std::string_view pair = raw.substr(pos, amp == std::string_view::npos ? std::string_view::npos : amp - pos);
+                size_t eq = pair.find('=');
+                if (!pair.empty())
+                {
+                    std::string k = url_decode(eq == std::string_view::npos ? pair : pair.substr(0, eq));
+                    std::string v = eq == std::string_view::npos ? std::string() : url_decode(pair.substr(eq + 1));
+                    if (!k.empty())
+                        out[k] = v;
+                }
+                if (amp == std::string_view::npos)
+                    break;
+                pos = amp + 1;
+            }
+        }
+
+        inline const char *status_text(int status)
+        {
+            switch (status)
+            {
+            case 200: return "OK";
+            case 204: return "No Content";
+            case 400: return "Bad Request";
+            case 401: return "Unauthorized";
+            case 404: return "Not Found";
+            case 405: return "Method Not Allowed";
+            case 409: return "Conflict";
+            case 413: return "Payload Too Large";
+            case 422: return "Unprocessable Entity";
+            case 500: return "Internal Server Error";
+            case 503: return "Service Unavailable";
+            default: return "OK";
+            }
+        }
+
+        struct request
+        {
+            std::string method;
+            std::string path; // decoded, without the query string
+            std::unordered_map<std::string, std::string> query;
+            std::unordered_map<std::string, std::string> headers; // keys lower-cased
+            std::string body;
+            std::string peer;
+            std::string header(const std::string &key) const
+            {
+                auto it = headers.find(key);
+                return it == headers.end() ? std::string() : it->second;
+            }
+        };
+
+        struct responder
+        {
+            std::function<bool(int, const std::string &, const std::string &)> plain; // status, content_type, body
+            std::function<bool(const std::string &, int)> stream_open;                // content_type, status
+            std::function<bool(const std::string &)> stream_write;
+            std::function<void()> stream_close;
+            bool responded = false;
+
+            bool json(int status, const nlohmann::json &j)
+            {
+                responded = true;
+                return plain(status, "application/json", j.dump());
+            }
+            bool error(int status, const std::string &code, const std::string &message)
+            {
+                responded = true;
+                return plain(status, "application/json",
+                             nlohmann::json{{"error", {{"code", code}, {"message", message}}}}.dump());
+            }
+            bool open_stream(int status = 200)
+            {
+                responded = true;
+                return stream_open("text/event-stream", status);
+            }
+            bool write_event(const std::string &data) { return stream_write("data: " + data + "\n\n"); }
+        };
+
+        class http_server
+        {
+        public:
+            using handler_t = std::function<void(const request &, responder &)>;
+
+            bool start(const std::string &host, int port, handler_t handler, std::string &err)
+            {
+                if (!ensure_socket_layer())
+                {
+                    err = "cannot initialize the socket layer";
+                    return false;
+                }
+                handler_ = std::move(handler);
+                listener_ = ::socket(AF_INET, SOCK_STREAM, 0);
+                if (listener_ == kInvalidSocket)
+                {
+                    err = std::format("socket() failed: {}", socket_error_text(last_socket_error()));
+                    return false;
+                }
+                int one = 1;
+                ::setsockopt(listener_, SOL_SOCKET, SO_REUSEADDR, (const char *)&one, sizeof one);
+                std::string bind_host = host.empty() ? "127.0.0.1" : host;
+                if (bind_host == "localhost")
+                    bind_host = "127.0.0.1";
+                sockaddr_in addr{};
+                addr.sin_family = AF_INET;
+                addr.sin_port = htons((unsigned short)port);
+                addr.sin_addr.s_addr = ::inet_addr(bind_host.c_str());
+                if (addr.sin_addr.s_addr == INADDR_NONE && bind_host != "255.255.255.255")
+                {
+                    err = std::format("invalid bind address: {}", bind_host);
+                    close_socket(listener_);
+                    listener_ = kInvalidSocket;
+                    return false;
+                }
+                if (::bind(listener_, (sockaddr *)&addr, (int)sizeof addr) != 0)
+                {
+                    err = std::format("bind {}:{} failed: {}", bind_host, port, socket_error_text(last_socket_error()));
+                    close_socket(listener_);
+                    listener_ = kInvalidSocket;
+                    return false;
+                }
+                if (::listen(listener_, 64) != 0)
+                {
+                    err = std::format("listen() failed: {}", socket_error_text(last_socket_error()));
+                    close_socket(listener_);
+                    listener_ = kInvalidSocket;
+                    return false;
+                }
+                sockaddr_in bound{};
+                sock_len_t blen = (sock_len_t)sizeof bound;
+                port_ = port;
+                if (::getsockname(listener_, (sockaddr *)&bound, &blen) == 0)
+                    port_ = (int)ntohs(bound.sin_port);
+                stopping_.store(false);
+                acceptor_ = std::thread([this]() { accept_loop(); });
+                return true;
+            }
+
+            void stop()
+            {
+                if (listener_ == kInvalidSocket)
+                    return;
+                stopping_.store(true);
+                if (acceptor_.joinable())
+                    acceptor_.join();
+                // give in-flight connections a moment to flush their response
+                for (int i = 0; i < 100 && active_.load() > 0; i++)
+                    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                close_socket(listener_);
+                listener_ = kInvalidSocket;
+            }
+
+            int port() const { return port_; }
+
+        private:
+            void accept_loop()
+            {
+                while (!stopping_.load())
+                {
+                    if (!wait_readable(listener_, 200))
+                        continue;
+                    sockaddr_in peer{};
+                    sock_len_t plen = (sock_len_t)sizeof peer;
+                    socket_t c = ::accept(listener_, (sockaddr *)&peer, &plen);
+                    if (c == kInvalidSocket)
+                        continue;
+                    char ip[64] = {0};
+                    std::snprintf(ip, sizeof ip, "%u.%u.%u.%u",
+                                  (unsigned)(peer.sin_addr.s_addr & 0xff), (unsigned)((peer.sin_addr.s_addr >> 8) & 0xff),
+                                  (unsigned)((peer.sin_addr.s_addr >> 16) & 0xff), (unsigned)((peer.sin_addr.s_addr >> 24) & 0xff));
+                    std::string peer_ip = ip;
+                    active_.fetch_add(1);
+                    std::thread([this, c, peer_ip]()
+                                {
+                                    serve_connection(c, peer_ip);
+                                    active_.fetch_sub(1);
+                                })
+                        .detach();
+                }
+            }
+
+            void serve_connection(socket_t c, const std::string &peer)
+            {
+                constexpr size_t kMaxHead = 64 * 1024;
+                constexpr size_t kMaxBody = 16 * 1024 * 1024;
+                set_socket_timeouts(c, 30000);
+
+                auto send_error = [&](int status, const std::string &code, const std::string &message)
+                {
+                    std::string body = nlohmann::json{{"error", {{"code", code}, {"message", message}}}}.dump();
+                    std::string head = std::format("HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                                   status, status_text(status), body.size());
+                    send_all(c, head.data(), head.size());
+                    send_all(c, body.data(), body.size());
+                };
+
+                std::string buf;
+                char chunk[8192];
+                size_t head_end = std::string::npos;
+                while ((head_end = buf.find("\r\n\r\n")) == std::string::npos)
+                {
+                    if (buf.size() > kMaxHead)
+                    {
+                        send_error(413, "payload_too_large", "request head exceeds 64 KiB");
+                        close_socket(c);
+                        return;
+                    }
+                    int n = recv_into(c, chunk, sizeof chunk);
+                    if (n <= 0)
+                    {
+                        close_socket(c);
+                        return;
+                    }
+                    buf.append(chunk, (size_t)n);
+                }
+
+                std::string head = buf.substr(0, head_end);
+                std::string rest = buf.substr(head_end + 4);
+                request req;
+                req.peer = peer;
+
+                size_t line_end = head.find("\r\n");
+                std::string line = head.substr(0, line_end == std::string::npos ? head.size() : line_end);
+                size_t sp1 = line.find(' ');
+                size_t sp2 = sp1 == std::string::npos ? std::string::npos : line.find(' ', sp1 + 1);
+                if (sp1 == std::string::npos || sp2 == std::string::npos)
+                {
+                    send_error(400, "bad_request", "malformed request line");
+                    close_socket(c);
+                    return;
+                }
+                req.method = line.substr(0, sp1);
+                std::string target = line.substr(sp1 + 1, sp2 - sp1 - 1);
+
+                size_t pos = line_end == std::string::npos ? head.size() : line_end + 2;
+                while (pos < head.size())
+                {
+                    size_t eol = head.find("\r\n", pos);
+                    std::string hl = head.substr(pos, eol == std::string::npos ? std::string::npos : eol - pos);
+                    size_t colon = hl.find(':');
+                    if (colon != std::string::npos)
+                    {
+                        std::string k = hl.substr(0, colon);
+                        std::string v = cell::text::trim(hl.substr(colon + 1));
+                        for (auto &ch : k)
+                            ch = (char)std::tolower((unsigned char)ch);
+                        req.headers[k] = v;
+                    }
+                    if (eol == std::string::npos)
+                        break;
+                    pos = eol + 2;
+                }
+
+                size_t q = target.find('?');
+                req.path = url_decode(target.substr(0, q));
+                if (q != std::string::npos)
+                    parse_query(target.substr(q + 1), req.query);
+
+                size_t clen = 0;
+                {
+                    const std::string &cl = req.header("content-length");
+                    if (!cl.empty())
+                        clen = (size_t)std::strtoull(cl.c_str(), nullptr, 10);
+                }
+                if (clen > kMaxBody)
+                {
+                    send_error(413, "payload_too_large", "request body exceeds 16 MiB");
+                    close_socket(c);
+                    return;
+                }
+                while (rest.size() < clen)
+                {
+                    int n = recv_into(c, chunk, sizeof chunk);
+                    if (n <= 0)
+                    {
+                        close_socket(c);
+                        return;
+                    }
+                    rest.append(chunk, (size_t)n);
+                }
+                req.body = rest.substr(0, clen);
+
+                responder res;
+                res.plain = [&](int status, const std::string &ctype, const std::string &body) -> bool
+                {
+                    std::string h = std::format("HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
+                                                status, status_text(status), ctype, body.size());
+                    return send_all(c, h.data(), h.size()) && (body.empty() || send_all(c, body.data(), body.size()));
+                };
+                res.stream_open = [&](const std::string &ctype, int status) -> bool
+                {
+                    std::string h = std::format("HTTP/1.1 {} {}\r\nContent-Type: {}\r\nCache-Control: no-store\r\nConnection: close\r\nX-Accel-Buffering: no\r\n\r\n",
+                                                status, status_text(status), ctype);
+                    return send_all(c, h.data(), h.size());
+                };
+                res.stream_write = [&](const std::string &data) -> bool { return send_all(c, data.data(), data.size()); };
+                res.stream_close = [&]() { shutdown_write(c); };
+
+                try
+                {
+                    handler_(req, res);
+                }
+                catch (const std::exception &e)
+                {
+                    if (!res.responded)
+                        send_error(500, "internal", e.what());
+                }
+                catch (...)
+                {
+                    if (!res.responded)
+                        send_error(500, "internal", "unhandled error");
+                }
+                if (!res.responded)
+                    send_error(404, "not_found", std::format("no route for {} {}", req.method, req.path));
+                shutdown_write(c);
+                close_socket(c);
+            }
+
+            handler_t handler_;
+            socket_t listener_ = kInvalidSocket;
+            std::thread acceptor_;
+            std::atomic<bool> stopping_{false};
+            std::atomic<int> active_{0};
+            int port_ = 0;
+        };
+
+        // ---- stdout/stderr capture ------------------------------------------
+#ifdef _WIN32
+        inline int fd_dup(int fd) { return ::_dup(fd); }
+        inline int fd_dup2(int from, int to) { return ::_dup2(from, to); }
+        inline int fd_close(int fd) { return ::_close(fd); }
+        inline int fd_read(int fd, char *buf, unsigned len) { return ::_read(fd, buf, len); }
+        inline bool make_pipe(int fds[2]) { return ::_pipe(fds, 1 << 16, _O_BINARY) == 0; }
+#else
+        inline int fd_dup(int fd) { return ::dup(fd); }
+        inline int fd_dup2(int from, int to) { return ::dup2(from, to); }
+        inline int fd_close(int fd) { return ::close(fd); }
+        inline int fd_read(int fd, char *buf, unsigned len)
+        {
+            ssize_t n = ::read(fd, buf, len);
+            return (int)n;
+        }
+        inline bool make_pipe(int fds[2]) { return ::pipe(fds) == 0; }
+#endif
+
+        // Descriptor-level redirection of fd 1/2 into a pipe for the duration of
+        // one turn; a detached reader hands every chunk to the sink. Same
+        // mechanism cell_run_oneshot() uses: it captures stdio, std::cout and
+        // child processes alike, and works while the core code writes through
+        // fwrite(stdout) directly.
+        class capture
+        {
+        public:
+            static std::shared_ptr<capture> begin(std::function<void(std::string)> sink, std::string &err)
+            {
+                std::fflush(nullptr);
+                int fds[2];
+                if (!make_pipe(fds))
+                {
+                    err = "pipe() failed";
+                    return nullptr;
+                }
+                auto cap = std::shared_ptr<capture>(new capture());
+                cap->sink_ = std::move(sink);
+                cap->saved_out_ = fd_dup(1);
+                cap->saved_err_ = fd_dup(2);
+                if (cap->saved_out_ < 0 || cap->saved_err_ < 0 ||
+                    fd_dup2(fds[1], 1) < 0 || fd_dup2(fds[1], 2) < 0)
+                {
+                    if (cap->saved_out_ >= 0)
+                        fd_dup2(cap->saved_out_, 1);
+                    if (cap->saved_err_ >= 0)
+                        fd_dup2(cap->saved_err_, 2);
+                    if (cap->saved_out_ >= 0)
+                        fd_close(cap->saved_out_);
+                    if (cap->saved_err_ >= 0)
+                        fd_close(cap->saved_err_);
+                    fd_close(fds[0]);
+                    fd_close(fds[1]);
+                    err = "dup2() failed";
+                    return nullptr;
+                }
+                fd_close(fds[1]); // fd 1 and fd 2 hold the write end now
+                cap->read_fd_ = fds[0];
+                std::shared_ptr<capture> self = cap;
+                std::thread([self]() { self->read_loop(); }).detach();
+                return cap;
+            }
+
+            // restore the host streams; the reader thread sees EOF and exits
+            void end()
+            {
+                if (ended_.exchange(true))
+                    return;
+                std::fflush(nullptr);
+                if (saved_out_ >= 0)
+                {
+                    fd_dup2(saved_out_, 1);
+                    fd_close(saved_out_);
+                    saved_out_ = -1;
+                }
+                if (saved_err_ >= 0)
+                {
+                    fd_dup2(saved_err_, 2);
+                    fd_close(saved_err_);
+                    saved_err_ = -1;
+                }
+                std::clearerr(stdout);
+                std::clearerr(stderr);
+            }
+
+            ~capture()
+            {
+                end();
+                // safe: the destructor only runs once the reader thread released
+                // its own shared_ptr, i.e. it is no longer blocked in read()
+                if (read_fd_ >= 0)
+                    fd_close(read_fd_);
+            }
+
+        private:
+            void read_loop()
+            {
+                char buf[8192];
+                for (;;)
+                {
+                    int n = fd_read(read_fd_, buf, sizeof buf);
+                    if (n > 0)
+                    {
+                        if (sink_)
+                            sink_(std::string(buf, (size_t)n));
+                        continue;
+                    }
+                    if (n == 0)
+                        break; // EOF: fd 1/2 were restored
+                    if (errno == EINTR)
+                        continue;
+                    break;
+                }
+            }
+
+            std::function<void(std::string)> sink_;
+            std::atomic<bool> ended_{false};
+            int saved_out_ = -1, saved_err_ = -1, read_fd_ = -1;
+        };
+
+        // ---- turn stream + bridge -------------------------------------------
+        struct turn_stream
+        {
+            std::mutex m;
+            std::condition_variable cv;
+            std::deque<std::string> events;
+            bool finished = false;
+            int rc = 0;
+            bool interrupted = false;
+
+            void push(nlohmann::json j)
+            {
+                {
+                    std::lock_guard<std::mutex> lk(m);
+                    events.push_back(j.dump());
+                }
+                cv.notify_all();
+            }
+            void finish(int code, bool was_interrupted)
+            {
+                {
+                    std::lock_guard<std::mutex> lk(m);
+                    rc = code;
+                    interrupted = was_interrupted;
+                    finished = true;
+                }
+                cv.notify_all();
+            }
+            // false = finished and drained
+            bool next(std::string &out)
+            {
+                std::unique_lock<std::mutex> lk(m);
+                cv.wait(lk, [&] { return !events.empty() || finished; });
+                if (events.empty())
+                    return false;
+                out = std::move(events.front());
+                events.pop_front();
+                return true;
+            }
+        };
+
+        struct bridge
+        {
+            // core-thread job queue (posted by HTTP workers, drained by the core loop)
+            std::mutex jm;
+            std::condition_variable jcv;
+            std::deque<std::function<void()>> jobs;
+            bool stopping = false;
+
+            std::string token; // set once before any worker thread starts
+            std::atomic<bool> cancel{false};
+            std::atomic<bool> turn_active{false};
+            std::atomic<unsigned long long> seq{0};
+
+            // /v1/health snapshot, written by the core thread
+            std::mutex snap_m;
+            std::string provider_label, model_label, session_id, sandbox_mode;
+            long long started_at = (long long)std::time(nullptr);
+
+            struct approval
+            {
+                std::string id, tool, args;
+                bool decided = false, allow = false;
+                std::string reason;
+            };
+            std::mutex am;
+            std::condition_variable acv;
+            std::unordered_map<std::string, std::shared_ptr<approval>> approvals;
+
+            std::mutex sm;
+            std::shared_ptr<turn_stream> current; // stream of the running turn
+
+            std::string next_id(const char *prefix)
+            {
+                return std::format("{}-{:x}-{:x}", prefix, (unsigned long long)std::time(nullptr), seq.fetch_add(1));
+            }
+            void post(std::function<void()> fn)
+            {
+                {
+                    std::lock_guard<std::mutex> lk(jm);
+                    jobs.push_back(std::move(fn));
+                }
+                jcv.notify_all();
+            }
+            void set_snapshot(const std::string &p, const std::string &m, const std::string &s, const std::string &sandbox)
+            {
+                std::lock_guard<std::mutex> lk(snap_m);
+                provider_label = p;
+                model_label = m;
+                session_id = s;
+                sandbox_mode = sandbox;
+            }
+            nlohmann::json snapshot_json()
+            {
+                std::lock_guard<std::mutex> lk(snap_m);
+                return nlohmann::json{{"provider", provider_label}, {"model", model_label},
+                                      {"session", session_id}, {"sandbox_mode", sandbox_mode}};
+            }
+            void set_current(std::shared_ptr<turn_stream> ts)
+            {
+                std::lock_guard<std::mutex> lk(sm);
+                current = std::move(ts);
+            }
+            std::shared_ptr<turn_stream> current_stream()
+            {
+                std::lock_guard<std::mutex> lk(sm);
+                return current;
+            }
+
+            // Blocks the *core* thread inside a turn until an HTTP decision
+            // arrives (or the timeout expires -> fail closed, like the CLI).
+            bool wait_decision(const std::string &tool, const std::string &args, std::string &reason, long long timeout_s)
+            {
+                auto ap = std::make_shared<approval>();
+                ap->id = next_id("ap");
+                ap->tool = tool;
+                ap->args = args;
+                {
+                    std::lock_guard<std::mutex> lk(am);
+                    approvals[ap->id] = ap;
+                }
+                if (auto ts = current_stream())
+                    ts->push(nlohmann::json{{"type", "approval_request"},
+                                            {"data", {{"request_id", ap->id}, {"tool", tool}, {"args", args}}}});
+                bool decided = false, allow = false;
+                std::string why;
+                {
+                    std::unique_lock<std::mutex> lk(am);
+                    decided = acv.wait_for(lk, std::chrono::seconds(timeout_s), [&] { return ap->decided; });
+                    if (decided)
+                    {
+                        allow = ap->allow;
+                        why = ap->reason;
+                    }
+                    approvals.erase(ap->id);
+                }
+                if (!decided)
+                {
+                    reason = std::format("no approval decision within {}s", timeout_s);
+                    return false;
+                }
+                if (!allow)
+                {
+                    reason = why.empty() ? "rejected by the client" : why;
+                    return false;
+                }
+                return true;
+            }
+
+            // called by the HTTP worker on POST /v1/approvals/{id}
+            bool decide(const std::string &id, bool allow, const std::string &why, std::string &err)
+            {
+                std::lock_guard<std::mutex> lk(am);
+                auto it = approvals.find(id);
+                if (it == approvals.end())
+                {
+                    err = "no pending approval with id " + id;
+                    return false;
+                }
+                it->second->decided = true;
+                it->second->allow = allow;
+                it->second->reason = why;
+                acv.notify_all();
+                return true;
+            }
+            nlohmann::json pending_approvals()
+            {
+                std::lock_guard<std::mutex> lk(am);
+                nlohmann::json out = nlohmann::json::array();
+                for (auto &kv : approvals)
+                    if (!kv.second->decided)
+                        out.push_back({{"request_id", kv.second->id}, {"tool", kv.second->tool}, {"args", kv.second->args}});
+                return out;
+            }
+        };
+
+        // ---- JSON views of core state ---------------------------------------
+        inline nlohmann::json settings_json(const cell::config::settings &s)
+        {
+            return nlohmann::json{
+                {"think_level", s.think_level},
+                {"think_levels", {"off", "low", "med", "high", "max"}},
+                {"tools", s.tools},
+                {"sandbox_mode", s.sandbox_mode},
+                {"autoallow", s.autoallow},
+                {"compact_auto", s.compact_auto},
+                {"compact_provider", s.compact_provider},
+                {"compact_model", s.compact_model},
+                {"system_prompt", s.system_prompt},
+                {"teamwork_max_children", s.teamwork_max_children},
+                {"max_threads", s.max_threads},
+                {"current_provider", s.current_provider},
+                {"current_model", s.current_model},
+                {"session_id", s.session_id}};
+        }
+
+        inline nlohmann::json provider_json(const cell::config::provider_entry &p, bool is_current)
+        {
+            return nlohmann::json{
+                {"name", p.name},
+                {"api_style", p.api_style},
+                {"base", p.base},
+                {"proxy", p.proxy},
+                {"key_set", !p.key_id.empty()},
+                {"current", is_current}};
+        }
+
+        // The session catalogue: the same scan /sessions performs, in JSON.
+        inline nlohmann::json sessions_json()
+        {
+            cell::async_io::flush(); // listings must reflect queued session writes
+            nlohmann::json out = nlohmann::json::array();
+            std::error_code ec;
+            std::filesystem::path dir = cell::root / "sessions";
+            const nlohmann::json &index = cell::sessions_index();
+            if (!std::filesystem::exists(dir, ec))
+                return out;
+            for (auto &g : std::filesystem::directory_iterator(dir, ec))
+            {
+                if (ec)
+                    break;
+                if (!g.is_directory(ec))
+                    continue;
+                std::string key = g.path().filename().string();
+                std::string group_cwd = index.value(key, "");
+                for (auto &f : std::filesystem::directory_iterator(g.path(), ec))
+                {
+                    if (ec)
+                        break;
+                    if (!f.is_directory(ec))
+                        continue;
+                    std::filesystem::path tf = f.path() / "messages.jsonl";
+                    std::error_code fec;
+                    if (!std::filesystem::exists(tf, fec))
+                        continue;
+                    nlohmann::json e{{"id", f.path().filename().string()}, {"cwd", group_cwd}, {"messages", 0}, {"snippet", ""}};
+                    try
+                    {
+                        std::ifstream fin(tf);
+                        std::string ln;
+                        long long count = 0;
+                        while (std::getline(fin, ln))
+                        {
+                            if (ln.empty())
+                                continue;
+                            count++;
+                            if (!e["snippet"].get<std::string>().empty())
+                                continue;
+                            auto mj = nlohmann::json::parse(ln, nullptr, false);
+                            if (mj.is_discarded() || !mj.is_object() || mj.value("role", "") != "user")
+                                continue;
+                            std::string snip;
+                            if (mj.contains("content") && mj["content"].is_string())
+                                snip = mj["content"].get<std::string>();
+                            else if (mj.contains("content") && mj["content"].is_array())
+                                for (auto &b : mj["content"])
+                                    if (b.is_object() && b.value("type", "") == "text" &&
+                                        b.contains("text") && b["text"].is_string())
+                                    {
+                                        snip = b["text"].get<std::string>();
+                                        break;
+                                    }
+                            if (!snip.empty())
+                            {
+                                if (snip.size() > 60)
+                                    snip = snip.substr(0, 57) + "...";
+                                e["snippet"] = snip;
+                            }
+                        }
+                        e["messages"] = count;
+                    }
+                    catch (const std::exception &)
+                    {
+                    }
+                    out.push_back(std::move(e));
+                }
+            }
+            std::sort(out.begin(), out.end(), [](const nlohmann::json &a, const nlohmann::json &b)
+                      {
+                          std::string ac = a["cwd"].get<std::string>(), bc = b["cwd"].get<std::string>();
+                          return ac != bc ? ac < bc : a["id"].get<std::string>() < b["id"].get<std::string>();
+                      });
+            return out;
+        }
+
+        inline nlohmann::json messages_json(const std::string &sid, size_t after, size_t limit)
+        {
+            cell::chat::session s(sid);
+            s.load();
+            const nlohmann::json &msgs = s.msg();
+            nlohmann::json out = nlohmann::json::array();
+            if (!msgs.is_array())
+                return out;
+            size_t end = limit == 0 ? msgs.size() : std::min(msgs.size(), after + limit);
+            for (size_t i = after; i < end; i++)
+                out.push_back(msgs[i]);
+            return out;
+        }
+
+        inline nlohmann::json skills_json()
+        {
+            nlohmann::json out = nlohmann::json::array();
+            for (auto &sk : cell::skills::list())
+                out.push_back({{"name", sk.name}, {"description", sk.description}, {"file", sk.file}});
+            return out;
+        }
+
+        inline nlohmann::json notices_json(const std::string &sid)
+        {
+            nlohmann::json out = nlohmann::json::array();
+            for (auto &m : cell::notice::peek(sid))
+                out.push_back({{"id", m.id}, {"from", m.from}, {"topic", m.topic}, {"body", m.body}, {"created_at", m.created_at}});
+            return out;
+        }
+
+        // ---- misc -----------------------------------------------------------
+        struct options
+        {
+            bool enabled = false;
+            std::string host = "127.0.0.1";
+            int port = 8737;
+            std::string token;
+        };
+
+        // A cancel request for the turn that is currently running (the CLI polls
+        // the Esc key instead; POST /v1/sessions/{id}/interrupt sets this and the
+        // streaming loop consumes it, keeping Esc and HTTP on the same path).
+        inline std::atomic<bool> g_cancel_requested{false};
+        inline std::atomic<bool> g_cancel_seen{false};
+        inline void request_cancel()
+        {
+            g_cancel_seen.store(true);
+            g_cancel_requested.store(true);
+        }
+        inline bool consume_cancel_request() { return g_cancel_requested.exchange(false); }
+        inline void clear_cancel()
+        {
+            g_cancel_requested.store(false);
+            g_cancel_seen.store(false);
+        }
+        // true when a cancel landed during the turn that just finished
+        inline bool take_cancel_seen() { return g_cancel_seen.exchange(false); }
+
+        inline std::string make_token()
+        {
+            unsigned char raw[16];
+            if (sodium_init() >= 0)
+                randombytes_buf(raw, sizeof raw);
+            else
+                for (auto &b : raw)
+                    b = (unsigned char)(std::rand() & 0xff);
+            static const char *kHex = "0123456789abcdef";
+            std::string out;
+            out.reserve(sizeof raw * 2);
+            for (unsigned char b : raw)
+            {
+                out.push_back(kHex[b >> 4]);
+                out.push_back(kHex[b & 0x0f]);
+            }
+            return out;
+        }
+
+        // discovery file for GUI front-ends: .cell/server.json {host, port, token}
+        inline void write_server_info(const std::string &host, int port, const std::string &token)
+        {
+            nlohmann::json j{{"host", host},
+                             {"port", port},
+                             {"token", token},
+                             {"pid", (long long)cell::plat::current_process_id()},
+                             {"started_at", (long long)std::time(nullptr)}};
+            std::error_code ec;
+            std::filesystem::create_directories(cell::root, ec);
+            std::ofstream f(cell::root / "server.json", std::ios::binary | std::ios::trunc);
+            if (f)
+                f << j.dump(2);
+        }
+
+    } // namespace serve
+
 } // namespace cell
 
 // =============================================================================
@@ -15088,6 +16091,10 @@ static void print_usage(const char *prog)
     cell::sys::println("  --no-color                   disable colored log output");
     cell::sys::println("  --verbose                    enable DEBUG-level log output on console");
     cell::sys::println("  --selftest                   run internal self tests");
+    cell::sys::println("  --serve                      run the RESTful service layer (HTTP + SSE) instead of the REPL");
+    cell::sys::println("  --port N                     serve: TCP port (default 8737; 0 picks a free port)");
+    cell::sys::println("  --host ADDR                  serve: bind address (default 127.0.0.1 - loopback only)");
+    cell::sys::println("  --token T                    serve: bearer token (default: random, written to .cell/server.json)");
     cell::sys::println("  --help, -h                   show this usage summary and exit");
 }
 
@@ -18170,7 +19177,7 @@ static int run_selftest()
             nlohmann::json partial = {{"role", "assistant"},
                                       {"content", "half"},
                                       {"tool_calls", nlohmann::json::array({{{"id", "c3"}}})}};
-            cell::chat::record_interrupt(sx, partial, "interrupted by the user (Esc) during streaming");
+            cell::chat::record_interrupt(sx, partial, "interrupted by the user (Esc / HTTP interrupt) during streaming");
             R.expect(sx.msg().size() == 3 && sx.msg()[0].value("role", "") == "system" &&
                          sx.msg()[1].value("role", "") == "user" && sx.msg()[2].value("role", "") == "assistant" &&
                          !sx.msg()[2].contains("tool_calls"),
@@ -18632,6 +19639,38 @@ static int run_selftest()
         R.expect(present == 32, "async_io::flush leaves every queued write on disk");
     }
 
+    // ---- RESTful service layer (cell --serve): transport plumbing -------------
+    {
+        R.expect(cell::serve::url_decode("a%20b+c") == "a b c", "serve: url_decode (percent and plus)");
+        R.expect(cell::serve::url_decode("plain-id_1") == "plain-id_1", "serve: url_decode leaves safe chars");
+        R.expect(cell::serve::url_decode("%zz") == "%zz", "serve: url_decode keeps invalid escapes");
+        std::unordered_map<std::string, std::string> q;
+        cell::serve::parse_query("a=1&b=two%20words&empty=&flag", q);
+        R.expect(q.size() == 4 && q["a"] == "1" && q["b"] == "two words" && q["flag"].empty(),
+                 "serve: parse_query");
+        std::string tok1 = cell::serve::make_token(), tok2 = cell::serve::make_token();
+        R.expect(tok1.size() == 32 && tok2.size() == 32 && tok1 != tok2, "serve: bearer tokens are 128-bit hex");
+        R.expect(std::string(cell::serve::status_text(401)) == "Unauthorized" &&
+                     std::string(cell::serve::status_text(409)) == "Conflict",
+                 "serve: status_text");
+        R.expect(cell::serve::settings_json(cell::config::settings{}).contains("sandbox_mode") &&
+                     cell::serve::settings_json(cell::config::settings{}).contains("think_levels"),
+                 "serve: settings_json covers the config surface");
+        cell::config::provider_entry pe;
+        pe.name = "probe";
+        pe.base = "http://127.0.0.1:1/v1";
+        pe.api_style = "openai-chat";
+        pe.key_id = "provider:probe";
+        auto pj = cell::serve::provider_json(pe, true);
+        R.expect(pj["name"] == "probe" && pj["key_set"] == true && pj["current"] == true &&
+                     !pj.contains("key_id"),
+                 "serve: provider_json never leaks key material");
+        auto sk = cell::serve::skills_json();
+        R.expect(sk.is_array(), "serve: skills_json");
+        auto nt = cell::serve::notices_json(""); // unknown session -> empty batch, never throws
+        R.expect(nt.is_array(), "serve: notices_json is an array for unknown sessions");
+    }
+
     R.print_summary();
     return R.exit_code();
 }
@@ -18646,11 +19685,12 @@ class repl
 {
 public:
     repl(cell::config::settings settings, std::string provider_arg, std::string base_arg,
-         std::string model_arg, std::string proxy_arg, std::string key_arg)
+         std::string model_arg, std::string proxy_arg, std::string key_arg,
+         cell::serve::options serve_opts)
         : cfg(std::move(settings)),
           provider_arg_(std::move(provider_arg)), base_arg_(std::move(base_arg)),
           model_arg_(std::move(model_arg)), proxy_arg_(std::move(proxy_arg)),
-          key_arg_(std::move(key_arg)) {}
+          key_arg_(std::move(key_arg)), serve_opts_(std::move(serve_opts)) {}
 
     // run the session loop; returns the process exit code
     int run();
@@ -18658,6 +19698,7 @@ public:
 private:
     cell::config::settings cfg; // owned; persisted on exit
     std::string provider_arg_, base_arg_, model_arg_, proxy_arg_, key_arg_;
+    cell::serve::options serve_opts_;
 };
 
 // =============================================================================
@@ -18674,6 +19715,7 @@ static int cell_main_impl(int argc, char const *argv[])
     bool verbose = false;
     std::string key_arg;
     std::string provider_arg, base_arg, model_arg, proxy_arg;
+    cell::serve::options serve_opts;
     cell::config::settings cfg;
     if (auto res = cell::config::load(); res)
         cfg = *res;
@@ -18722,6 +19764,14 @@ static int cell_main_impl(int argc, char const *argv[])
             verbose = true;
         else if (arg == "--selftest")
             selftest = true;
+        else if (arg == "--serve")
+            serve_opts.enabled = true;
+        else if (arg == "--port")
+            serve_opts.port = (int)std::strtol(value("--port").c_str(), nullptr, 10);
+        else if (arg == "--host")
+            serve_opts.host = cell::text::trim(value("--host"));
+        else if (arg == "--token")
+            serve_opts.token = cell::text::trim(value("--token"));
         else if (arg == "--help" || arg == "-h")
         {
             print_usage(argv[0]);
@@ -18734,6 +19784,11 @@ static int cell_main_impl(int argc, char const *argv[])
             return 1;
         }
     }
+    // the RESTful service layer streams the turn output to HTTP clients; ANSI
+    // colour codes and the spinner would pollute that stream, so serve mode
+    // always renders plain text
+    if (serve_opts.enabled)
+        no_color = true;
     cell::sys::detail::color_force = !no_color;
     cell::sys::detail::verbose_enabled = verbose;
     cell::sys::detail::init_console();
@@ -18760,8 +19815,17 @@ static int cell_main_impl(int argc, char const *argv[])
         cell::box::autoallow_enabled() = cfg.autoallow && cell::box::sandbox_mode() == cell::box::SandboxMode::FullAccess;
     }
 
+    if (serve_opts.enabled && serve_opts.port < 0)
+    {
+        cell::sys::error("invalid --port value: {}", serve_opts.port);
+        return 1;
+    }
+    if (serve_opts.enabled && serve_opts.token.empty())
+        serve_opts.token = cell::serve::make_token();
+
     repl app(std::move(cfg), std::move(provider_arg), std::move(base_arg),
-             std::move(model_arg), std::move(proxy_arg), std::move(key_arg));
+             std::move(model_arg), std::move(proxy_arg), std::move(key_arg),
+             std::move(serve_opts));
     return app.run();
 }
 
@@ -19027,6 +20091,15 @@ int repl::run()
     auto t_start = cell::sys::detail::clock::now();
     long long total_llm_requests = 0;
     long long total_tool_calls = 0;
+
+    // -------- RESTful service layer (--serve) --------------------------------
+    // The bridge is the only object shared with the HTTP worker threads: it
+    // carries the core job queue, the pending approvals, the cancel flag and
+    // the health snapshot. Inert unless serve mode is enabled.
+    cell::serve::bridge serve_bridge;
+    const bool serve_mode = serve_opts_.enabled;
+    if (serve_mode)
+        serve_bridge.token = serve_opts_.token;
 
     // configure the read-only tool worker pool from config.json before first use
     cell::sys::pool_max_setting() = std::clamp(cfg.max_threads, (size_t)1, (size_t)16);
@@ -19940,8 +21013,20 @@ int repl::run()
             return false;
         };
     }
+    if (serve_mode)
+    {
+        // serve mode: the approval channel is HTTP. The decision arrives through
+        // the bridge while this (core) thread is blocked inside the turn; the
+        // request is announced on the running turn's SSE stream. Without a
+        // decision within the window the call fails closed, exactly like a
+        // non-interactive CLI run.
+        tool_rt.approval_prompt = [&serve_bridge](const std::string &tool, const std::string &args, std::string &reason) -> bool
+        {
+            return serve_bridge.wait_decision(tool, args, reason, 300);
+        };
+    }
     std::string pending;
-    if (!interactive)
+    if (!interactive && !serve_mode)
     {
         std::string line;
         while (std::getline(std::cin, line))
@@ -20005,7 +21090,8 @@ int repl::run()
                     h.now().clear_interrupt();
                 }
             }
-            cell::sys::print("reply> ");
+            if (!serve_mode)
+                cell::sys::print("reply> "); // console prompt marker; HTTP clients get plain output
 
             bool done = false;
             bool natural_end = true; // false when the turn aborted early (error, cancel, refusal)
@@ -20049,18 +21135,27 @@ int repl::run()
                 {
                     bool got = false, timer_line = false, tok_line = false, cancelled = false;
                     bool reason_active = false; // reasoning output is still open on the current line
+                    bool serve = false;         // service mode: no console, cancel arrives over HTTP
                     long long toks = 0, last_timer_ms = 0, last_cnt_ms = 0;
                     cell::sys::detail::clock::time_point t0;
                     cell::sys::detail::clock::time_point tok0;
                 };
                 StreamUI ui;
+                ui.serve = serve_mode;
                 auto t0 = cell::sys::detail::clock::now();
                 ui.t0 = t0;
                 // single-threaded TTFB timer + Esc-cancel + Ctrl+C abort: libcurl invokes this periodically while blocked
                 auto xfer_cb = +[](void *p, curl_off_t, curl_off_t, curl_off_t, curl_off_t) -> int
                 {
                     auto *u = (StreamUI *)p;
-                    if (cell::plat::peek_key() == 27)
+                    if (u->serve)
+                    {
+                        // the console is not ours in serve mode: a cancel hints
+                        // through the bridge instead of the Esc key
+                        if (cell::serve::consume_cancel_request())
+                            u->cancelled = true;
+                    }
+                    else if (cell::plat::peek_key() == 27)
                         u->cancelled = true;
                     if (!u->got && cell::sys::detail::color_enabled)
                     {
@@ -20091,8 +21186,11 @@ int repl::run()
                         log.info("llm", std::format("retry attempt={}/{} delay={:.0f}s model={} round={}", attempt + 1, kMaxRetries, kRetryDelaySec, cfg.model_label(), rounds));
                         cell::sys::println("\n[retrying in {:.0f}s... attempt {}/{}]", kRetryDelaySec, attempt + 1, kMaxRetries);
                         std::this_thread::sleep_for(std::chrono::milliseconds((int)(kRetryDelaySec * 1000)));
-                        // reset UI state for retry
+                        // reset UI state for retry (keep the console/serve mode flag:
+                        // it decides how the next attempt detects a cancel)
+                        const bool was_serve = ui.serve;
                         ui = StreamUI{};
+                        ui.serve = was_serve;
                         ui.t0 = cell::sys::detail::clock::now();
                         reply = nlohmann::json{};
                         tool_calls = nlohmann::json{};
@@ -20234,7 +21332,7 @@ int repl::run()
                         cell::sys::error("[cancelled]");
                         // Ctrl+C prints nothing and exits through the signal hook;
                         // this path (Esc) keeps the interrupted turn on disk
-                        cell::chat::record_interrupt(h.now(), reply, "interrupted by the user (Esc) during streaming");
+                        cell::chat::record_interrupt(h.now(), reply, "interrupted by the user (Esc / HTTP interrupt) during streaming");
                         cell::sys::println("[interrupted] partial output kept, pending tool calls cancelled - /reload resumes the turn");
                         done = true;
                         natural_end = false;
@@ -20258,8 +21356,11 @@ int repl::run()
                     // request failed: retry only transient failures. A 4xx other
                     // than 408/409/429 is deterministic (bad request, model or
                     // base, auth, validation) — retrying it only burns 5s per
-                    // attempt; transport aborts report 0 here and stay retryable
-                    bool retryable = !(http_status >= 400 && http_status < 500 &&
+                    // attempt; transport aborts report 0 here and stay retryable.
+                    // A user cancel (Esc / HTTP interrupt) aborts the transfer on
+                    // purpose and must never be retried.
+                    bool retryable = !ui.cancelled &&
+                                     !(http_status >= 400 && http_status < 500 &&
                                        http_status != 408 && http_status != 409 && http_status != 429);
                     if (retryable && attempt < kMaxRetries - 1)
                     {
@@ -22119,7 +23220,664 @@ int repl::run()
                     return cmd_flow::handled;
             }},
     };
-        while (running)
+    // -------- phase: RESTful service layer (--serve) -------------------------
+    // The routing table runs on the HTTP worker threads. Endpoints that only
+    // touch bridged state (health, version, approvals, notices, usages, skills,
+    // interrupt, shutdown) answer directly; everything that needs the live
+    // session or the configuration posts a job to this core thread and waits.
+    // Wire contract: docs/RESTful.md.
+    if (serve_mode)
+    {
+        using nlohmann::json;
+
+        // A response produced on the core thread for a worker thread.
+        struct core_reply
+        {
+            std::mutex m;
+            std::condition_variable cv;
+            bool done = false;
+            int status = 200;
+            std::string body = "{}";
+        };
+
+        auto on_core = [&](const std::shared_ptr<core_reply> &r, std::function<void(core_reply &)> fn)
+        {
+            serve_bridge.post([&serve_bridge, r, fn = std::move(fn)]()
+                              {
+                                  if (serve_bridge.stopping)
+                                  {
+                                      r->status = 503;
+                                      r->body = nlohmann::json{{"error", {{"code", "shutting_down"}, {"message", "server is stopping"}}}}.dump();
+                                  }
+                                  else
+                                  {
+                                      try
+                                      {
+                                          fn(*r);
+                                      }
+                                      catch (const std::exception &e)
+                                      {
+                                          r->status = 500;
+                                          r->body = nlohmann::json{{"error", {{"code", "internal"}, {"message", e.what()}}}}.dump();
+                                      }
+                                  }
+                                  {
+                                      std::lock_guard<std::mutex> lk(r->m);
+                                      r->done = true;
+                                  }
+                                  r->cv.notify_all();
+                              });
+        };
+
+        // config patch application (assigned right after the dispatcher; declared
+        // here so the routing lambda can call it)
+        std::function<bool(const nlohmann::json &, std::string &)> apply_config_patch;
+
+        // refresh the /v1/health snapshot (core thread only)
+        auto snapshot_push = [&](const std::string &session)
+        {
+            const cell::config::provider_entry *p = cfg.current_provider_entry();
+            serve_bridge.set_snapshot(p ? p->name : "(none)", cfg.current_model, session, cfg.sandbox_mode);
+        };
+
+        auto dispatch = [&](const cell::serve::request &req, cell::serve::responder &res)
+        {
+            // ---- authentication (everything but /v1/health) ------------------
+            if (req.path != "/v1/health")
+            {
+                bool ok = (req.header("authorization") == "Bearer " + serve_bridge.token);
+                if (!ok)
+                {
+                    auto it = req.query.find("token");
+                    ok = (it != req.query.end() && it->second == serve_bridge.token);
+                }
+                if (!ok)
+                {
+                    res.error(401, "unauthorized", "missing or wrong bearer token");
+                    return;
+                }
+            }
+
+            // ---- path segments -------------------------------------------------
+            std::vector<std::string> seg;
+            for (size_t pos = 0; pos < req.path.size();)
+            {
+                size_t slash = req.path.find('/', pos);
+                std::string s = req.path.substr(pos, slash == std::string::npos ? std::string::npos : slash - pos);
+                if (!s.empty())
+                    seg.push_back(std::move(s));
+                if (slash == std::string::npos)
+                    break;
+                pos = slash + 1;
+            }
+
+            auto parse_body = [&]() -> std::optional<json>
+            {
+                if (req.body.empty())
+                    return json::object();
+                auto j = json::parse(req.body, nullptr, false);
+                if (j.is_discarded() || !j.is_object())
+                {
+                    res.error(400, "bad_request", "request body must be a JSON object");
+                    return std::nullopt;
+                }
+                return j;
+            };
+
+            auto query_size = [&](const char *key) -> size_t
+            {
+                auto it = req.query.find(key);
+                if (it == req.query.end() || it->second.empty())
+                    return 0;
+                return (size_t)std::strtoull(it->second.c_str(), nullptr, 10);
+            };
+
+            // ================= direct endpoints (worker thread) =================
+            if (seg.size() == 2 && seg[0] == "v1" && seg[1] == "health" && req.method == "GET")
+            {
+                json snap = serve_bridge.snapshot_json();
+                res.json(200, json{{"status", "ok"},
+                                   {"version", CELL_VERSION},
+                                   {"uptime_s", (long long)std::time(nullptr) - serve_bridge.started_at},
+                                   {"provider", snap["provider"]},
+                                   {"model", snap["model"]},
+                                   {"session", snap["session"]},
+                                   {"sandbox_mode", snap["sandbox_mode"]},
+                                   {"turn_active", serve_bridge.turn_active.load()}});
+                return;
+            }
+            if (seg.size() == 2 && seg[0] == "v1" && seg[1] == "version" && req.method == "GET")
+            {
+                res.json(200, json{{"version", CELL_VERSION}});
+                return;
+            }
+            if (seg.size() == 2 && seg[0] == "v1" && seg[1] == "shutdown" && req.method == "POST")
+            {
+                res.json(200, json{{"status", "stopping"}});
+                {
+                    std::lock_guard<std::mutex> lk(serve_bridge.jm);
+                    serve_bridge.stopping = true;
+                }
+                serve_bridge.jcv.notify_all();
+                return;
+            }
+            if (seg.size() == 2 && seg[0] == "v1" && seg[1] == "approvals" && req.method == "GET")
+            {
+                res.json(200, json{{"pending", serve_bridge.pending_approvals()},
+                                   {"turn_active", serve_bridge.turn_active.load()}});
+                return;
+            }
+            if (seg.size() == 3 && seg[0] == "v1" && seg[1] == "approvals" && req.method == "POST")
+            {
+                auto body = parse_body();
+                if (!body)
+                    return;
+                bool allow = body->value("decision", "") == "allow";
+                std::string why = body->value("reason", "");
+                std::string err;
+                if (serve_bridge.decide(seg[2], allow, why, err))
+                    res.json(200, json{{"request_id", seg[2]}, {"decision", allow ? "allow" : "deny"}});
+                else
+                    res.error(404, "not_found", err);
+                return;
+            }
+            if (seg.size() == 2 && seg[0] == "v1" && seg[1] == "notices" && req.method == "GET")
+            {
+                auto it = req.query.find("session");
+                std::string sid = it == req.query.end() ? std::string() : it->second;
+                res.json(200, json{{"pending", cell::serve::notices_json(sid)}});
+                return;
+            }
+            if (seg.size() == 2 && seg[0] == "v1" && seg[1] == "notices" && req.method == "POST")
+            {
+                auto body = parse_body();
+                if (!body)
+                    return;
+                std::string err, id;
+                if (cell::notice::send_to(body->value("session", ""), "http", body->value("topic", ""),
+                                          body->value("body", ""), err, &id))
+                    res.json(200, json{{"id", id}});
+                else
+                    res.error(422, "notices_rejected", err);
+                return;
+            }
+            if (seg.size() == 2 && seg[0] == "v1" && seg[1] == "usages" && req.method == "GET")
+            {
+                res.json(200, cell::stats::load());
+                return;
+            }
+            if (seg.size() == 2 && seg[0] == "v1" && seg[1] == "skills" && req.method == "GET")
+            {
+                res.json(200, json{{"skills", cell::serve::skills_json()}});
+                return;
+            }
+            if (seg.size() == 4 && seg[0] == "v1" && seg[1] == "sessions" && seg[3] == "interrupt" && req.method == "POST")
+            {
+                if (!serve_bridge.turn_active.load())
+                {
+                    res.error(409, "no_turn", "no turn is running");
+                    return;
+                }
+                cell::serve::request_cancel();
+                res.json(202, json{{"status", "cancel_requested"}});
+                return;
+            }
+
+            // ================= queued endpoints (core thread) ==================
+            // POST /v1/sessions/{id}/turn — the one endpoint that streams.
+            if (seg.size() == 4 && seg[0] == "v1" && seg[1] == "sessions" && seg[3] == "turn" && req.method == "POST")
+            {
+                auto body = parse_body();
+                if (!body)
+                    return;
+                std::string sid = seg[2];
+                std::string text = body->value("text", body->value("ins", ""));
+                bool resume = body->value("resume", false);
+                bool want_stream = req.header("accept").find("text/event-stream") != std::string::npos ||
+                                   req.query.find("stream") != req.query.end();
+                if (text.empty() && !resume)
+                {
+                    res.error(400, "bad_request", "text (or resume:true) is required");
+                    return;
+                }
+                if (serve_bridge.turn_active.exchange(true))
+                {
+                    res.error(409, "busy", "another turn is already running");
+                    return;
+                }
+                auto ts = std::make_shared<cell::serve::turn_stream>();
+                if (want_stream && (!res.open_stream() || !res.stream_write(": cell " CELL_VERSION " turn stream\n\n")))
+                {
+                    serve_bridge.turn_active.store(false);
+                    return;
+                }
+                serve_bridge.post([&, ts, sid, text, resume]()
+                                  {
+                                      int rc = 0;
+                                      cell::serve::clear_cancel();
+                                      serve_bridge.set_current(ts);
+                                      try
+                                      {
+                                          h.use(sid);
+                                          ensure_prompt(h.now());
+                                          snapshot_push(h.now().id());
+                                          ts->push(json{{"type", "turn_start"},
+                                                        {"data", {{"session", h.now().id()}, {"model", cfg.model_label()}}}});
+                                          std::string cap_err;
+                                          auto cap = cell::serve::capture::begin(
+                                              [ts](std::string chunk)
+                                              {
+                                                  ts->push(json{{"type", "output"}, {"data", {{"text", std::move(chunk)}}}});
+                                              },
+                                              cap_err);
+                                          if (!cap)
+                                              ts->push(json{{"type", "error"}, {"data", {{"code", "capture_failed"}, {"message", cap_err}}}});
+                                          run_turn(resume, text);
+                                          if (cap)
+                                              cap->end();
+                                          cell::async_io::flush(); // durability: the GUI may read right after turn_done
+                                      }
+                                      catch (const std::exception &e)
+                                      {
+                                          ts->push(json{{"type", "error"}, {"data", {{"code", "internal"}, {"message", e.what()}}}});
+                                          rc = 1;
+                                      }
+                                      bool interrupted = cell::serve::take_cancel_seen();
+                                      serve_bridge.set_current(nullptr);
+                                      serve_bridge.turn_active.store(false);
+                                      ts->push(json{{"type", "turn_done"}, {"data", {{"rc", rc}, {"interrupted", interrupted}}}});
+                                      ts->finish(rc, interrupted);
+                                  });
+                // consume events (this thread). A gone client keeps draining so
+                // the core never writes into an unconsumed queue.
+                std::string ev;
+                bool client_gone = false;
+                json collected = json::array();
+                std::string captured;
+                while (ts->next(ev))
+                {
+                    if (!client_gone && want_stream)
+                    {
+                        if (!res.write_event(ev))
+                            client_gone = true;
+                    }
+                    else if (!want_stream)
+                    {
+                        auto ej = json::parse(ev, nullptr, false);
+                        if (ej.is_discarded())
+                            continue;
+                        if (ej.value("type", "") == "output" && ej.contains("data"))
+                            captured += ej["data"].value("text", "");
+                        collected.push_back(ej);
+                    }
+                }
+                if (want_stream)
+                {
+                    if (!client_gone)
+                        res.stream_close();
+                    return;
+                }
+                res.json(200, json{{"rc", ts->rc}, {"interrupted", ts->interrupted}, {"output", captured}, {"events", collected}});
+                return;
+            }
+
+            // everything below needs the core thread
+            auto r = std::make_shared<core_reply>();
+
+            if (seg.size() == 2 && seg[0] == "v1" && seg[1] == "config" && req.method == "GET")
+            {
+                on_core(r, [&](core_reply &rep) { rep.body = cell::serve::settings_json(cfg).dump(); });
+            }
+            else if (seg.size() == 2 && seg[0] == "v1" && seg[1] == "config" && req.method == "PATCH")
+            {
+                auto body = parse_body();
+                if (!body)
+                    return;
+                json patch = *body;
+                on_core(r, [&, patch](core_reply &rep)
+                        {
+                            std::string err;
+                            if (!apply_config_patch(patch, err))
+                            {
+                                rep.status = 400;
+                                rep.body = json{{"error", {{"code", "bad_request"}, {"message", err}}}}.dump();
+                                return;
+                            }
+                            rep.body = cell::serve::settings_json(cfg).dump();
+                        });
+            }
+            else if (seg.size() == 2 && seg[0] == "v1" && seg[1] == "providers" && req.method == "GET")
+            {
+                on_core(r, [&](core_reply &rep)
+                        {
+                            json arr = json::array();
+                            for (size_t i = 0; i < cfg.providers.size(); i++)
+                            {
+                                bool cur = cfg.current_provider.empty() ? i == 0 : cfg.providers[i].name == cfg.current_provider;
+                                arr.push_back(cell::serve::provider_json(cfg.providers[i], cur));
+                            }
+                            rep.body = json{{"providers", arr}, {"current_model", cfg.current_model}}.dump();
+                        });
+            }
+            else if (seg.size() == 2 && seg[0] == "v1" && seg[1] == "providers" && req.method == "POST")
+            {
+                auto body = parse_body();
+                if (!body)
+                    return;
+                json b = *body;
+                on_core(r, [&, b](core_reply &rep)
+                        {
+                            std::string canon = cell::config::provider_entry::parse_api_style(b.value("api_style", b.value("style", "openai-chat")));
+                            if (canon.empty())
+                            {
+                                rep.status = 400;
+                                rep.body = json{{"error", {{"code", "bad_request"}, {"message", "api_style must be openai-chat | openai-responses | anthropic"}}}}.dump();
+                                return;
+                            }
+                            std::string name = b.value("name", canon);
+                            int idx = cell::config::find(cfg, name);
+                            cell::config::provider_entry *p = nullptr;
+                            if (idx >= 0)
+                                p = &cfg.providers[(size_t)idx];
+                            else
+                            {
+                                cfg.providers.push_back(cell::config::provider_entry{});
+                                p = &cfg.providers.back();
+                                p->name = name;
+                            }
+                            p->api_style = canon;
+                            p->style = (canon == "anthropic") ? "anthropic" : "openai";
+                            if (b.contains("base") && b["base"].is_string())
+                                p->base = b["base"].get<std::string>();
+                            if (b.contains("proxy") && b["proxy"].is_string())
+                                p->proxy = b["proxy"].get<std::string>();
+                            if (b.contains("key") && b["key"].is_string() && !b["key"].get<std::string>().empty())
+                            {
+                                std::string kid = "provider:" + p->name;
+                                p->key_id = kid;
+                                vault.set(kid, b["key"].get<std::string>());
+                            }
+                            if (b.contains("model") && b["model"].is_string() && !b["model"].get<std::string>().empty())
+                                cfg.current_model = b["model"].get<std::string>();
+                            if (cfg.current_provider.empty())
+                                cfg.current_provider = p->name;
+                            cell::config::save(cfg);
+                            snapshot_push(cfg.session_id);
+                            rep.status = (idx >= 0) ? 200 : 201;
+                            rep.body = cell::serve::provider_json(*p, true).dump();
+                        });
+            }
+            else if (seg.size() == 3 && seg[0] == "v1" && seg[1] == "providers" && req.method == "DELETE")
+            {
+                std::string name = seg[2];
+                on_core(r, [&, name](core_reply &rep)
+                        {
+                            int idx = cell::config::find(cfg, name);
+                            if (idx < 0)
+                            {
+                                rep.status = 404;
+                                rep.body = json{{"error", {{"code", "not_found"}, {"message", "provider not found: " + name}}}}.dump();
+                                return;
+                            }
+                            std::string kid = cfg.providers[(size_t)idx].key_id;
+                            if (!kid.empty())
+                                vault.remove(kid);
+                            bool was_current = (cfg.providers[(size_t)idx].name == cfg.current_provider) ||
+                                               (cfg.current_provider.empty() && idx == 0);
+                            cfg.providers.erase(cfg.providers.begin() + idx);
+                            if (was_current)
+                            {
+                                if (cfg.providers.empty())
+                                {
+                                    cfg.current_provider.clear();
+                                    cfg.current_model.clear();
+                                }
+                                else
+                                {
+                                    cfg.current_provider = cfg.providers[0].name;
+                                    cfg.current_model.clear();
+                                }
+                            }
+                            cell::config::save(cfg);
+                            rep.body = json{{"removed", name}, {"remaining", cfg.providers.size()}}.dump();
+                        });
+            }
+            else if (seg.size() == 4 && seg[0] == "v1" && seg[1] == "providers" && seg[3] == "select" && req.method == "POST")
+            {
+                std::string name = seg[2];
+                auto body = parse_body();
+                if (!body)
+                    return;
+                json b = *body;
+                on_core(r, [&, name, b](core_reply &rep)
+                        {
+                            if (cell::config::find(cfg, name) < 0)
+                            {
+                                rep.status = 404;
+                                rep.body = json{{"error", {{"code", "not_found"}, {"message", "provider not found: " + name}}}}.dump();
+                                return;
+                            }
+                            cell::config::select_provider(cfg, name);
+                            if (b.contains("model") && b["model"].is_string() && !b["model"].get<std::string>().empty())
+                                cfg.current_model = b["model"].get<std::string>();
+                            cell::config::save(cfg);
+                            snapshot_push(cfg.session_id);
+                            rep.body = json{{"current_provider", cfg.current_provider}, {"current_model", cfg.current_model}}.dump();
+                        });
+            }
+            else if (seg.size() == 4 && seg[0] == "v1" && seg[1] == "providers" && seg[3] == "models" && req.method == "GET")
+            {
+                std::string name = seg[2];
+                on_core(r, [&, name](core_reply &rep)
+                        {
+                            int idx = cell::config::find(cfg, name);
+                            if (idx < 0)
+                            {
+                                rep.status = 404;
+                                rep.body = json{{"error", {{"code", "not_found"}, {"message", "provider not found: " + name}}}}.dump();
+                                return;
+                            }
+                            std::vector<std::string> models;
+                            std::string ferr;
+                            // the same probe /models performs (network call on the core thread)
+                            if (!fetch_models(cfg.providers[(size_t)idx], models, ferr))
+                            {
+                                rep.status = 502;
+                                rep.body = json{{"error", {{"code", "provider_unreachable"}, {"message", ferr}}}}.dump();
+                                return;
+                            }
+                            json arr = json::array();
+                            for (auto &m : models)
+                                arr.push_back(m);
+                            rep.body = json{{"provider", name}, {"models", arr}}.dump();
+                        });
+            }
+            else if (seg.size() == 2 && seg[0] == "v1" && seg[1] == "sessions" && req.method == "GET")
+            {
+                on_core(r, [&](core_reply &rep)
+                        { rep.body = json{{"sessions", cell::serve::sessions_json()}, {"current", h.now().id()}}.dump(); });
+            }
+            else if (seg.size() == 2 && seg[0] == "v1" && seg[1] == "sessions" && req.method == "POST")
+            {
+                on_core(r, [&](core_reply &rep)
+                        {
+                            std::string old_id = h.now().id();
+                            h.now().unload();
+                            cell::async_io::flush();
+                            h.forget_current();
+                            ensure_prompt(h.now());
+                            rep.status = 201;
+                            rep.body = json{{"id", h.now().id()}, {"cwd", cell::workdir().string()}, {"previous", old_id}}.dump();
+                        });
+            }
+            else if (seg.size() == 4 && seg[0] == "v1" && seg[1] == "sessions" && seg[3] == "messages" && req.method == "GET")
+            {
+                std::string sid = seg[2];
+                size_t after = query_size("after");
+                size_t limit = query_size("limit");
+                on_core(r, [&, sid, after, limit](core_reply &rep)
+                        {
+                            if (!std::filesystem::exists(cell::session_dir(sid) / "messages.jsonl"))
+                            {
+                                rep.status = 404;
+                                rep.body = json{{"error", {{"code", "session_not_found"}, {"message", "no session with id " + sid}}}}.dump();
+                                return;
+                            }
+                            rep.body = json{{"messages", cell::serve::messages_json(sid, after, limit)}}.dump();
+                        });
+            }
+            else if (seg.size() == 3 && seg[0] == "v1" && seg[1] == "sessions" && req.method == "DELETE")
+            {
+                std::string sid = seg[2];
+                on_core(r, [&, sid](core_reply &rep)
+                        {
+                            if (serve_bridge.turn_active.load() && h.now().id() == sid)
+                            {
+                                rep.status = 409;
+                                rep.body = json{{"error", {{"code", "busy"}, {"message", "a turn is running in this session"}}}}.dump();
+                                return;
+                            }
+                            h.remove(sid);
+                            rep.body = json{{"deleted", sid}}.dump();
+                        });
+            }
+            else
+            {
+                res.error(404, "not_found", std::format("no route for {} {}", req.method, req.path));
+                return;
+            }
+
+            std::unique_lock<std::mutex> lk(r->m);
+            r->cv.wait(lk, [&] { return r->done; });
+            auto rj = json::parse(r->body, nullptr, false);
+            res.json(r->status, rj.is_discarded() ? json{{"raw", r->body}} : rj);
+        };
+
+        // ---- config patch application (core thread) ------------------------
+        apply_config_patch = [&](const json &patch, std::string &err) -> bool
+        {
+            if (patch.contains("think_level"))
+            {
+                const auto &v = patch["think_level"];
+                if (v.is_number_integer())
+                    cfg.think_level = std::clamp(v.get<int>(), 0, 4);
+                else if (v.is_string())
+                {
+                    static const std::vector<std::string> kNames{"off", "low", "med", "high", "max"};
+                    auto it = std::find(kNames.begin(), kNames.end(), v.get<std::string>());
+                    if (it == kNames.end())
+                    {
+                        err = "think_level must be off|low|med|high|max or an integer 0..4";
+                        return false;
+                    }
+                    cfg.think_level = (int)(it - kNames.begin());
+                }
+                else
+                {
+                    err = "think_level must be a string or an integer";
+                    return false;
+                }
+            }
+            if (patch.contains("tools") && patch["tools"].is_boolean())
+                cfg.tools = patch["tools"].get<bool>();
+            if (patch.contains("sandbox_mode") && patch["sandbox_mode"].is_string())
+            {
+                std::string m = cell::text::trim(patch["sandbox_mode"].get<std::string>());
+                if (m == "read-only" || m == "readonly")
+                {
+                    cfg.sandbox_mode = "read-only";
+                    cell::box::sandbox_mode() = cell::box::SandboxMode::ReadOnly;
+                }
+                else if (m == "edit-only" || m == "edit")
+                {
+                    cfg.sandbox_mode = "edit-only";
+                    cell::box::sandbox_mode() = cell::box::SandboxMode::EditOnly;
+                }
+                else if (m == "full-access" || m == "full")
+                {
+                    cfg.sandbox_mode = "full-access";
+                    cell::box::sandbox_mode() = cell::box::SandboxMode::FullAccess;
+                }
+                else
+                {
+                    err = "sandbox_mode must be read-only | edit-only | full-access";
+                    return false;
+                }
+            }
+            if (patch.contains("autoallow") && patch["autoallow"].is_boolean())
+            {
+                cfg.autoallow = patch["autoallow"].get<bool>();
+                cell::box::autoallow_enabled() = cfg.autoallow && cell::box::sandbox_mode() == cell::box::SandboxMode::FullAccess;
+            }
+            if (patch.contains("compact_auto") && patch["compact_auto"].is_boolean())
+                cfg.compact_auto = patch["compact_auto"].get<bool>();
+            if (patch.contains("compact_provider") && patch["compact_provider"].is_string())
+                cfg.compact_provider = patch["compact_provider"].get<std::string>();
+            if (patch.contains("compact_model") && patch["compact_model"].is_string())
+                cfg.compact_model = patch["compact_model"].get<std::string>();
+            if (patch.contains("system_prompt") && patch["system_prompt"].is_string())
+                cfg.system_prompt = patch["system_prompt"].get<std::string>();
+            if (patch.contains("teamwork_max_children") && patch["teamwork_max_children"].is_number_unsigned())
+                cfg.teamwork_max_children = std::clamp<size_t>(patch["teamwork_max_children"].get<size_t>(), 1, 100);
+            if (patch.contains("max_threads") && patch["max_threads"].is_number_unsigned())
+            {
+                cfg.max_threads = std::clamp<size_t>(patch["max_threads"].get<size_t>(), 1, 16);
+                cell::sys::pool_max_setting() = std::clamp(cfg.max_threads, (size_t)1, (size_t)16);
+            }
+            cell::config::save(cfg);
+            snapshot_push(cfg.session_id);
+            return true;
+        };
+
+        // ---- start the server, then run the core job loop -------------------
+        cell::serve::http_server server;
+        std::string serr;
+        snapshot_push(cfg.session_id);
+        if (!server.start(serve_opts_.host, serve_opts_.port, dispatch, serr))
+        {
+            cell::sys::error("serve: cannot start the HTTP server: {}", serr);
+            return 1;
+        }
+        cell::serve::write_server_info(serve_opts_.host, server.port(), serve_bridge.token);
+        cell::sys::println("cell serve: listening on http://{}:{}", serve_opts_.host, server.port());
+        cell::sys::println("cell serve: bearer token: {}", serve_bridge.token);
+        cell::sys::println("cell serve: discovery file: {}", (cell::root / "server.json").string());
+        log.info("serve", std::format("listening host={} port={}", serve_opts_.host, server.port()));
+
+        for (;;)
+        {
+            std::function<void()> job;
+            {
+                std::unique_lock<std::mutex> lk(serve_bridge.jm);
+                serve_bridge.jcv.wait_for(lk, std::chrono::milliseconds(200),
+                                          [&] { return !serve_bridge.jobs.empty() || serve_bridge.stopping; });
+                if (!serve_bridge.jobs.empty())
+                {
+                    job = std::move(serve_bridge.jobs.front());
+                    serve_bridge.jobs.pop_front();
+                }
+                else if (serve_bridge.stopping)
+                    break;
+            }
+            if (job)
+            {
+                try
+                {
+                    job();
+                }
+                catch (const std::exception &e)
+                {
+                    log.error("serve", std::format("job_failed err={}", e.what()));
+                }
+            }
+        }
+        server.stop();
+        cell::async_io::flush();
+        cell::sys::println("cell serve: stopped");
+        log.info("serve", "stopped");
+        return 0;
+    }
+    while (running)
         {
             std::string input;
             if (interactive)
