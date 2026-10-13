@@ -4195,7 +4195,13 @@ namespace cell
         bool exec(std::string_view cmd, double timeout_s, std::string &output, int &exit_code, std::string_view wd = "")
         {
             if (!check(cmd))
+            {
+                // reachable beyond the (narrower) check_exec gate: this is the wide
+                // credential-store / runtime-root rule. leave a reason behind or the
+                // caller reports a bare "exitcode=N" with no explanation.
+                output = "exec blocked by sandbox: the command references a protected path (credential store or cell runtime file).\n";
                 return false;
+            }
             exit_code = 1;
             // change to the working directory if specified
             std::string actual_cmd(cmd);
@@ -4213,6 +4219,12 @@ namespace cell
             }
             std::string stderr_output;
             bool ok = plat::spawn_cmd(actual_cmd, timeout_s, output, exit_code, stderr_output);
+            // spawn_cmd only fails to LAUNCH the process (pipe / CreateProcess /
+            // fork error): a command that ran and exited non-zero is ok=true with
+            // its real exit code. surface a reason, or the result degrades to a
+            // bare "exitcode=-1".
+            if (!ok && output.empty())
+                output = "failed to start the process (spawn error; nothing was run)";
             // include stderr in output when the command failed
             if (exit_code != 0 && !stderr_output.empty())
             {
@@ -4734,6 +4746,7 @@ namespace cell
                 output = std::format("write failed: {} could not be written (permission denied, disk full, or locked by another process).", std::string(path));
                 return false;
             }
+            output = std::format("write ok: created {} ({} chars)", std::string(path), (long long)input.size());
             // seed the edit cache so a follow-up edit skips re-reading the disk
             std::error_code ec;
             auto mtime = std::filesystem::last_write_time(path, ec);
@@ -6042,7 +6055,7 @@ namespace cell
             bool compact_auto = true;                 // auto-compress after long agent runs (default on)
             std::string compact_provider;             // compression provider name (empty => session provider)
             std::string compact_model;                // compression model name (empty => session model)
-            std::string system_prompt = "You are a helpful assistant.";
+            std::string system_prompt = "You are a helpful assistant. Do not multiply entities beyond necessity.";
             std::string session_id;
             size_t teamwork_max_children = 5;                             // child agents per Teamwork job (1..100)
             size_t log_max_lines = 1000;                                  // keep at most this many lines in logs/cell.log
@@ -14583,6 +14596,10 @@ static std::pair<std::unordered_map<std::string, std::shared_ptr<cell::tools::to
                 pos = nl + 1;
                 line_num++;
             }
+            // an empty body must still say WHY it is empty — the wrapper alone
+            // would leave the model unable to tell success from a glitch
+            if (numbered.empty())
+                numbered = start_line <= 1 ? "(the file is empty)\n" : "(no lines in the requested range)\n";
             out.text = std::move(numbered);
             return out;
         });
@@ -15681,12 +15698,18 @@ static int run_selftest()
 
     R.expect(!cell::box::write_new("box_test.txt", "x", out) && out.find("already exists") != std::string::npos, "write_new refuses overwrite");
     R.expect(!cell::box::write_new("no_such_dir/a.txt", "x", out) && out.find("parent directory") != std::string::npos, "write_new checks parent dir");
+    R.expect(cell::box::write_new("write_marker.txt", "abc", out) && out.find("write ok") != std::string::npos, "write_new success reports its result");
+    R.expect(cell::box::remove("write_marker.txt"), "write_new marker cleanup");
     R.expect(cell::box::mkdir("box_dir/sub"), "box::mkdir");
     R.expect(cell::box::exist("box_dir/sub"), "box::mkdir created");
     std::string cmd_out;
     int rc = -1;
     R.expect(cell::box::exec("echo cell_selftest", 10, cmd_out, rc) && rc == 0 && cmd_out.find("cell_selftest") != std::string::npos, "box::exec exit code 0");
     R.expect(cell::box::exec("exit 3", 10, cmd_out, rc) && rc == 3, "box::exec nonzero exit code");
+    // the gate (check_exec) is narrower than the credential-store rule enforced
+    // inside box::exec: that refusal must carry a reason, not a bare exitcode
+    cmd_out.clear();
+    R.expect(!cell::box::exec("cat ~/.ssh/id_rsa", 10, cmd_out, rc) && cmd_out.find("blocked") != std::string::npos, "box::exec credential-path refusal carries a reason");
 #ifdef _WIN32
     const char *slow_cmd = "ping -n 10 127.0.0.1";
 #else
@@ -15899,6 +15922,16 @@ static int run_selftest()
             o = conc_tools["read"]->execute(test_rt, nlohmann::json{{"path", "conc_dir/f00.txt"}, {"offset", 0}, {"limit", 1}}.dump());
             R.expect(o.ok && o.text == std::format("{:>6}: payload 0\n", 1),
                      "read tool tolerates number offset/limit");
+        }
+        {
+            // an empty read must still say so: the result body is the wrapper
+            // otherwise empty and the model cannot tell success from a glitch
+            R.expect(cell::box::write("conc_dir/empty.txt", ""), "empty-file fixture");
+            cell::ToolOutput oe = conc_tools["read"]->execute(test_rt, R"({"path":"conc_dir/empty.txt"})");
+            R.expect(oe.ok && oe.text.find("empty") != std::string::npos, "read of an empty file reports it");
+            oe = conc_tools["read"]->execute(test_rt, R"({"path":"conc_dir/empty.txt","offset":3})");
+            R.expect(oe.ok && oe.text.find("requested range") != std::string::npos, "read beyond EOF reports an empty range");
+            R.expect(cell::box::remove("conc_dir/empty.txt"), "empty-file cleanup");
         }
         std::vector<std::future<bool>> mixed;
         mixed.push_back(std::async(std::launch::async, [&conc_tools, &test_rt]
