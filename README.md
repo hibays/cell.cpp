@@ -291,7 +291,7 @@ Input starting with `/` is split on whitespace and handled locally — it is nev
 | `/export [PATH]` | Export the current session as a **self-contained HTML file** (single file, no scripts/external resources; light/dark aware; full-width two-pane layout — a sticky left rail with the execution chain that links 1:1 to the messages on the right, **draggable at its bottom-right corner** to widen it; markdown-lite rendering — headings, lists, quotes, rules, pipe tables, `code`, **bold**, *italic*, links — with tool calls, tool results and reasoning as collapsed sections; Teamwork jobs get an **agent-list pane**: the rail is a clickable list of jobs/stages/child agents that jumps straight to each agent's report + full transcript, wrapping labels instead of scrolling; workflow jobs get a **flowchart sub-page** with its own rail — start/stage/terminator nodes on a vertical rail, parallel stages forking into per-agent branch boxes, gates drawn as dashed diamonds; **phone-friendly**: the header and type tighten, the view tabs become a thumb-reachable bottom bar, every rail folds into a tap-to-open drawer (a hidden checkbox — still no script) and a parallel fan that cannot fit its column folds to one; default `cell-export-<UTC time>.html` in the working directory) |
 | `/export saved NAME [PATH]` | Export one compaction archive to HTML (name resolved like `/saved show`) |
 | `/usages` | Print per-model and per-session usage statistics (orphaned session records are pruned first) |
-| `/compact` | Archive the full transcript to `saved/msg-<UTC time>.jsonl`, then aggregate the conversation (plus the agent's reasoning) into one system summary message; refuses while the context is small (≤ 12 messages) |
+| `/compact` | Archive the full transcript to `saved/msg-<UTC time>.jsonl`, then aggregate the conversation (plus the agent's reasoning) into one summary message, backfilled as a standalone assistant reply directly behind the last user turn; refuses while the context is small (≤ 12 messages) |
 | `/compact auto [on\|off]` | Show or toggle automatic compaction after long agent runs (persisted, default on) |
 | `/compact model provider:model` | Route summarization through a specific registered provider/model; `inherit` resets it to the session model |
 | `/ins TEXT` | Interject a user message and get a response (injects text and triggers one LLM round-trip) |
@@ -356,11 +356,14 @@ reserved for `exec` output.
 message is split into conversation text and agent reasoning (thinking blocks are summarized in a
 second pass), each message truncated to 400 chars, and both parts are sent to the compression model
 (`compact_provider` / `compact_model`, falling back to the session model) with tools disabled. The
-two summaries are merged into a single
-`{"role":"system","content":"# Here is a summary that captures the previous conversation: …"}`
-message, and **the most recent user message is kept** — a compaction result needs at least one real
-turn, because a transcript of system messages alone is rejected by many chat templates
-(`No user query found in messages`) and would leave an overflow retry with nothing to re-send.
+two summaries are merged into one
+`{"role":"assistant","content":"# Here is a summary that captures the previous conversation: …"}`
+message, backfilled **directly behind the surviving user turn**: the most recent real user message
+is kept (never a tool_result carrier), and the summary follows it as a standalone assistant reply —
+the compacted transcript reads as a normal turn boundary (user → assistant), so the next user input
+lands behind the summary instead of piling onto an unanswered user message, and an overflow retry
+continues from the summary the way `/reload` continues a partial reply. A result without a real
+turn would be rejected by many chat templates (`No user query found in messages`).
 With ≤ 12 messages to aggregate it reports "context already small" and does nothing; if a
 summarization call fails, a truncation placeholder is used. The summary is re-run through the
 injection sanitizer before it is inserted, and the read-before-edit log is reset because the earlier
@@ -371,7 +374,7 @@ toward usage.
 and strict ones (llama.cpp's Jinja templates) accept **exactly one `system` message, at the very
 front** — a second one, or one that follows a turn, fails with `System message must be at the
 beginning`. So whenever session state arrives mid-conversation (notices, a loaded skill, an
-interrupt note, a compaction summary) every `system` message is merged into the single leading one
+interrupt note) every `system` message is merged into the single leading one
 in transcript order (`chat::fold_system_messages`), and the same fold runs on the transcript before
 every request as a last line of defence. The other two API styles never cared: they lift system
 messages out of the array into `system` / `instructions` anyway.
@@ -601,8 +604,9 @@ text, so results stay recoverable.
   `ok / failed / stopped` per child.
 - **No round cap, self-compacting children.** A child continues until it answers without tool
   calls, is stopped, or fails. When its transcript outgrows the model's context window — or
-  passes 500 messages — the child's own output is summarized into its leading system block (the
-  carried background is never compacted), the raw transcript is archived into the job directory
+  passes 500 messages — the child's own output is summarized into one assistant message backfilled
+  directly behind the carried background, whose last turn is the works user message (the background
+  itself is never compacted), the raw transcript is archived into the job directory
   (`<worker>.compact-<UTC>.jsonl`) before the rewrite, and a `compact` notice tells the
   supervisor it may stop the job if the child should not continue. A summarization that fails
   leaves the transcript exactly as it was.

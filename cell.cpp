@@ -10588,7 +10588,7 @@ details{break-inside:avoid}
         // EXACTLY one system message, at the very front: a second one — even
         // right after the first — fails with "System message must be at the
         // beginning". Session state that arrives after the conversation started
-        // (notices, skill bodies, interrupt notes, compaction summaries) can
+        // (notices, skill bodies, interrupt notes) can
         // therefore not stay a separate message at all: every system message is
         // merged into the single leading one, in transcript order.
         // Anthropic/Responses clients never cared (they lift system messages out
@@ -13674,8 +13674,9 @@ details{break-inside:avoid}
         // A child runs without a round cap. When its transcript outgrows the
         // model's context window (or passes the kForceCompactMessages safety
         // valve), the part THIS child produced is summarized and replaced by one
-        // system message; the carried background (prompt, works, foreground
-        // context, reuse summary) stays untouched. On any failure nothing is
+        // assistant message backfilled behind the carried background (prompt,
+        // works, foreground context, reuse summary — all untouched); the next
+        // round then continues from that summary. On any failure nothing is
         // rewritten. The summarizer rides on the child's own client with tools
         // off and no streaming, so a compaction never prints, never touches the
         // live session and never shares state with a sibling child.
@@ -13711,10 +13712,13 @@ details{break-inside:avoid}
         }
 
         // rewrite the child-produced segment: everything from `base` on is
-        // dropped and replaced by one system message carrying the summaries;
-        // fold_system_messages merges the system block so the summary lands in
-        // the leading message, and `base` is re-anchored to the new tail.
-        // false when there is nothing to compact.
+        // dropped and replaced by one assistant message carrying the summaries.
+        // It is backfilled directly behind the carried background — whose last
+        // turn is the works user message — so the transcript reads as a normal
+        // turn boundary and the next round continues from the summary (the same
+        // shape the main loop's compaction produces); fold_system_messages keeps
+        // the background system block canonical, and `base` is re-anchored to
+        // the new tail. false when there is nothing to compact.
         static bool compact_worker_segment(nlohmann::json &messages, size_t &base,
                                            const std::string &conv_summary, const std::string &think_summary)
         {
@@ -13727,8 +13731,8 @@ details{break-inside:avoid}
             nlohmann::json kept = nlohmann::json::array();
             for (size_t i = 0; i < base; i++)
                 kept.push_back(messages[i]);
-            kept.push_back({{"role", "system"}, {"content", content}});
             cell::chat::fold_system_messages(kept);
+            kept.push_back({{"role", "assistant"}, {"content", content}});
             messages = std::move(kept);
             base = messages.size();
             return true;
@@ -13816,7 +13820,7 @@ details{break-inside:avoid}
                 return false;
             if (!compact_worker_segment(messages, base, conv_summary, think_summary))
                 return false;
-            info = std::format("{} message(s) summarized into the leading system block (archive: {})", dropped, archive_name);
+            info = std::format("{} message(s) summarized into one assistant message behind the background (archive: {})", dropped, archive_name);
             return true;
         }
 
@@ -17026,15 +17030,18 @@ static int run_selftest()
             msgs.push_back({{"role", "assistant"}, {"content", "round two"}});
             R.expect(tw::compact_worker_segment(msgs, base, "conv-mem", "think-mem"),
                      "teamwork: compaction rewrites the child-produced segment");
-            R.expect(base == msgs.size() && msgs.size() == 2,
-                     "teamwork: compacted transcript = background + merged summary, base re-anchored");
+            R.expect(base == msgs.size() && msgs.size() == 3,
+                     "teamwork: compacted transcript = background + backfilled summary, base re-anchored");
             R.expect(msgs[0].value("role", "") == "system" &&
                          msgs[0].value("content", "").find("child prompt") != std::string::npos &&
-                         msgs[0].value("content", "").find("conv-mem") != std::string::npos &&
-                         msgs[0].value("content", "").find("think-mem") != std::string::npos,
-                     "teamwork: summary lands in the leading system block");
+                         msgs[0].value("content", "").find("conv-mem") == std::string::npos,
+                     "teamwork: the leading system block stays clean of the summary");
             R.expect(msgs[1].value("role", "") == "user" && msgs[1].value("content", "") == "works",
                      "teamwork: the works turn survives verbatim");
+            R.expect(msgs[2].value("role", "") == "assistant" &&
+                         msgs[2].value("content", "").find("conv-mem") != std::string::npos &&
+                         msgs[2].value("content", "").find("think-mem") != std::string::npos,
+                     "teamwork: summary is backfilled as an assistant message behind the works turn");
             nlohmann::json empty_sum = nlohmann::json::array({{{"role", "system"}, {"content", "s"}}, {{"role", "user"}, {"content", "w"}}, {{"role", "assistant"}, {"content", "x"}}});
             size_t b2 = 2;
             R.expect(!tw::compact_worker_segment(empty_sum, b2, "", "") && empty_sum.size() == 3,
@@ -18145,7 +18152,7 @@ static int run_selftest()
                  "user turn: an empty content array does not count");
 
         // session state injected mid-conversation (notices, skills, interrupt
-        // notes, compaction summaries) must end up in the leading system block:
+        // notes) must end up in the leading system block:
         // chat templates reject a system message that follows a real turn
         {
             nlohmann::json m = nlohmann::json::array({
@@ -19623,11 +19630,13 @@ int repl::run()
     // context compaction: keep every system message (the base prompt plus any
     // injected skills — they are session state, not conversation), split the rest
     // into conversation text and thinking text, summarize each separately, then
-    // append one {"role":"system","content": …} summary message plus the last
-    // user message, so the result stays a transcript any chat template accepts
-    // (system messages only at the front, and at least one real turn). The full
-    // transcript is archived to saved/msg-<UTC time>.jsonl inside the session
-    // folder before anything is rewritten; if either the archive or the
+    // rebuild the tail as the last user message followed by one {"role":
+    // "assistant","content": …} summary message. The summary is backfilled
+    // directly BEHIND the surviving user turn, so the transcript reads as a
+    // normal turn boundary (user → assistant) and the next user input lands
+    // behind the summary instead of piling onto an unanswered user message. The
+    // full transcript is archived to saved/msg-<UTC time>.jsonl inside the
+    // session folder before anything is rewritten; if either the archive or the
     // conversation summary cannot be produced the context is left EXACTLY as it
     // was: replacing real history with a placeholder would be irreversible data
     // loss, and the whole point of compacting is to preserve the information.
@@ -19687,12 +19696,16 @@ int repl::run()
         nlohmann::json new_msgs = nlohmann::json::array();
         for (size_t idx : sys_indexes)
             new_msgs.push_back(msgs[idx]);
-        new_msgs.push_back({{"role", "system"}, {"content", content}});
-        // the summary is session state, so it belongs to the leading system
-        // block: a chat template would reject it behind the conversation
+        // fold first, while the array holds only system messages, so the
+        // leading block stays canonical for strict chat templates
         cell::chat::fold_system_messages(new_msgs);
         if (tail_user)
             new_msgs.push_back(*tail_user);
+        // the summary is the assistant's own memory of the compacted run: a
+        // standalone assistant message directly behind the surviving user turn
+        // (the transcript ends on a turn boundary; the retry after an overflow
+        // continues from the summary, like /reload continues a partial reply)
+        new_msgs.push_back({{"role", "assistant"}, {"content", content}});
         size_t removed = rest.size() - (tail_user ? 1 : 0);
         msgs = std::move(new_msgs);
         return std::format("context compacted: archived to {}, aggregated {} message(s) into 1 summary, {} message(s) remain",
