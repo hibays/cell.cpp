@@ -57,9 +57,14 @@ endif()
 # -----------------------------------------------------------------------------
 #  C++ standard
 #
-#  CMake >= 3.30 knows "26" natively; older CMake (still common on LTS distros)
-#  does not, so the flag is injected directly there. Both paths end up with the
-#  same compiler flag, which the capability probe below then verifies for real.
+#  Three paths, all ending in the same compiler flag:
+#    * MSVC  — always inject `/std:c++latest` directly: CMake's MSVC mapping for
+#              CXX_STANDARD 26 depends on the CMake version, and a value CMake
+#              cannot map makes every try_compile fail ("requires the language
+#              dialect CXX26").
+#    * CMake >= 3.30 — knows "26" natively for GCC/Clang.
+#    * older CMake  — the flag is injected directly.
+#  The capability probe below then verifies the flag for real.
 # -----------------------------------------------------------------------------
 if(MSVC)
     set(CELL_CXX_FLAG "/std:c++latest") # MSVC spells C++26 "latest"
@@ -67,7 +72,9 @@ else()
     set(CELL_CXX_FLAG "-std=c++${CELL_CXX_STANDARD}")
 endif()
 
-if(CMAKE_VERSION VERSION_GREATER_EQUAL 3.30)
+if(MSVC)
+    string(APPEND CMAKE_CXX_FLAGS " ${CELL_CXX_FLAG}")
+elseif(CMAKE_VERSION VERSION_GREATER_EQUAL 3.30)
     set(CMAKE_CXX_STANDARD ${CELL_CXX_STANDARD})
     set(CMAKE_CXX_STANDARD_REQUIRED ON)
     set(CMAKE_CXX_EXTENSIONS OFF)
@@ -249,7 +256,8 @@ if(CELL_ENABLE_ASAN)
         set(_cell_asan_flags "/fsanitize=address")
         set(_cell_asan_link_flags "/INCREMENTAL:NO")
     else()
-        set(_cell_asan_flags "-fsanitize=address,undefined -fno-omit-frame-pointer -g")
+        # a CMake list, so each flag reaches the compiler as its own argument
+        set(_cell_asan_flags "-fsanitize=address,undefined" "-fno-omit-frame-pointer" "-g")
         set(_cell_asan_link_flags "-fsanitize=address,undefined")
     endif()
 
@@ -257,7 +265,8 @@ if(CELL_ENABLE_ASAN)
     # otherwise fail later with hundreds of undefined __asan_* references.
     include(CheckCXXSourceCompiles)
     set(_cell_saved_required_flags "${CMAKE_REQUIRED_FLAGS}")
-    set(CMAKE_REQUIRED_FLAGS "${CMAKE_REQUIRED_FLAGS} ${_cell_asan_flags}")
+    string(REPLACE ";" " " _cell_asan_flags_probe "${_cell_asan_flags}")
+    set(CMAKE_REQUIRED_FLAGS "${CMAKE_REQUIRED_FLAGS} ${_cell_asan_flags_probe}")
     check_cxx_source_compiles("int main() { return 0; }" CELL_TOOLCHAIN_SUPPORTS_SANITIZERS)
     set(CMAKE_REQUIRED_FLAGS "${_cell_saved_required_flags}")
 
@@ -265,7 +274,7 @@ if(CELL_ENABLE_ASAN)
         message(FATAL_ERROR
             "CELL_ENABLE_ASAN=ON, but this toolchain cannot link the sanitizer runtime.\n"
             "  Compiler: ${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION}\n"
-            "  Flags tried: ${_cell_asan_flags}\n"
+            "  Flags tried: ${_cell_asan_flags_probe}\n"
             "GCC/Clang on Linux and macOS ship libasan/libubsan; MSVC supports "
             "/fsanitize=address; some MinGW distributions (e.g. MSYS2 UCRT64) do not "
             "ship the sanitizer runtime at all.")

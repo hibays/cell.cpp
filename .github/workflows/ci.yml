@@ -227,7 +227,12 @@ jobs:
   # ---------------------------------------------------------------------------
   macos:
     name: macOS · AppleClang
-    runs-on: macos-15 # ships Xcode 16.x; cell.cpp needs Xcode 16.3+ (libc++ <generator>)
+    # The cell.cpp C++26 surface (<generator> in libc++) is not available in the
+    # AppleClang shipping with the current macos-15 runner image, so this job is
+    # informational: it configures, and fails with the exact toolchain message
+    # from the configure-time probe until a newer Xcode lands on the image.
+    continue-on-error: true
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
 
