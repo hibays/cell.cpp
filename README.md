@@ -609,12 +609,13 @@ The `notice` system is a **message bus for agent sessions**. Any writer — the 
 a Teamwork child inside this process, or a second cell process sharing the runtime root — drops a
 JSON file into the target session's `notices/pending/` folder (atomic write, sanitized on read:
 UTF-8 only, control/ANSI bytes stripped, 16 KB body cap, 500 pending-files cap). Delivered notices
-are archived to `notices/seen.jsonl`.
+are archived to `notices/seen.jsonl`; a failed archive is logged, but never blocks delivery.
 
 **Waiting is token-free.** `/notices wait` (and the `notice` tool's `wait` operation) block on a
-condition variable with a periodic folder re-scan (~0.7 s) — no LLM request is made while idle.
-In-process sends wake the waiter instantly; cross-process sends arrive within ~1 s. Pending
-notices are also drained automatically before every LLM turn, so a supervisor never has to poll.
+condition variable with a periodic folder re-scan (0.2 s in the REPL, ~0.7 s for the tool) — no LLM
+request is made while idle. In-process sends wake the waiter instantly; cross-process sends arrive
+within a second. Pending notices are also drained automatically before every LLM turn, so a
+supervisor never has to poll.
 
 - **Send**: `/notices send [SESSION] TEXT`, or the `notice` tool (`from`/`topic` fields give the
   receiver routing hints). Teamwork children report progress this way — `notice` is the one tool
@@ -622,6 +623,9 @@ notices are also drained automatically before every LLM turn, so a supervisor ne
 - **Automatic progress**: every Teamwork job posts notices for job start/completion/failure, stage
   start/finish, gate pauses, stops, and each worker start/finish (with status and a summary
   snippet), all `from=teamwork/<job-id>[/<worker>]`.
+- **Backpressure**: the queue holds at most 500 pending notices. Beyond that the oldest is dropped —
+  except for Teamwork *progress* posts (`worker`/`stage`/`review`), which are turned away instead,
+  so a progress flood can never evict a `gate`/`job` notice awaiting the supervisor.
 - **Consume**: `/notices drain` (or `notice drain`) delivers pending notices into the conversation
   as context; `wait` delivers what it woke for; `clear` drops them. Delivered = exactly once per
   draining session, thanks to file removal under a drain lock.
