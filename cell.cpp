@@ -9401,6 +9401,26 @@ namespace cell
             return out;
         }
 
+        // one rail: a phone folds it behind a tap-to-open bar (a hidden checkbox
+        // plus a label — still no script) that names the rail and counts its
+        // entries; a wide screen hides both and shows the body as it always did
+        static std::string rail_html(std::string_view id, std::string_view title, size_t count,
+                                     std::string body)
+        {
+            std::string out = "<aside class=\"tree\"><input type=\"checkbox\" class=\"railtgl\" id=\"";
+            out += id;
+            out += "\"><label class=\"railbar\" for=\"";
+            out += id;
+            out += "\"><span class=\"rbt\">";
+            out += html_escape(title);
+            out += "</span><span class=\"rbn\">";
+            out += std::to_string(count);
+            out += "</span><span class=\"rbc\" aria-hidden=\"true\"></span></label><div class=\"railbody\">";
+            out += std::move(body);
+            out += "</div></aside>";
+            return out;
+        }
+
         // "ok" / "run" / "idle" / "bad" — the only place a status gets colour
         static const char *status_class(std::string_view s)
         {
@@ -9581,9 +9601,9 @@ namespace cell
         // with its report and (collapsed) its own transcript
         static std::string teamwork_pane_html(const export_context &ctx, size_t &child_msgs, bool &capped)
         {
-            std::string out = "<aside class=\"tree\"><h2>agents</h2>";
-            out += teamwork_outline_html(ctx);
-            out += "</aside><div class=\"stream\">";
+            std::string out = rail_html("rail-agents", "agents", ctx.jobs.size(),
+                                        "<h2>agents</h2>" + teamwork_outline_html(ctx));
+            out += "<div class=\"stream\">";
             for (size_t ji = 0; ji < ctx.jobs.size(); ++ji)
             {
                 const teamwork_job_view &job = ctx.jobs[ji];
@@ -9734,10 +9754,12 @@ namespace cell
                 out += "</div>";
                 if (!agents.empty())
                 {
-                    out += "<ul class=\"fbr";
-                    if (fan)
-                        out += " fan";
-                    out += "\" style=\"--n:" + std::to_string(agents.size()) + "\">";
+                out += "<ul class=\"fbr";
+                if (fan)
+                    out += " fan";
+                if (agents.size() > 5) // too many branches to read as columns
+                    out += " stack";
+                out += "\" style=\"--n:" + std::to_string(agents.size()) + "\">";
                     for (const auto *w : agents)
                     {
                         out += "<li><div class=\"frow\"><span class=\"dot assistant\" aria-hidden=\"true\"></span>";
@@ -9772,7 +9794,7 @@ namespace cell
         // sub-page carrying the flowchart plus a pointer back into the teamwork pane
         static std::string workflow_pane_html(const export_context &ctx, size_t &pages)
         {
-            std::string rail = "<aside class=\"tree\"><h2>workflows</h2><ol class=\"chain\">";
+            std::string chain = "<ol class=\"chain\">";
             std::string body;
             for (size_t ji = 0; ji < ctx.jobs.size(); ++ji)
             {
@@ -9782,12 +9804,12 @@ namespace cell
                 pages++;
                 std::string anchor = "wf" + std::to_string(ji);
                 std::string title = job.workflow_name.empty() ? job.id : job.workflow_name;
-                rail += "<li><a href=\"#" + anchor + "\"><span class=\"ix\">" + std::format("{:02}", pages) +
-                        "</span><span class=\"dot tool\" aria-hidden=\"true\"></span><span class=\"lbl\">" +
-                        html_escape(title) + "</span></a><ul class=\"kids\">";
-                rail += "<li><a href=\"#" + anchor + "\">" + std::to_string(job.stages.size()) + " stage(s) \xc2\xb7 " +
-                        std::to_string(job.workers.size()) + " agent(s)</a></li>";
-                rail += "<li><a href=\"#j" + std::to_string(ji) + "\">teamwork entry</a></li></ul></li>";
+                chain += "<li><a href=\"#" + anchor + "\"><span class=\"ix\">" + std::format("{:02}", pages) +
+                         "</span><span class=\"dot tool\" aria-hidden=\"true\"></span><span class=\"lbl\">" +
+                         html_escape(title) + "</span></a><ul class=\"kids\">";
+                chain += "<li><a href=\"#" + anchor + "\">" + std::to_string(job.stages.size()) + " stage(s) \xc2\xb7 " +
+                         std::to_string(job.workers.size()) + " agent(s)</a></li>";
+                chain += "<li><a href=\"#j" + std::to_string(ji) + "\">teamwork entry</a></li></ul></li>";
 
                 body += "<section class=\"subpage\" id=\"" + anchor +
                         "\"><div class=\"crumbs\"><a href=\"#pane-chat\">conversation</a><span>/</span>";
@@ -9801,8 +9823,9 @@ namespace cell
                 body += "<p class=\"p muted\">child reports and full transcripts live in the teamwork tab.</p>";
                 body += "</section>";
             }
-            rail += "</ol></aside>";
-            return rail + "<div class=\"stream\">" + body + "</div>";
+            chain += "</ol>";
+            return rail_html("rail-workflows", "workflows", pages, "<h2>workflows</h2>" + chain) +
+                   "<div class=\"stream\">" + body + "</div>";
         }
 
         // write the transcript as one self-contained HTML file (no scripts, no
@@ -9957,7 +9980,21 @@ border-radius:5px;font-size:12.5px;color:var(--fg-dim);text-decoration:none}
 .tree .stages .kind{display:block;padding:2px 0 3px;overflow-wrap:anywhere}
 .tree .stages ul{margin-left:1.1em}
 .tree .stages ul li{display:flex;align-items:flex-start;gap:6px;min-width:0}
-.stream{flex:1 1 0;min-width:0;padding:26px var(--pad) 72px}
+/* rails on a phone: a long rail would push the transcript below the fold, so a
+   small screen folds every rail into a tap-to-open drawer — a hidden checkbox
+   plus a label, so the export still needs no script. Both are hidden on a wide
+   screen, where the body shows as it always did. */
+.railtgl{position:absolute;width:1px;height:1px;opacity:0;pointer-events:none}
+.railbar{display:none}
+.railbar .rbn{margin-left:auto;font-family:var(--mono);font-size:10.5px;color:var(--fg-faint)}
+.railbar .rbc::before{content:"\25BE"}
+.railtgl:checked~.railbar .rbc::before{content:"\25B4"}
+.railtgl:focus-visible~.railbar{outline:2px solid var(--link);outline-offset:2px}
+/* the stream is the flow's query container: a fan of branches that cannot fit
+   the column it lives in folds to a single column (see @container below), which
+   a viewport media query alone cannot see on a wide window with a wide rail */
+.stream{flex:1 1 0;min-width:0;padding:26px var(--pad) 72px;
+container-type:inline-size;container-name:stream}
 .msg{scroll-margin-top:calc(var(--hero-h) + 14px)}
 .msg+.msg{border-top:1px solid var(--line);margin-top:26px;padding-top:26px}
 .msg.tool{margin-top:16px;padding-top:16px}
@@ -10036,14 +10073,15 @@ padding:22px 26px 24px}
 /* workflow flowchart: a vertical rail (drawn with borders — no images) and one
    node per stage. Parallel stages fan their agents out into branch boxes joined
    by a fork, gates get a dashed edge and a diamond marker, and the flow is
-   book-ended by a start and a status terminator. */
-.flow{position:relative;margin:18px 0 4px}
-.flow::before{content:"";position:absolute;left:19px;top:16px;bottom:16px;border-left:1px solid var(--line)}
+   book-ended by a start and a status terminator. The rail offset lives in a var
+   so a phone can pull the whole diagram closer to the left edge. */
+.flow{--railx:19px;--fork:14px;position:relative;margin:18px 0 4px}
+.flow::before{content:"";position:absolute;left:var(--railx);top:16px;bottom:16px;border-left:1px solid var(--line)}
 .fnode{display:flex;align-items:stretch;margin:0 0 12px}
 .frail{position:relative;flex:0 0 40px;min-height:30px}
-.fnode:not(:last-child) .frail::after{content:"";position:absolute;left:14px;bottom:-6px;width:0;height:0;
+.fnode:not(:last-child) .frail::after{content:"";position:absolute;left:calc(var(--railx) - 5px);bottom:-6px;width:0;height:0;
 border-left:5px solid transparent;border-right:5px solid transparent;border-top:6px solid var(--line)}
-.fdot{position:absolute;left:19px;top:20px;width:9px;height:9px;margin:-4.5px 0 0 -4.5px;
+.fdot{position:absolute;left:var(--railx);top:20px;width:9px;height:9px;margin:-4.5px 0 0 -4.5px;
 border-radius:50%;background:var(--fg-faint);border:1.5px solid var(--bg)}
 .fdot.ok{background:var(--ok)}
 .fdot.run{background:var(--run)}
@@ -10061,35 +10099,88 @@ border-radius:50%;background:var(--fg-faint);border:1.5px solid var(--bg)}
 .fmeta{font-family:var(--mono);font-size:10.5px;color:var(--fg-faint)}
 .kbadge{font-family:var(--mono);font-size:9.5px;letter-spacing:.08em;text-transform:uppercase;
 color:var(--fg-dim);border:1px solid var(--line);border-radius:20px;padding:0 7px}
-.fbr{display:grid;grid-template-columns:repeat(var(--n,1),minmax(0,1fr));gap:12px;margin:12px 0 0;
+.fbr{display:grid;grid-template-columns:var(--cols,repeat(var(--n,1),minmax(0,1fr)));gap:12px;margin:12px 0 0;
 padding:0;list-style:none}
 .fbr:not(.fan)>li{padding:5px 0;border-top:1px solid var(--line-soft)}
 .fbr:not(.fan)>li:first-child{border-top:0;padding-top:0}
-.fbr.fan{position:relative;margin-top:18px;padding-top:14px}
-.fbr.fan::before{content:"";position:absolute;top:0;left:calc(50%/var(--n,1));right:calc(50%/var(--n,1));
-border-top:1px solid var(--line)}
+/* a fork draws its connectors from the same vars that pick the column count, so
+   folding the fan to one column (phone / narrow stream / many agents) is a var
+   change, not a second copy of the layout */
+.fbr.fan{--forkop:1;--fork:14px;position:relative;margin-top:18px;padding-top:var(--fork)}
+.fbr.fan::before{content:"";position:absolute;pointer-events:none;top:0;left:calc(50%/var(--n,1));
+right:calc(50%/var(--n,1));border-top:1px solid var(--line);opacity:var(--forkop)}
 .fbr.fan>li{position:relative;border:1px solid var(--line-soft);border-radius:8px;padding:9px 12px}
-.fbr.fan>li::before{content:"";position:absolute;top:-14px;left:50%;height:14px;width:0;
-border-left:1px solid var(--line)}
+.fbr.fan>li::before{content:"";position:absolute;pointer-events:none;top:calc(-1*var(--fork));left:50%;
+height:var(--fork);width:0;border-left:1px solid var(--line);opacity:var(--forkop)}
+.fbr.fan.stack{--cols:minmax(0,1fr);--fork:0px;--forkop:0}
 .frow{display:flex;align-items:center;gap:8px;flex-wrap:wrap;min-width:0}
 .frow .nm{font-family:var(--mono);font-size:12px}
 .frow .st{font-family:var(--mono);font-size:10.5px}
 .fbr .ex{display:block;margin-top:3px;font-size:11.5px;color:var(--fg-faint);overflow-wrap:anywhere}
 footer{max-width:var(--page);margin:0 auto;padding:22px var(--pad) 64px;display:flex;gap:14px;
 flex-wrap:wrap;justify-content:space-between;font-size:11.5px;color:var(--fg-faint)}
+footer .totop{color:var(--fg-faint);text-decoration:none;white-space:nowrap}
+footer .totop:hover{color:var(--fg)}
+/* tablets and below: one column, the rail folds into a drawer, the flow tightens */
 @media (max-width:900px){
-:root{--pad:18px;--hero-h:0px}
+:root{--pad:16px;--hero-h:0px}
 #pane-chat,.pane:target,.pane:has(:target){flex-direction:column}
-.tree{position:static;width:auto;max-width:none;max-height:none;resize:none;overflow:visible;
-border-right:0;border-bottom:1px solid var(--line);padding:20px var(--pad)}
-.stream{padding:20px var(--pad) 48px}
-.subpage{border-radius:8px;padding:18px}
+.hero{position:static}
+.tree{position:static;align-self:stretch;width:auto;min-width:0;max-width:none;max-height:none;resize:none;
+overflow:visible;border-right:0;border-bottom:1px solid var(--line);padding:12px var(--pad) 13px}
+.railbar{display:flex;align-items:center;gap:8px;padding:9px 11px;cursor:pointer;
+-webkit-user-select:none;user-select:none;border:1px solid var(--line);border-radius:9px;
+font-size:12px;letter-spacing:.02em;color:var(--fg-dim)}
+.railbar .rbt{font-weight:600}
+.railtgl:not(:checked)~.railbody{display:none}
+.railbody{padding-top:12px}
+.railbody h2{display:none}
+.stream{padding:18px var(--pad) 44px}
+.subpage{border-radius:10px;padding:16px}
 .msg+.msg{margin-top:20px;padding-top:20px}
+.fbr.fan{--cols:minmax(0,1fr);--fork:0px;--forkop:0}
+}
+/* phones: the view tabs become a bottom bar (always under the thumb), the
+   header and the type tighten, and every fan folds into a single column */
+@media (max-width:640px){
+:root{--pad:14px}
+body{padding-bottom:calc(54px + env(safe-area-inset-bottom,0px))}
+.hero-in{padding:11px var(--pad) 9px;gap:6px}
+h1{font-size:14.5px}
+.sub{font-size:11px}
+.meta{font-size:11px;gap:6px 10px;white-space:normal;flex-wrap:wrap}
+.meta>span{white-space:nowrap}
+.tabs{position:fixed;left:0;right:0;bottom:0;z-index:20;margin:0;
+padding:0 4px env(safe-area-inset-bottom,0px);background:var(--bg);
+border-top:1px solid var(--line);border-bottom:0}
+.tabs a{flex:1 1 0;justify-content:center;text-align:center;padding:11px 6px 9px;margin-bottom:0;font-size:12.5px}
+.fbr.fan{--cols:minmax(0,1fr);--fork:0px;--forkop:0}
+.flow{--railx:13px}
+.frail{flex:0 0 28px}
+.fbox{padding:10px 12px 12px}
+.fbr.fan>li{padding:8px 10px}
+.subpage{padding:14px 14px 16px}
+.crumbs{flex-wrap:wrap}
+pre.code{font-size:12px;padding:10px 12px}
+.md-tab{font-size:12.5px}
+.md-tab th,.md-tab td{padding:6px 10px 6px 0}
+summary{padding:6px 0;font-size:12.5px}
+.substream{padding-left:10px}
+.tree a{padding:5px 6px}
+.tree .kids a{padding-left:calc(2.6em + 6px)}
+footer{padding:18px var(--pad) 30px;flex-direction:column;gap:6px}
+}
+/* a stream too narrow for columns folds the fork even on a wide window (a fan
+   with many agents, or a rail dragged wide); progressive — the media query
+   above already covers browsers without container queries */
+@container stream (max-width:760px){
+.fbr.fan{--cols:minmax(0,1fr);--fork:0px;--forkop:0}
 }
 @media print{
 :root{color-scheme:light;--hero-h:0px}
-body{background:#fff}
+body{background:#fff;padding-bottom:0}
 .hero{position:static}
+.tabs{position:static;border-top:0}
 .pane{display:block!important}
 .tree{display:none}
 .stream{flex:none;padding:0}
@@ -10125,6 +10216,8 @@ details{break-inside:avoid}
             html += "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n";
             html += "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n";
             html += "<meta name=\"color-scheme\" content=\"light dark\">\n";
+            html += "<meta name=\"theme-color\" content=\"#ffffff\" media=\"(prefers-color-scheme:light)\">\n";
+            html += "<meta name=\"theme-color\" content=\"#0f1115\" media=\"(prefers-color-scheme:dark)\">\n";
             html += "<meta name=\"generator\" content=\"cell.cpp /export\">\n";
             html += "<title>cell.cpp transcript - ";
             html += html_escape(session_id);
@@ -10132,7 +10225,7 @@ details{break-inside:avoid}
             html += css;
             html += picks;
             html += "</style>\n</head>\n<body>\n";
-            html += "<header class=\"hero\"><div class=\"hero-in\"><div class=\"titles\">";
+            html += "<header class=\"hero\" id=\"top\"><div class=\"hero-in\"><div class=\"titles\">";
             html += "<h1>cell.cpp transcript</h1><p class=\"sub\">session <code>";
             html += html_escape(session_id);
             html += "</code></p></div><div class=\"meta\"><span><b>";
@@ -10148,13 +10241,14 @@ details{break-inside:avoid}
             // hide it with a forward sibling selector (no scripts needed)
             html += teamwork_pane;
             html += workflow_pane;
-            html += "<section class=\"pane\" id=\"pane-chat\"><aside class=\"tree\"><h2>execution chain</h2>";
-            html += outline_html(outline);
-            html += "</aside><div class=\"stream\">";
+            html += "<section class=\"pane\" id=\"pane-chat\">";
+            html += rail_html("rail-chat", "execution chain", outline.size(),
+                              "<h2>execution chain</h2>" + outline_html(outline));
+            html += "<div class=\"stream\">";
             html += body;
             html += "</div></section>\n</div>\n<footer><span>generated by cell.cpp &middot; /export</span><span>";
             html += html_escape(stats);
-            html += "</span></footer>\n</body>\n</html>\n";
+            html += "</span><a class=\"totop\" href=\"#top\">\xe2\x86\x91 top</a></footer>\n</body>\n</html>\n";
             if (!plat::write_file_atomic(target, html))
             {
                 err = std::format("failed to write {}", target.string());
@@ -18210,9 +18304,15 @@ static int run_selftest()
                      "HTML export wraps messages in role-styled cards");
             R.expect(html.find("<nav class=\"tabs\">") != std::string::npos && html.find("href=\"#pane-chat\"") != std::string::npos,
                      "HTML export renders the view tabs");
-            R.expect(html.find("<aside class=\"tree\"><h2>execution chain</h2>") != std::string::npos &&
+            R.expect(html.find("<aside class=\"tree\">") != std::string::npos &&
+                         html.find("<h2>execution chain</h2>") != std::string::npos &&
                          html.find("<a href=\"#m2\">") != std::string::npos && html.find("id=\"m2\"") != std::string::npos,
                      "HTML export renders the execution chain rail with working anchors");
+            R.expect(html.find("class=\"railtgl\" id=\"rail-chat\"") != std::string::npos &&
+                         html.find("<label class=\"railbar\" for=\"rail-chat\">") != std::string::npos &&
+                         html.find("<div class=\"railbody\">") != std::string::npos &&
+                         html.find(".railtgl:not(:checked)~.railbody{display:none}") != std::string::npos,
+                     "HTML export folds the rail into a script-free drawer for small screens");
             R.expect(html.find(">thinking</a>") != std::string::npos && html.find(">call ls</a>") != std::string::npos &&
                          html.find(">result exec</a>") != std::string::npos,
                      "HTML export lists thinking, tool calls and tool results in the chain");
@@ -18280,6 +18380,26 @@ static int run_selftest()
         job.workers.push_back(w2);
         job.workers.push_back(w1);
         ctx.jobs.push_back(job);
+        // a wide parallel stage: too many branches to read as columns, so the
+        // flow folds them into one column even on a wide screen
+        cell::chat::teamwork_job_view wide;
+        wide.id = "tw-20260101-000100";
+        wide.status = "ok";
+        wide.work_type = "workflow";
+        wide.created = "20260101-000100";
+        wide.is_workflow = true;
+        wide.workflow_name = "wide-fan";
+        wide.stages.push_back({"sweep", "parallel", false, 6});
+        for (int i = 0; i < 6; i++)
+        {
+            cell::chat::teamwork_worker_view wv;
+            wv.name = std::format("w{}", i);
+            wv.stage = 0;
+            wv.stage_name = "sweep";
+            wv.status = "ok";
+            wide.workers.push_back(std::move(wv));
+        }
+        ctx.jobs.push_back(wide);
 
         std::filesystem::path out2 = cell::root / "selftest-export-tw.html";
         R.expect(cell::chat::export_transcript_html(tw_msgs, "sid-tw", out2, xerr, &ctx), "HTML export writes the teamwork views");
@@ -18290,7 +18410,7 @@ static int run_selftest()
                      "HTML export renders the teamwork pane and its tab");
             R.expect(html.find("id=\"pane-workflow\"") != std::string::npos && html.find("href=\"#pane-workflow\"") != std::string::npos,
                      "HTML export renders the workflow sub-page and its tab");
-            R.expect(html.find("<aside class=\"tree\"><h2>agents</h2>") != std::string::npos &&
+            R.expect(html.find("<h2>agents</h2>") != std::string::npos &&
                          html.find("id=\"j0\"") != std::string::npos && html.find("href=\"#w0-0\"") != std::string::npos &&
                          html.find("href=\"#w0-2\"") != std::string::npos,
                      "HTML export renders the agent list with job and child anchors");
@@ -18316,9 +18436,11 @@ static int run_selftest()
             R.expect(html.find("&lt;script&gt;alert(1)&lt;/script&gt;") != std::string::npos && html.find("<script") == std::string::npos,
                      "HTML export escapes child transcripts");
             R.expect(html.find("map &lt;b&gt;the&lt;/b&gt; code") != std::string::npos, "HTML export escapes child work payloads");
-            R.expect(html.find("1 teamwork job(s) / 3 child agent(s)") != std::string::npos,
+            R.expect(html.find("<ul class=\"fbr fan stack\" style=\"--n:6\">") != std::string::npos,
+                     "HTML export folds a wide parallel stage into one column");
+            R.expect(html.find("2 teamwork job(s) / 9 child agent(s)") != std::string::npos,
                      "HTML export reports teamwork counts in the footer");
-            R.expect(html.find("<aside class=\"tree\"><h2>workflows</h2>") != std::string::npos &&
+            R.expect(html.find("<h2>workflows</h2>") != std::string::npos &&
                          html.find("href=\"#wf0\"") != std::string::npos && html.find("id=\"wf0\"") != std::string::npos,
                      "HTML export gives the workflow pane a rail selecting its sub-pages");
             R.expect(html.find("body:has(#w0-2:target) .tree a[href=\"#w0-2\"]{color:var(--fg);background:var(--line-soft)}") !=
@@ -18327,6 +18449,16 @@ static int run_selftest()
             R.expect(html.find("#pane-teamwork:has(:target)~#pane-chat") != std::string::npos &&
                          html.find("resize:horizontal") != std::string::npos && html.find("--page:100%") != std::string::npos,
                      "HTML export keeps a pane open for in-pane jumps and leaves the rail resizable");
+            R.expect(html.find("@container stream (max-width:760px)") != std::string::npos &&
+                         html.find("container-type:inline-size") != std::string::npos,
+                     "HTML export folds a fan that cannot fit its column even on a wide window");
+            R.expect(html.find("@media (max-width:640px)") != std::string::npos &&
+                         html.find(".tabs{position:fixed") != std::string::npos &&
+                         html.find("padding-bottom:calc(54px + env(safe-area-inset-bottom,0px))") != std::string::npos,
+                     "HTML export turns the view tabs into a bottom bar on a phone");
+            R.expect(html.find("<meta name=\"theme-color\"") != std::string::npos &&
+                         html.find("content=\"width=device-width, initial-scale=1\"") != std::string::npos,
+                     "HTML export declares a viewport and a theme colour for mobile browsers");
         }
         std::error_code ec2;
         std::filesystem::remove(out2, ec2);
