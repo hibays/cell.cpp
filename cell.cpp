@@ -877,10 +877,30 @@ namespace cell
         {
             enum class key
             {
-                none, insert, backspace, del, left, right, word_left, word_right,
-                home, end, up, down, enter, ctrl_c, ctrl_d,
-                kill_start, kill_end, kill_word_back, kill_word_fwd,
-                yank, transpose, clear_screen, hist_first, hist_last
+                none,
+                insert,
+                backspace,
+                del,
+                left,
+                right,
+                word_left,
+                word_right,
+                home,
+                end,
+                up,
+                down,
+                enter,
+                ctrl_c,
+                ctrl_d,
+                kill_start,
+                kill_end,
+                kill_word_back,
+                kill_word_fwd,
+                yank,
+                transpose,
+                clear_screen,
+                hist_first,
+                hist_last
             };
             key k = key::none;
             std::string text;
@@ -913,13 +933,31 @@ namespace cell
                     // meta (Alt) pair: a single byte after ESC
                     switch (c1)
                     {
-                    case 'b': case 'B': ev.k = k::word_left; break;
-                    case 'f': case 'F': ev.k = k::word_right; break;
-                    case 'd': case 'D': ev.k = k::kill_word_fwd; break;
-                    case '<': ev.k = k::hist_first; break;
-                    case '>': ev.k = k::hist_last; break;
-                    case 0x7F: case 0x08: ev.k = k::kill_word_back; break; // Alt+Backspace
-                    default: ev.k = k::none; break;                        // unbound meta key: ignore the pair
+                    case 'b':
+                    case 'B':
+                        ev.k = k::word_left;
+                        break;
+                    case 'f':
+                    case 'F':
+                        ev.k = k::word_right;
+                        break;
+                    case 'd':
+                    case 'D':
+                        ev.k = k::kill_word_fwd;
+                        break;
+                    case '<':
+                        ev.k = k::hist_first;
+                        break;
+                    case '>':
+                        ev.k = k::hist_last;
+                        break;
+                    case 0x7F:
+                    case 0x08:
+                        ev.k = k::kill_word_back;
+                        break; // Alt+Backspace
+                    default:
+                        ev.k = k::none;
+                        break; // unbound meta key: ignore the pair
                     }
                     return 2;
                 }
@@ -959,48 +997,109 @@ namespace cell
                 bool word = mod >= 3; // Alt/Ctrl held; 2 is Shift only
                 switch ((unsigned char)buf[i])
                 {
-                case 'A': ev.k = k::up; break;
-                case 'B': ev.k = k::down; break;
-                case 'C': ev.k = word ? k::word_right : k::right; break;
-                case 'D': ev.k = word ? k::word_left : k::left; break;
-                case 'H': ev.k = k::home; break;
-                case 'F': ev.k = k::end; break;
+                case 'A':
+                    ev.k = k::up;
+                    break;
+                case 'B':
+                    ev.k = k::down;
+                    break;
+                case 'C':
+                    ev.k = word ? k::word_right : k::right;
+                    break;
+                case 'D':
+                    ev.k = word ? k::word_left : k::left;
+                    break;
+                case 'H':
+                    ev.k = k::home;
+                    break;
+                case 'F':
+                    ev.k = k::end;
+                    break;
                 case '~':
                     switch (param)
                     {
-                    case 1: case 7: ev.k = k::home; break;
-                    case 3: ev.k = word ? k::kill_word_fwd : k::del; break;
-                    case 4: case 8: ev.k = k::end; break;
-                    default: ev.k = k::none; break; // Insert / PgUp / PgDn / F-keys: not edited here
+                    case 1:
+                    case 7:
+                        ev.k = k::home;
+                        break;
+                    case 3:
+                        ev.k = word ? k::kill_word_fwd : k::del;
+                        break;
+                    case 4:
+                    case 8:
+                        ev.k = k::end;
+                        break;
+                    default:
+                        ev.k = k::none;
+                        break; // Insert / PgUp / PgDn / F-keys: not edited here
                     }
                     break;
-                default: ev.k = k::none; break;
+                default:
+                    ev.k = k::none;
+                    break;
                 }
                 return i + 1;
             }
             switch (c)
             {
-            case 0x0D: case 0x0A: ev.k = k::enter; return 1;
-            case 0x7F: case 0x08: ev.k = k::backspace; return 1;
-            case 0x03: ev.k = k::ctrl_c; return 1;
-            case 0x04: ev.k = k::ctrl_d; return 1;
-            case 0x01: ev.k = k::home; return 1;           // Ctrl+A
-            case 0x05: ev.k = k::end; return 1;            // Ctrl+E
-            case 0x02: ev.k = k::left; return 1;           // Ctrl+B
-            case 0x06: ev.k = k::right; return 1;          // Ctrl+F
-            case 0x10: ev.k = k::up; return 1;             // Ctrl+P
-            case 0x0E: ev.k = k::down; return 1;           // Ctrl+N
-            case 0x0B: ev.k = k::kill_end; return 1;       // Ctrl+K
-            case 0x15: ev.k = k::kill_start; return 1;     // Ctrl+U
-            case 0x17: ev.k = k::kill_word_back; return 1; // Ctrl+W
-            case 0x19: ev.k = k::yank; return 1;           // Ctrl+Y
-            case 0x14: ev.k = k::transpose; return 1;      // Ctrl+T
-            case 0x0C: ev.k = k::clear_screen; return 1;   // Ctrl+L
-            default: break;
+            case 0x0D:
+            case 0x0A:
+                ev.k = k::enter;
+                return 1;
+            case 0x7F:
+            case 0x08:
+                ev.k = k::backspace;
+                return 1;
+            case 0x03:
+                ev.k = k::ctrl_c;
+                return 1;
+            case 0x04:
+                ev.k = k::ctrl_d;
+                return 1;
+            case 0x01:
+                ev.k = k::home;
+                return 1; // Ctrl+A
+            case 0x05:
+                ev.k = k::end;
+                return 1; // Ctrl+E
+            case 0x02:
+                ev.k = k::left;
+                return 1; // Ctrl+B
+            case 0x06:
+                ev.k = k::right;
+                return 1; // Ctrl+F
+            case 0x10:
+                ev.k = k::up;
+                return 1; // Ctrl+P
+            case 0x0E:
+                ev.k = k::down;
+                return 1; // Ctrl+N
+            case 0x0B:
+                ev.k = k::kill_end;
+                return 1; // Ctrl+K
+            case 0x15:
+                ev.k = k::kill_start;
+                return 1; // Ctrl+U
+            case 0x17:
+                ev.k = k::kill_word_back;
+                return 1; // Ctrl+W
+            case 0x19:
+                ev.k = k::yank;
+                return 1; // Ctrl+Y
+            case 0x14:
+                ev.k = k::transpose;
+                return 1; // Ctrl+T
+            case 0x0C:
+                ev.k = k::clear_screen;
+                return 1; // Ctrl+L
+            default:
+                break;
             }
             if (c < 0x20)
                 return 1; // other control keys (Ctrl+G, Ctrl+O, ...) are ignored
-            size_t n = c < 0x80 ? 1 : (c >= 0xF0 ? 4 : c >= 0xE0 ? 3 : c >= 0xC0 ? 2 : 1);
+            size_t n = c < 0x80 ? 1 : (c >= 0xF0 ? 4 : c >= 0xE0 ? 3
+                                                   : c >= 0xC0   ? 2
+                                                                 : 1);
             if (buf.size() < n)
                 return 0; // the rest of the code point is still in flight
             for (size_t j = 1; j < n; j++)
@@ -1050,11 +1149,11 @@ namespace cell
         {
             std::string text;
             size_t cursor = 0;
-            size_t hidx = 0;    // history index; == history.size() while not browsing
-            std::string saved;  // the draft stashed when history browsing starts
-            std::string killed; // last killed text (single-slot kill ring) for Ctrl+Y
+            size_t hidx = 0;           // history index; == history.size() while not browsing
+            std::string saved;         // the draft stashed when history browsing starts
+            std::string killed;        // last killed text (single-slot kill ring) for Ctrl+Y
             bool clear_screen = false; // Ctrl+L: the caller repaints from a cleared screen
-            bool dirty = false; // an edit or cursor move happened: the caller redraws
+            bool dirty = false;        // an edit or cursor move happened: the caller redraws
 
             // returns 0 = handled, 1 = submit, 2 = end of input, 3 = interrupt
             int apply(const key_event &ev, const std::vector<std::string> &history)
@@ -1416,14 +1515,29 @@ namespace cell
                         return 1;
                     switch ((int)_getwch())
                     {
-                    case 72: pending += "\x1b[A"; break;
-                    case 80: pending += "\x1b[B"; break;
-                    case 77: pending += "\x1b[C"; break;
-                    case 75: pending += "\x1b[D"; break;
-                    case 71: pending += "\x1b[H"; break;
-                    case 79: pending += "\x1b[F"; break;
-                    case 83: pending += "\x1b[3~"; break;
-                    default: break;
+                    case 72:
+                        pending += "\x1b[A";
+                        break;
+                    case 80:
+                        pending += "\x1b[B";
+                        break;
+                    case 77:
+                        pending += "\x1b[C";
+                        break;
+                    case 75:
+                        pending += "\x1b[D";
+                        break;
+                    case 71:
+                        pending += "\x1b[H";
+                        break;
+                    case 79:
+                        pending += "\x1b[F";
+                        break;
+                    case 83:
+                        pending += "\x1b[3~";
+                        break;
+                    default:
+                        break;
                     }
                     return 1;
                 }
@@ -2134,9 +2248,21 @@ namespace cell
                 unsigned char c = (unsigned char)s[i];
                 uint32_t cp = c;
                 size_t n = 1;
-                if (c >= 0xF0) { cp = c & 0x07u; n = 4; }
-                else if (c >= 0xE0) { cp = c & 0x0Fu; n = 3; }
-                else if (c >= 0xC0) { cp = c & 0x1Fu; n = 2; }
+                if (c >= 0xF0)
+                {
+                    cp = c & 0x07u;
+                    n = 4;
+                }
+                else if (c >= 0xE0)
+                {
+                    cp = c & 0x0Fu;
+                    n = 3;
+                }
+                else if (c >= 0xC0)
+                {
+                    cp = c & 0x1Fu;
+                    n = 2;
+                }
                 for (size_t k = 1; k < n && i + k < s.size(); k++)
                     cp = (cp << 6) | ((unsigned char)s[i + k] & 0x3Fu);
                 i += n;
@@ -4565,7 +4691,7 @@ namespace cell
             auto file_size = std::filesystem::file_size(path);
             std::string media_type = get_media_type(path);
             result.text = std::format("File: {}\nType: {}\nSize: {} bytes\nMedia-Type: {}",
-                                             std::string(path), file_type_to_string(file_type), file_size, media_type);
+                                      std::string(path), file_type_to_string(file_type), file_size, media_type);
             // Video and Document have no provider-native multimodal support;
             // return metadata only without base64 data.
             if (file_type == FileType::Video || file_type == FileType::Document)
@@ -7434,7 +7560,11 @@ namespace cell
 
         public:
             OpenAI(const std::string &api_base) : api_base(api_base) {}
-            ~OpenAI() { if (!net::curl_global_is_down()) curl_easy_cleanup(curl); }
+            ~OpenAI()
+            {
+                if (!net::curl_global_is_down())
+                    curl_easy_cleanup(curl);
+            }
             void set_proxy(std::string proxy) { proxy_ = std::move(proxy); }
 
             bool chat(const encrypt::secure_string &api_key, const std::string &model, const nlohmann::json &messages, const nlohmann::json &tools, nlohmann::json &reply, nlohmann::json &tool_calls, nlohmann::json &usage, std::string &err, long *http_status = nullptr)
@@ -7866,7 +7996,11 @@ namespace cell
 
         public:
             OpenAIResponses(const std::string &api_base) : api_base(api_base) {}
-            ~OpenAIResponses() { if (!net::curl_global_is_down()) curl_easy_cleanup(curl); }
+            ~OpenAIResponses()
+            {
+                if (!net::curl_global_is_down())
+                    curl_easy_cleanup(curl);
+            }
             void set_proxy(std::string proxy) { proxy_ = std::move(proxy); }
 
             bool chat(const encrypt::secure_string &api_key, const std::string &model, const nlohmann::json &messages, const nlohmann::json &tools, nlohmann::json &reply, nlohmann::json &tool_calls, nlohmann::json &usage, std::string &err, long *http_status = nullptr)
@@ -8305,7 +8439,11 @@ namespace cell
             }
 
             Anthropic(const std::string &api_base) : api_base(api_base) {}
-            ~Anthropic() { if (!net::curl_global_is_down()) curl_easy_cleanup(curl); }
+            ~Anthropic()
+            {
+                if (!net::curl_global_is_down())
+                    curl_easy_cleanup(curl);
+            }
             void set_proxy(std::string proxy) { proxy_ = std::move(proxy); }
 
             bool chat(const encrypt::secure_string &api_key, const std::string &model, const nlohmann::json &messages, const nlohmann::json &tools, nlohmann::json &reply, nlohmann::json &tool_calls, nlohmann::json &usage, std::string &err, int think_level = 0, long *http_status = nullptr)
@@ -9754,12 +9892,12 @@ namespace cell
                 out += "</div>";
                 if (!agents.empty())
                 {
-                out += "<ul class=\"fbr";
-                if (fan)
-                    out += " fan";
-                if (agents.size() > 5) // too many branches to read as columns
-                    out += " stack";
-                out += "\" style=\"--n:" + std::to_string(agents.size()) + "\">";
+                    out += "<ul class=\"fbr";
+                    if (fan)
+                        out += " fan";
+                    if (agents.size() > 5) // too many branches to read as columns
+                        out += " stack";
+                    out += "\" style=\"--n:" + std::to_string(agents.size()) + "\">";
                     for (const auto *w : agents)
                     {
                         out += "<li><div class=\"frow\"><span class=\"dot assistant\" aria-hidden=\"true\"></span>";
@@ -14274,7 +14412,8 @@ details{break-inside:avoid}
                 {
                     worker_tools_rt = *rt.tools_rt;
                     const std::string run_sid = rt.session_id.empty() ? "current" : rt.session_id;
-                    worker_tools_rt.session_id = [run_sid]() { return run_sid; };
+                    worker_tools_rt.session_id = [run_sid]()
+                    { return run_sid; };
                     worker_tools_rt.live_session = nullptr;
                 }
                 for (auto &call : tool_calls)
@@ -15650,8 +15789,7 @@ static std::pair<std::unordered_map<std::string, std::shared_ptr<cell::tools::to
                     out.ok = cell::teamwork::run_job(std::move(team_rt), job_id, out.text);
                     return out;
                 }
-                return cell::ToolOutput::fail("operation must be new, run, edit, remove, reuse, list, history, report, reports, or workflow");
-            }, Phase::Deferred);
+                return cell::ToolOutput::fail("operation must be new, run, edit, remove, reuse, list, history, report, reports, or workflow"); }, Phase::Deferred);
     }
     {
         // notice — the cross-session message bus. Teamwork children report
@@ -15734,8 +15872,7 @@ static std::pair<std::unordered_map<std::string, std::shared_ptr<cell::tools::to
                     out.text = std::format("dropped {} pending notice(s)", n);
                     return out;
                 }
-                return cell::ToolOutput::fail("operation must be send, list, drain, wait, or clear");
-            });
+                return cell::ToolOutput::fail("operation must be send, list, drain, wait, or clear"); });
     }
     return {list, defs};
 }
@@ -16105,9 +16242,24 @@ static int run_selftest()
         R.expect(decode("\x1bOH", used).k == k::home && used == 3, "decode_key: application-mode home");
         R.expect(decode("\x1b[2~", used).k == k::none && used == 4, "decode_key: Insert is ignored");
         R.expect(decode("\x1b[5~", used).k == k::none && used == 4, "decode_key: page keys are ignored");
-        R.expect(decode("\x1b" "b", used).k == k::word_left && used == 2, "decode_key: Alt+B is word left");
-        R.expect(decode("\x1b" "f", used).k == k::word_right && used == 2, "decode_key: Alt+F is word right");
-        R.expect(decode("\x1b" "d", used).k == k::kill_word_fwd && used == 2, "decode_key: Alt+D kills the next word");
+        R.expect(decode("\x1b"
+                        "b",
+                        used)
+                             .k == k::word_left &&
+                     used == 2,
+                 "decode_key: Alt+B is word left");
+        R.expect(decode("\x1b"
+                        "f",
+                        used)
+                             .k == k::word_right &&
+                     used == 2,
+                 "decode_key: Alt+F is word right");
+        R.expect(decode("\x1b"
+                        "d",
+                        used)
+                             .k == k::kill_word_fwd &&
+                     used == 2,
+                 "decode_key: Alt+D kills the next word");
         R.expect(decode("\x1b\x7f", used).k == k::kill_word_back && used == 2, "decode_key: Alt+Backspace kills the previous word");
         R.expect(decode("\x1b<", used).k == k::hist_first && used == 2, "decode_key: Alt+< is the oldest entry");
         R.expect(decode("\x1b>", used).k == k::hist_last && used == 2, "decode_key: Alt+> is the newest entry");
@@ -16148,7 +16300,6 @@ static int run_selftest()
         R.expect(cell::plat::word_next("one two", 3) == 7, "word_next skips the spaces in between");
         R.expect(cell::plat::word_next("abc", 3) == 3, "word_next clamps at the end");
         R.expect(cell::plat::word_next("\xE4\xB8\xAD x", 0) == 3, "word_next steps over a whole CJK code point");
-
 
         std::string w = "a\xE4\xB8\xAD"
                         "b"; // "a中b"
@@ -16255,13 +16406,15 @@ static int run_selftest()
             press(ev_t::key::insert, "\xE4\xB8\xAD"); // 中
             press(ev_t::key::transpose);              // at the end: swaps the last two code points
             R.expect(lb.text == "a\xE4\xB8\xAD"
-                                "b" && lb.cursor == 5,
+                                "b" &&
+                         lb.cursor == 5,
                      "line_buffer: Ctrl+T swaps whole code points, never bytes");
             press(ev_t::key::clear_screen);
             R.expect(lb.clear_screen, "line_buffer: Ctrl+L asks the caller to repaint");
             lb.clear_screen = false;
             R.expect(lb.text == "a\xE4\xB8\xAD"
-                                "b" && lb.cursor == 5,
+                                "b" &&
+                         lb.cursor == 5,
                      "line_buffer: Ctrl+L leaves the line and cursor alone");
             press(ev_t::key::home);
             press(ev_t::key::kill_end);
@@ -16675,8 +16828,7 @@ static int run_selftest()
                                        {
                                            cell::ToolOutput o = conc_tools["read"]->execute(
                                                test_rt, nlohmann::json{{"path", std::format("conc_dir/f{:02d}.txt", i)}}.dump());
-                                           return std::make_pair(o.ok, std::move(o.text));
-                                       }));
+                                           return std::make_pair(o.ok, std::move(o.text)); }));
         bool reads_ok = true;
         for (int i = 0; i < 16; i++)
         {
@@ -17710,9 +17862,9 @@ static int run_selftest()
             {{"role", "user"}, {"content", "do both"}},
             {{"role", "assistant"},
              {"content", nlohmann::json::array({
-                            {{"type", "tool_use"}, {"id", "tu_1"}, {"name", "read"}, {"input", nlohmann::json::object()}},
-                            {{"type", "tool_use"}, {"id", "tu_2"}, {"name", "ls"}, {"input", nlohmann::json::object()}},
-                        })}},
+                             {{"type", "tool_use"}, {"id", "tu_1"}, {"name", "read"}, {"input", nlohmann::json::object()}},
+                             {{"type", "tool_use"}, {"id", "tu_2"}, {"name", "ls"}, {"input", nlohmann::json::object()}},
+                         })}},
             {{"role", "user"}, {"content", nlohmann::json::array({{{"type", "tool_result"}, {"tool_use_id", "tu_1"}, {"content", "file body"}}})}},
             {{"role", "user"}, {"content", nlohmann::json::array({{{"type", "tool_result"}, {"tool_use_id", "tu_2"}, {"content", "names"}}})}},
             {{"role", "user"}, {"content", "thanks"}},
@@ -17849,9 +18001,9 @@ static int run_selftest()
             {{"role", "tool"},
              {"tool_call_id", "mc1"},
              {"content", nlohmann::json::array({
-                            {{"type", "text"}, {"text", "screenshot:"}},
-                            {{"type", "image_url"}, {"image_url", {{"url", "data:image/png;base64,AA=="}}}},
-                        })}},
+                             {{"type", "text"}, {"text", "screenshot:"}},
+                             {{"type", "image_url"}, {"image_url", {{"url", "data:image/png;base64,AA=="}}}},
+                         })}},
         });
         auto media_chat = cell::llm::OpenAI::body("m", media_tool, nlohmann::json::array(), false);
         auto &media_msgs = media_chat["messages"];
@@ -18204,9 +18356,9 @@ static int run_selftest()
         {
             nlohmann::json parts = nlohmann::json::array({
                 {{"role", "assistant"}, {"content", nlohmann::json::array({
-                    {{"type", "thinking"}, {"thinking", "think-A"}},
-                    {{"type", "text"}, {"text", "answer-A"}},
-                })}},
+                                                        {{"type", "thinking"}, {"thinking", "think-A"}},
+                                                        {{"type", "text"}, {"text", "answer-A"}},
+                                                    })}},
                 {{"role", "tool"}, {"content", "tool-body"}},
                 {{"role", "assistant"}, {"content", std::string(500, 'x')}},
             });
@@ -19728,8 +19880,8 @@ int repl::run()
         {
             cell::sys::pprintln(cell::sys::color::cyan, "{}", cell::notice::render(m));
             h.now().msg().push_back({{"role", "system"},
-                                {"content", std::format("A notice was delivered to this session (from={}{}). Treat it as context from the user or a supervised agent.\n{}",
-                                                        m.from, m.topic.empty() ? "" : " topic=" + m.topic, m.body)}});
+                                     {"content", std::format("A notice was delivered to this session (from={}{}). Treat it as context from the user or a supervised agent.\n{}",
+                                                             m.from, m.topic.empty() ? "" : " topic=" + m.topic, m.body)}});
         }
         // notices arrive mid-conversation: lift them into the leading system
         // block so a chat template never sees a system message behind a user turn
@@ -20473,1510 +20625,1510 @@ int repl::run()
                 running = false;
         };
 
-    // ---- slash-command table ------------------------------------------------
-    // Keyed by the leading token. A handler returns how the REPL continues:
-    // `handled` (consumed — back to the prompt) or `exit` (leave the loop).
-    // /ins and /reload run the turn themselves before returning.
-    enum class cmd_flow
-    {
-        handled,
-        exit,
-    };
-    using cmd_fn = std::function<cmd_flow(const std::vector<std::string> &, std::string &)>;
-    const std::unordered_map<std::string, cmd_fn> commands = {
+        // ---- slash-command table ------------------------------------------------
+        // Keyed by the leading token. A handler returns how the REPL continues:
+        // `handled` (consumed — back to the prompt) or `exit` (leave the loop).
+        // /ins and /reload run the turn themselves before returning.
+        enum class cmd_flow
+        {
+            handled,
+            exit,
+        };
+        using cmd_fn = std::function<cmd_flow(const std::vector<std::string> &, std::string &)>;
+        const std::unordered_map<std::string, cmd_fn> commands = {
             {"/exit", [](const std::vector<std::string> &, std::string &) -> cmd_flow
-            { return cmd_flow::exit; }},
+             { return cmd_flow::exit; }},
             {"/quit", [](const std::vector<std::string> &, std::string &) -> cmd_flow
-            { return cmd_flow::exit; }},
+             { return cmd_flow::exit; }},
             {"/help", [&](const std::vector<std::string> &, std::string &) -> cmd_flow
-            {
-                    print_help();
-                    return cmd_flow::handled;
-            }},
+             {
+                 print_help();
+                 return cmd_flow::handled;
+             }},
             {"/save", [&](const std::vector<std::string> &, std::string &) -> cmd_flow
-            {
-                    h.now().unload();
-                    cell::async_io::flush(); // /save promises durability now
-                    log.info("sess", std::format("saved id={} msgs={}", h.now().id(), h.now().msg().size()));
-                    cell::sys::println("session saved: {}", h.now().id());
-                    return cmd_flow::handled;
-            }},
+             {
+                 h.now().unload();
+                 cell::async_io::flush(); // /save promises durability now
+                 log.info("sess", std::format("saved id={} msgs={}", h.now().id(), h.now().msg().size()));
+                 cell::sys::println("session saved: {}", h.now().id());
+                 return cmd_flow::handled;
+             }},
             {"/new", [&](const std::vector<std::string> &, std::string &) -> cmd_flow
-            {
-                    std::string old_id = h.now().id();
-                    h.now().unload();
-                    cell::async_io::flush(); // the old session must survive a crash
-                    h.forget_current();
-                    ensure_prompt(h.now());
-                    log.info("sess", std::format("new id={} previous={} kept=true", h.now().id(), old_id));
-                    cell::sys::println("new session: {} cwd={}", h.now().id(), cell::workdir().string());
-                    if (const cell::config::provider_entry *p = cfg.current_provider_entry(); p)
-                        probe_provider(*p);
-                    return cmd_flow::handled;
-            }},
+             {
+                 std::string old_id = h.now().id();
+                 h.now().unload();
+                 cell::async_io::flush(); // the old session must survive a crash
+                 h.forget_current();
+                 ensure_prompt(h.now());
+                 log.info("sess", std::format("new id={} previous={} kept=true", h.now().id(), old_id));
+                 cell::sys::println("new session: {} cwd={}", h.now().id(), cell::workdir().string());
+                 if (const cell::config::provider_entry *p = cfg.current_provider_entry(); p)
+                     probe_provider(*p);
+                 return cmd_flow::handled;
+             }},
             {"/clear", [&](const std::vector<std::string> &, std::string &) -> cmd_flow
-            {
-                    // A background run holds a snapshot of these jobs: wiping the
-                    // store underneath it loses its reports, and the directories it
-                    // re-creates are then unreachable (the store no longer lists
-                    // them), so they can never be collected.
-                    bool busy = false;
-                    {
-                        nlohmann::json store = cell::teamwork::load_store(h.now().id());
-                        if (auto jobs = store.find("jobs"); jobs != store.end() && jobs->is_object())
-                            for (auto &[jid, job] : jobs->items())
-                                if (job.value("status", "") == "running")
-                                {
-                                    cell::sys::error("teamwork {} is running in the background - stop it with /teamworks stop {} (or let it finish), then /clear again", jid, jid);
-                                    busy = true;
-                                    break;
-                                }
-                    }
-                    if (busy)
-                        return cmd_flow::handled;
-                    long long before = (long long)h.now().msg().size();
-                    h.now().msg().clear();
-                    h.now().clear_interrupt();        // the transcript an interrupt could resume is gone
-                    cell::box::reset_read_log(); // context gone: recorded reads no longer apply
-                    // clear teamwork: remove all job directories and the store file
-                    {
-                        nlohmann::json store = cell::teamwork::load_store(h.now().id());
-                        auto jobs = store.find("jobs");
-                        if (jobs != store.end() && jobs->is_object())
-                        {
-                            std::error_code rec;
-                            for (auto &[jid, job] : jobs->items())
-                            {
-                                (void)jid;
-                                // remove_all() throws without an error_code, and a
-                                // locked directory must not take the process down
-                                std::filesystem::remove_all(cell::teamwork::job_storage_dir(job, h.now().id()), rec);
-                            }
-                        }
-                        cell::teamwork::save_store(h.now().id(), nlohmann::json::object());
-                    }
-                    ensure_prompt(h.now());
-                    h.now().unload();
-                    cell::async_io::flush();
-                    log.info("sess", std::format("cleared id={} msgs_before={}", h.now().id(), before));
-                    cell::sys::println("session cleared: {} (removed {} messages)", h.now().id(), before);
-                    return cmd_flow::handled;
-            }},
+             {
+                 // A background run holds a snapshot of these jobs: wiping the
+                 // store underneath it loses its reports, and the directories it
+                 // re-creates are then unreachable (the store no longer lists
+                 // them), so they can never be collected.
+                 bool busy = false;
+                 {
+                     nlohmann::json store = cell::teamwork::load_store(h.now().id());
+                     if (auto jobs = store.find("jobs"); jobs != store.end() && jobs->is_object())
+                         for (auto &[jid, job] : jobs->items())
+                             if (job.value("status", "") == "running")
+                             {
+                                 cell::sys::error("teamwork {} is running in the background - stop it with /teamworks stop {} (or let it finish), then /clear again", jid, jid);
+                                 busy = true;
+                                 break;
+                             }
+                 }
+                 if (busy)
+                     return cmd_flow::handled;
+                 long long before = (long long)h.now().msg().size();
+                 h.now().msg().clear();
+                 h.now().clear_interrupt();   // the transcript an interrupt could resume is gone
+                 cell::box::reset_read_log(); // context gone: recorded reads no longer apply
+                 // clear teamwork: remove all job directories and the store file
+                 {
+                     nlohmann::json store = cell::teamwork::load_store(h.now().id());
+                     auto jobs = store.find("jobs");
+                     if (jobs != store.end() && jobs->is_object())
+                     {
+                         std::error_code rec;
+                         for (auto &[jid, job] : jobs->items())
+                         {
+                             (void)jid;
+                             // remove_all() throws without an error_code, and a
+                             // locked directory must not take the process down
+                             std::filesystem::remove_all(cell::teamwork::job_storage_dir(job, h.now().id()), rec);
+                         }
+                     }
+                     cell::teamwork::save_store(h.now().id(), nlohmann::json::object());
+                 }
+                 ensure_prompt(h.now());
+                 h.now().unload();
+                 cell::async_io::flush();
+                 log.info("sess", std::format("cleared id={} msgs_before={}", h.now().id(), before));
+                 cell::sys::println("session cleared: {} (removed {} messages)", h.now().id(), before);
+                 return cmd_flow::handled;
+             }},
             {"/ins", [&](const std::vector<std::string> &toks, std::string &input) -> cmd_flow
-            {
-                    // interjection: inject user text and trigger one LLM round-trip
-                    if (toks.size() < 2)
-                    {
-                        cell::sys::error("usage: /ins <message text>");
-                        return cmd_flow::handled;
-                    }
-                    // reconstruct the message from all tokens after /ins
-                    std::string ins_text;
-                    for (size_t i = 1; i < toks.size(); i++)
-                    {
-                        if (i > 1)
-                            ins_text += ' ';
-                        ins_text += toks[i];
-                    }
-                    // replace the raw "/ins ..." line with the reconstructed text:
-                    // run_turn adds exactly one user message, so pushing here too
-                    // would duplicate the turn
-                    input = std::move(ins_text);
-                    log.info("ins", std::format("interject chars={}", input.size()));
-                    run_turn(false, input);
-                    return cmd_flow::handled;
-            }},
+             {
+                 // interjection: inject user text and trigger one LLM round-trip
+                 if (toks.size() < 2)
+                 {
+                     cell::sys::error("usage: /ins <message text>");
+                     return cmd_flow::handled;
+                 }
+                 // reconstruct the message from all tokens after /ins
+                 std::string ins_text;
+                 for (size_t i = 1; i < toks.size(); i++)
+                 {
+                     if (i > 1)
+                         ins_text += ' ';
+                     ins_text += toks[i];
+                 }
+                 // replace the raw "/ins ..." line with the reconstructed text:
+                 // run_turn adds exactly one user message, so pushing here too
+                 // would duplicate the turn
+                 input = std::move(ins_text);
+                 log.info("ins", std::format("interject chars={}", input.size()));
+                 run_turn(false, input);
+                 return cmd_flow::handled;
+             }},
             {"/reload", [&](const std::vector<std::string> &, std::string &input) -> cmd_flow
-            {
-                    // resume an interrupted turn. The transcript already ends with
-                    // the partial reply (truncated at its last token) and the
-                    // system message that explains the interrupt, so sending it
-                    // again is the whole operation — nothing is injected.
-                    const std::string &reason = h.now().interrupt_state();
-                    if (reason.empty())
-                    {
-                        cell::sys::error("no interrupted turn to resume (the last turn ended normally or the state was already cleared)");
-                        return cmd_flow::handled;
-                    }
-                    log.info("cmd", std::format("reload id={} reason={}", h.now().id(), reason));
-                    cell::sys::println("[reload] resuming interrupted turn ({})", reason);
-                    run_turn(true, input);
-                    return cmd_flow::handled;
-            }},
+             {
+                 // resume an interrupted turn. The transcript already ends with
+                 // the partial reply (truncated at its last token) and the
+                 // system message that explains the interrupt, so sending it
+                 // again is the whole operation — nothing is injected.
+                 const std::string &reason = h.now().interrupt_state();
+                 if (reason.empty())
+                 {
+                     cell::sys::error("no interrupted turn to resume (the last turn ended normally or the state was already cleared)");
+                     return cmd_flow::handled;
+                 }
+                 log.info("cmd", std::format("reload id={} reason={}", h.now().id(), reason));
+                 cell::sys::println("[reload] resuming interrupted turn ({})", reason);
+                 run_turn(true, input);
+                 return cmd_flow::handled;
+             }},
             {"/provides", [&](const std::vector<std::string> &, std::string &) -> cmd_flow
-            {
-                    list_providers();
-                    return cmd_flow::handled;
-            }},
+             {
+                 list_providers();
+                 return cmd_flow::handled;
+             }},
             {"/provide", [&](const std::vector<std::string> &toks, std::string &) -> cmd_flow
-            {
-                    if (toks.size() < 2)
-                    {
-                        list_providers();
-                        return cmd_flow::handled;
-                    }
-                    if (toks[1] == "rm" || toks[1] == "del")
-                    {
-                        if (toks.size() < 3)
-                        {
-                            cell::sys::error("usage: /provide rm NAME");
-                            return cmd_flow::handled;
-                        }
-                        std::string name = toks[2];
-                        int idx = cell::config::find(cfg, name);
-                        if (idx < 0)
-                        {
-                            cell::sys::error("provider not found: {}", name);
-                            return cmd_flow::handled;
-                        }
-                        std::string kid = cfg.providers[idx].key_id;
-                        if (!kid.empty() && vault.remove(kid) > 0)
-                            log.info("vault", std::format("removed key id={}", kid));
-                        bool was_current = (cfg.providers[idx].name == cfg.current_provider) ||
-                                           (cfg.current_provider.empty() && idx == 0);
-                        std::string removed = cfg.providers[idx].name;
-                        cfg.providers.erase(cfg.providers.begin() + idx);
-                        if (was_current)
-                        {
-                            if (cfg.providers.empty())
-                            {
-                                cfg.current_provider.clear();
-                                cfg.current_model.clear();
-                            }
-                            else
-                            {
-                                cfg.current_provider = cfg.providers[0].name;
-                                cfg.current_model.clear(); // the model belonged to the removed provider
-                            }
-                        }
-                        cell::config::save(cfg);
-                        log.info("provider", std::format("removed name={} remaining={} key_cleaned={}",
-                                                         removed, cfg.providers.size(), kid.empty() ? "false" : "true"));
-                        cell::sys::println("provider removed: {} ({} provider(s) remaining)", removed, cfg.providers.size());
-                        return cmd_flow::handled;
-                    }
-                    if (toks[1] == "add")
-                    {
-                        if (toks.size() < 3)
-                        {
-                            cell::sys::error("usage: /provide add API_STYLE:URL [key:KEY] [proxy:URL] [name:ALIAS]   (API_STYLE = openai-chat | openai-responses | anthropic)");
-                            return cmd_flow::handled;
-                        }
-                        std::string style, base, prefix_api_style;
-                        std::string name_arg, new_key, new_proxy;
-                        size_t ti = 2;
-                        // parse "API_STYLE:URL" (tolerant spaced form "API_STYLE: URL" also accepted);
-                        // the style prefix is the api style of that url
-                        std::string t = toks[ti];
-                        size_t colon = t.find(':');
-                        if (colon != std::string::npos && colon > 0)
-                        {
-                            std::string s = t.substr(0, colon);
-                            std::string canonical = cell::config::provider_entry::parse_api_style(s);
-                            if (!canonical.empty())
-                            {
-                                style = s;
-                                prefix_api_style = canonical;
-                                if (colon + 1 < t.size())
-                                    base = t.substr(colon + 1);
-                                else if (ti + 1 < toks.size())
-                                    base = toks[++ti];
-                                ti++;
-                            }
-                        }
-                        if (style.empty())
-                        {
-                            cell::sys::error("usage: /provide add API_STYLE:URL | e.g. openai-chat:https://api.openai.com/v1, anthropic:https://api.anthropic.com (the prefix selects the API style)");
-                            return cmd_flow::handled;
-                        }
-                        for (; ti < toks.size(); ti++)
-                        {
-                            auto &tt = toks[ti];
-                            if (tt.rfind("key:", 0) == 0)
-                                new_key = tt.size() > 4 ? tt.substr(4) : (ti + 1 < toks.size() ? toks[++ti] : "");
-                            else if (tt.rfind("proxy:", 0) == 0)
-                                new_proxy = tt.size() > 6 ? tt.substr(6) : (ti + 1 < toks.size() ? toks[++ti] : "");
-                            else if (tt.rfind("name:", 0) == 0)
-                                name_arg = tt.size() > 5 ? tt.substr(5) : (ti + 1 < toks.size() ? toks[++ti] : "");
-                            else if (tt.rfind("api_style:", 0) == 0)
-                                cell::sys::error("api_style is no longer a separate option: put the style in front of the url instead, e.g. openai-responses:{}", base.empty() ? "URL" : base);
-                            else
-                                cell::sys::warn("ignoring token: {}", tt);
-                        }
-                        base = cell::text::trim(base);
-                        new_key = cell::text::trim(new_key);
-                        new_proxy = cell::text::trim(new_proxy);
-                        name_arg = cell::text::trim(name_arg);
-                        if (base.empty())
-                        {
-                            cell::sys::error("missing api base url: /provide add {}:URL", style);
-                            return cmd_flow::handled;
-                        }
-                        std::string name = name_arg.empty() ? style : name_arg;
-                        std::string requested_name = name;
-                        name = cell::config::unique_name(cfg, name);
-                        cell::config::provider_entry ne;
-                        ne.name = name;
-                        // the api style is carried by the url prefix (e.g. anthropic:https://...)
-                        ne.set_api_style(prefix_api_style);
-                        ne.base = base;
-                        ne.proxy = new_proxy;
-                        if (!new_key.empty())
-                        {
-                            std::string kid = "provider:" + name;
-                            vault.set(kid, new_key);
-                            sodium_memzero(new_key.data(), new_key.size());
-                            ne.key_id = kid;
-                        }
-                        cfg.providers.push_back(std::move(ne));
-                        cfg.current_model.clear(); // the model belonged to the previous provider
-                        cell::config::select_provider(cfg, name);
-                        cell::config::save(cfg);
-                        auto &reg = cfg.providers.back();
-                        log.info("provider", std::format("added name={} style={} base={} proxy={} key={}",
-                                                         reg.name, reg.style, reg.base,
-                                                         reg.proxy.empty() ? "(none)" : reg.proxy,
-                                                         reg.key_id.empty() ? "none" : "stored"));
-                        cell::sys::println("provider added: {}", reg.name);
-                        cell::sys::println("       style:     {}", reg.style);
-                        cell::sys::println("       api_style: {}", reg.api_style);
-                        cell::sys::println("       base:      {}", reg.base);
-                        cell::sys::println("       proxy: {}", reg.proxy.empty() ? "(system default)" : reg.proxy);
-                        cell::sys::println("       key:   {}", reg.key_id.empty() ? "not stored (env var / vault fallback)" : "stored (encrypted vault)");
-                        std::vector<std::string> models;
-                        std::string ferr;
-                        if (fetch_models(reg, models, ferr))
-                            cell::sys::println("       models: {} available (see /models)", models.size());
-                        else
-                            cell::sys::warn("[provider unreachable] {}: {}", reg.name, ferr.empty() ? "request failed" : ferr);
-                        cell::sys::println("       pick a model with /models then /model NAME");
-                        return cmd_flow::handled;
-                    }
-                    if (toks[1] == "update")
-                    {
-                        if (toks.size() < 3)
-                        {
-                            cell::sys::error("usage: /provide update NAME [base:[API_STYLE:]URL] [key:KEY] [proxy:URL] [name:NEW_NAME]   (API_STYLE = openai-chat | openai-responses | anthropic)");
-                            return cmd_flow::handled;
-                        }
+             {
+                 if (toks.size() < 2)
+                 {
+                     list_providers();
+                     return cmd_flow::handled;
+                 }
+                 if (toks[1] == "rm" || toks[1] == "del")
+                 {
+                     if (toks.size() < 3)
+                     {
+                         cell::sys::error("usage: /provide rm NAME");
+                         return cmd_flow::handled;
+                     }
+                     std::string name = toks[2];
+                     int idx = cell::config::find(cfg, name);
+                     if (idx < 0)
+                     {
+                         cell::sys::error("provider not found: {}", name);
+                         return cmd_flow::handled;
+                     }
+                     std::string kid = cfg.providers[idx].key_id;
+                     if (!kid.empty() && vault.remove(kid) > 0)
+                         log.info("vault", std::format("removed key id={}", kid));
+                     bool was_current = (cfg.providers[idx].name == cfg.current_provider) ||
+                                        (cfg.current_provider.empty() && idx == 0);
+                     std::string removed = cfg.providers[idx].name;
+                     cfg.providers.erase(cfg.providers.begin() + idx);
+                     if (was_current)
+                     {
+                         if (cfg.providers.empty())
+                         {
+                             cfg.current_provider.clear();
+                             cfg.current_model.clear();
+                         }
+                         else
+                         {
+                             cfg.current_provider = cfg.providers[0].name;
+                             cfg.current_model.clear(); // the model belonged to the removed provider
+                         }
+                     }
+                     cell::config::save(cfg);
+                     log.info("provider", std::format("removed name={} remaining={} key_cleaned={}",
+                                                      removed, cfg.providers.size(), kid.empty() ? "false" : "true"));
+                     cell::sys::println("provider removed: {} ({} provider(s) remaining)", removed, cfg.providers.size());
+                     return cmd_flow::handled;
+                 }
+                 if (toks[1] == "add")
+                 {
+                     if (toks.size() < 3)
+                     {
+                         cell::sys::error("usage: /provide add API_STYLE:URL [key:KEY] [proxy:URL] [name:ALIAS]   (API_STYLE = openai-chat | openai-responses | anthropic)");
+                         return cmd_flow::handled;
+                     }
+                     std::string style, base, prefix_api_style;
+                     std::string name_arg, new_key, new_proxy;
+                     size_t ti = 2;
+                     // parse "API_STYLE:URL" (tolerant spaced form "API_STYLE: URL" also accepted);
+                     // the style prefix is the api style of that url
+                     std::string t = toks[ti];
+                     size_t colon = t.find(':');
+                     if (colon != std::string::npos && colon > 0)
+                     {
+                         std::string s = t.substr(0, colon);
+                         std::string canonical = cell::config::provider_entry::parse_api_style(s);
+                         if (!canonical.empty())
+                         {
+                             style = s;
+                             prefix_api_style = canonical;
+                             if (colon + 1 < t.size())
+                                 base = t.substr(colon + 1);
+                             else if (ti + 1 < toks.size())
+                                 base = toks[++ti];
+                             ti++;
+                         }
+                     }
+                     if (style.empty())
+                     {
+                         cell::sys::error("usage: /provide add API_STYLE:URL | e.g. openai-chat:https://api.openai.com/v1, anthropic:https://api.anthropic.com (the prefix selects the API style)");
+                         return cmd_flow::handled;
+                     }
+                     for (; ti < toks.size(); ti++)
+                     {
+                         auto &tt = toks[ti];
+                         if (tt.rfind("key:", 0) == 0)
+                             new_key = tt.size() > 4 ? tt.substr(4) : (ti + 1 < toks.size() ? toks[++ti] : "");
+                         else if (tt.rfind("proxy:", 0) == 0)
+                             new_proxy = tt.size() > 6 ? tt.substr(6) : (ti + 1 < toks.size() ? toks[++ti] : "");
+                         else if (tt.rfind("name:", 0) == 0)
+                             name_arg = tt.size() > 5 ? tt.substr(5) : (ti + 1 < toks.size() ? toks[++ti] : "");
+                         else if (tt.rfind("api_style:", 0) == 0)
+                             cell::sys::error("api_style is no longer a separate option: put the style in front of the url instead, e.g. openai-responses:{}", base.empty() ? "URL" : base);
+                         else
+                             cell::sys::warn("ignoring token: {}", tt);
+                     }
+                     base = cell::text::trim(base);
+                     new_key = cell::text::trim(new_key);
+                     new_proxy = cell::text::trim(new_proxy);
+                     name_arg = cell::text::trim(name_arg);
+                     if (base.empty())
+                     {
+                         cell::sys::error("missing api base url: /provide add {}:URL", style);
+                         return cmd_flow::handled;
+                     }
+                     std::string name = name_arg.empty() ? style : name_arg;
+                     std::string requested_name = name;
+                     name = cell::config::unique_name(cfg, name);
+                     cell::config::provider_entry ne;
+                     ne.name = name;
+                     // the api style is carried by the url prefix (e.g. anthropic:https://...)
+                     ne.set_api_style(prefix_api_style);
+                     ne.base = base;
+                     ne.proxy = new_proxy;
+                     if (!new_key.empty())
+                     {
+                         std::string kid = "provider:" + name;
+                         vault.set(kid, new_key);
+                         sodium_memzero(new_key.data(), new_key.size());
+                         ne.key_id = kid;
+                     }
+                     cfg.providers.push_back(std::move(ne));
+                     cfg.current_model.clear(); // the model belonged to the previous provider
+                     cell::config::select_provider(cfg, name);
+                     cell::config::save(cfg);
+                     auto &reg = cfg.providers.back();
+                     log.info("provider", std::format("added name={} style={} base={} proxy={} key={}",
+                                                      reg.name, reg.style, reg.base,
+                                                      reg.proxy.empty() ? "(none)" : reg.proxy,
+                                                      reg.key_id.empty() ? "none" : "stored"));
+                     cell::sys::println("provider added: {}", reg.name);
+                     cell::sys::println("       style:     {}", reg.style);
+                     cell::sys::println("       api_style: {}", reg.api_style);
+                     cell::sys::println("       base:      {}", reg.base);
+                     cell::sys::println("       proxy: {}", reg.proxy.empty() ? "(system default)" : reg.proxy);
+                     cell::sys::println("       key:   {}", reg.key_id.empty() ? "not stored (env var / vault fallback)" : "stored (encrypted vault)");
+                     std::vector<std::string> models;
+                     std::string ferr;
+                     if (fetch_models(reg, models, ferr))
+                         cell::sys::println("       models: {} available (see /models)", models.size());
+                     else
+                         cell::sys::warn("[provider unreachable] {}: {}", reg.name, ferr.empty() ? "request failed" : ferr);
+                     cell::sys::println("       pick a model with /models then /model NAME");
+                     return cmd_flow::handled;
+                 }
+                 if (toks[1] == "update")
+                 {
+                     if (toks.size() < 3)
+                     {
+                         cell::sys::error("usage: /provide update NAME [base:[API_STYLE:]URL] [key:KEY] [proxy:URL] [name:NEW_NAME]   (API_STYLE = openai-chat | openai-responses | anthropic)");
+                         return cmd_flow::handled;
+                     }
 
-                        std::string target = toks[2];
-                        int idx = cell::config::find(cfg, target);
-                        if (idx < 0)
-                        {
-                            cell::sys::error("provider not found: {}", target);
-                            return cmd_flow::handled;
-                        }
+                     std::string target = toks[2];
+                     int idx = cell::config::find(cfg, target);
+                     if (idx < 0)
+                     {
+                         cell::sys::error("provider not found: {}", target);
+                         return cmd_flow::handled;
+                     }
 
-                        std::string new_base, new_key, new_proxy, new_name;
-                        std::string base_api_style; // api style carried by the base url prefix
-                        bool has_base = false, has_key = false, has_proxy = false;
-                        bool has_name = false, has_base_api_style = false;
-                        bool bad_base = false;
-                        auto read_value = [&](size_t &ti, size_t prefix_len) -> std::string
-                        {
-                            std::string v = toks[ti].substr(prefix_len);
-                            if (v.empty() && ti + 1 < toks.size())
-                                v = toks[++ti];
-                            return cell::text::trim(std::move(v));
-                        };
-                        for (size_t ti = 3; ti < toks.size(); ti++)
-                        {
-                            auto &tt = toks[ti];
-                            if (tt.rfind("base:", 0) == 0)
-                            {
-                                new_base = read_value(ti, 5);
-                                // the api style is set together with the base url it applies to:
-                                // base:anthropic:https://api.anthropic.com
-                                size_t sep = new_base.find(':');
-                                if (sep != std::string::npos)
-                                {
-                                    std::string head = new_base.substr(0, sep);
-                                    std::string tail = new_base.substr(sep + 1);
-                                    std::string canonical = cell::config::provider_entry::parse_api_style(head);
-                                    if (!canonical.empty())
-                                    {
-                                        base_api_style = canonical;
-                                        has_base_api_style = true;
-                                        new_base = cell::text::trim(tail);
-                                    }
-                                    else if (head.find('/') == std::string::npos && tail.find("://") != std::string::npos)
-                                    {
-                                        cell::sys::error("invalid api_style in base url: {} (use openai-chat, openai-responses, or anthropic)", head);
-                                        bad_base = true;
-                                    }
-                                }
-                                has_base = true;
-                            }
-                            else if (tt.rfind("key:", 0) == 0)
-                            {
-                                new_key = read_value(ti, 4);
-                                has_key = true;
-                            }
-                            else if (tt.rfind("proxy:", 0) == 0)
-                            {
-                                new_proxy = read_value(ti, 6);
-                                has_proxy = true;
-                            }
-                            else if (tt.rfind("name:", 0) == 0)
-                            {
-                                new_name = read_value(ti, 5);
-                                has_name = true;
-                            }
-                            else if (tt.rfind("api_style:", 0) == 0)
-                            {
-                                cell::sys::error("api_style is no longer a separate option: set it together with the base url, e.g. base:anthropic:https://api.anthropic.com");
-                                bad_base = true;
-                            }
-                            else
-                                cell::sys::warn("ignoring token: {}", tt);
-                        }
-                        if (bad_base)
-                            return cmd_flow::handled;
+                     std::string new_base, new_key, new_proxy, new_name;
+                     std::string base_api_style; // api style carried by the base url prefix
+                     bool has_base = false, has_key = false, has_proxy = false;
+                     bool has_name = false, has_base_api_style = false;
+                     bool bad_base = false;
+                     auto read_value = [&](size_t &ti, size_t prefix_len) -> std::string
+                     {
+                         std::string v = toks[ti].substr(prefix_len);
+                         if (v.empty() && ti + 1 < toks.size())
+                             v = toks[++ti];
+                         return cell::text::trim(std::move(v));
+                     };
+                     for (size_t ti = 3; ti < toks.size(); ti++)
+                     {
+                         auto &tt = toks[ti];
+                         if (tt.rfind("base:", 0) == 0)
+                         {
+                             new_base = read_value(ti, 5);
+                             // the api style is set together with the base url it applies to:
+                             // base:anthropic:https://api.anthropic.com
+                             size_t sep = new_base.find(':');
+                             if (sep != std::string::npos)
+                             {
+                                 std::string head = new_base.substr(0, sep);
+                                 std::string tail = new_base.substr(sep + 1);
+                                 std::string canonical = cell::config::provider_entry::parse_api_style(head);
+                                 if (!canonical.empty())
+                                 {
+                                     base_api_style = canonical;
+                                     has_base_api_style = true;
+                                     new_base = cell::text::trim(tail);
+                                 }
+                                 else if (head.find('/') == std::string::npos && tail.find("://") != std::string::npos)
+                                 {
+                                     cell::sys::error("invalid api_style in base url: {} (use openai-chat, openai-responses, or anthropic)", head);
+                                     bad_base = true;
+                                 }
+                             }
+                             has_base = true;
+                         }
+                         else if (tt.rfind("key:", 0) == 0)
+                         {
+                             new_key = read_value(ti, 4);
+                             has_key = true;
+                         }
+                         else if (tt.rfind("proxy:", 0) == 0)
+                         {
+                             new_proxy = read_value(ti, 6);
+                             has_proxy = true;
+                         }
+                         else if (tt.rfind("name:", 0) == 0)
+                         {
+                             new_name = read_value(ti, 5);
+                             has_name = true;
+                         }
+                         else if (tt.rfind("api_style:", 0) == 0)
+                         {
+                             cell::sys::error("api_style is no longer a separate option: set it together with the base url, e.g. base:anthropic:https://api.anthropic.com");
+                             bad_base = true;
+                         }
+                         else
+                             cell::sys::warn("ignoring token: {}", tt);
+                     }
+                     if (bad_base)
+                         return cmd_flow::handled;
 
-                        std::string final_name = has_name ? new_name : target;
-                        if (has_name && !final_name.empty() && final_name != target)
-                            final_name = cell::config::unique_name(cfg, final_name);
-                        if (!has_base && !has_key && !has_proxy && !has_name)
-                        {
-                            cell::sys::error("no provider changes requested: /provide update {} base:URL key:KEY", target);
-                            return cmd_flow::handled;
-                        }
-                        if (has_base && new_base.empty())
-                        {
-                            cell::sys::error("base url cannot be empty: /provide update {} base:[API_STYLE:]URL", target);
-                            return cmd_flow::handled;
-                        }
+                     std::string final_name = has_name ? new_name : target;
+                     if (has_name && !final_name.empty() && final_name != target)
+                         final_name = cell::config::unique_name(cfg, final_name);
+                     if (!has_base && !has_key && !has_proxy && !has_name)
+                     {
+                         cell::sys::error("no provider changes requested: /provide update {} base:URL key:KEY", target);
+                         return cmd_flow::handled;
+                     }
+                     if (has_base && new_base.empty())
+                     {
+                         cell::sys::error("base url cannot be empty: /provide update {} base:[API_STYLE:]URL", target);
+                         return cmd_flow::handled;
+                     }
 
-                        auto &p = cfg.providers[idx];
-                        std::string old_name = p.name;
-                        std::string old_key_id = p.key_id;
-                        if (has_base)
-                            p.base = new_base;
-                        // the api style always travels with its base url
-                        if (has_base_api_style)
-                            p.set_api_style(base_api_style);
-                        p.name = final_name;
+                     auto &p = cfg.providers[idx];
+                     std::string old_name = p.name;
+                     std::string old_key_id = p.key_id;
+                     if (has_base)
+                         p.base = new_base;
+                     // the api style always travels with its base url
+                     if (has_base_api_style)
+                         p.set_api_style(base_api_style);
+                     p.name = final_name;
 
-                        std::string key_id = "provider:" + p.name;
-                        if (has_key)
-                        {
-                            if (!new_key.empty())
-                            {
-                                vault.set(key_id, new_key);
-                                sodium_memzero(new_key.data(), new_key.size());
-                                p.key_id = key_id;
-                            }
-                            else
-                            {
-                                if (!old_key_id.empty() && vault.remove(old_key_id) > 0)
-                                    log.info("vault", std::format("removed old key id={}", old_key_id));
-                                p.key_id.clear();
-                            }
-                        }
-                        else if (p.name != old_name && !old_key_id.empty())
-                        {
-                            auto existing_key = vault.get(old_key_id);
-                            if (!existing_key.empty())
-                            {
-                                vault.set(key_id, existing_key);
-                                p.key_id = key_id;
-                            }
-                            if (old_key_id != key_id)
-                                vault.remove(old_key_id);
-                        }
-                        if (!p.key_id.empty() && p.key_id != key_id)
-                        {
-                            // older entries may point at a vault id that does not
-                            // match the final provider name; keep the vault mapping coherent
-                            p.key_id = key_id;
-                        }
-                        if (has_proxy)
-                            p.proxy = new_proxy;
-                        if ((cfg.current_provider == old_name) ||
-                            (cfg.current_provider.empty() && idx == 0))
-                            cfg.current_provider = p.name;
+                     std::string key_id = "provider:" + p.name;
+                     if (has_key)
+                     {
+                         if (!new_key.empty())
+                         {
+                             vault.set(key_id, new_key);
+                             sodium_memzero(new_key.data(), new_key.size());
+                             p.key_id = key_id;
+                         }
+                         else
+                         {
+                             if (!old_key_id.empty() && vault.remove(old_key_id) > 0)
+                                 log.info("vault", std::format("removed old key id={}", old_key_id));
+                             p.key_id.clear();
+                         }
+                     }
+                     else if (p.name != old_name && !old_key_id.empty())
+                     {
+                         auto existing_key = vault.get(old_key_id);
+                         if (!existing_key.empty())
+                         {
+                             vault.set(key_id, existing_key);
+                             p.key_id = key_id;
+                         }
+                         if (old_key_id != key_id)
+                             vault.remove(old_key_id);
+                     }
+                     if (!p.key_id.empty() && p.key_id != key_id)
+                     {
+                         // older entries may point at a vault id that does not
+                         // match the final provider name; keep the vault mapping coherent
+                         p.key_id = key_id;
+                     }
+                     if (has_proxy)
+                         p.proxy = new_proxy;
+                     if ((cfg.current_provider == old_name) ||
+                         (cfg.current_provider.empty() && idx == 0))
+                         cfg.current_provider = p.name;
 
-                        cell::config::save(cfg);
-                        log.info("provider", std::format("updated name={} style={} api_style={} base={} proxy={} key={}",
-                                                         p.name, p.style, p.api_style, p.base,
-                                                         p.proxy.empty() ? "(none)" : p.proxy,
-                                                         p.key_id.empty() ? "none" : "stored"));
-                        cell::sys::println("provider updated: {}", p.name);
-                        if (p.name != old_name)
-                            cell::sys::println("       renamed:  {} -> {}", old_name, p.name);
-                        cell::sys::println("       style:     {}", p.style);
-                        cell::sys::println("       api_style: {}", p.api_style);
-                        cell::sys::println("       base:      {}", p.base);
-                        cell::sys::println("       proxy: {}", p.proxy.empty() ? "(system default)" : p.proxy);
-                        cell::sys::println("       key:   {}", p.key_id.empty() ? "not stored (env var / vault fallback)" : "stored (encrypted vault)");
-                        return cmd_flow::handled;
-                    }
-                    // select a provider by name (persistent)
-                    std::string name = toks[1];
-                    int idx = cell::config::find(cfg, name);
-                    if (idx < 0)
-                    {
-                        cell::sys::error("provider not found: {} (use /provide add openai:URL to add one)", name);
-                        return cmd_flow::handled;
-                    }
-                    cell::config::select_provider(cfg, name);
-                    cell::config::save(cfg);
-                    log.info("provider", std::format("selected name={} model={}", name, cfg.current_model.empty() ? "(none)" : cfg.current_model));
-                    cell::sys::println("provider selected: {}", name);
-                    if (cfg.current_model.empty())
-                        cell::sys::println("  no model set - use /models to list and /model NAME to pick one");
-                    else
-                        cell::sys::println("  model: {}", cfg.current_model);
-                    return cmd_flow::handled;
-            }},
+                     cell::config::save(cfg);
+                     log.info("provider", std::format("updated name={} style={} api_style={} base={} proxy={} key={}",
+                                                      p.name, p.style, p.api_style, p.base,
+                                                      p.proxy.empty() ? "(none)" : p.proxy,
+                                                      p.key_id.empty() ? "none" : "stored"));
+                     cell::sys::println("provider updated: {}", p.name);
+                     if (p.name != old_name)
+                         cell::sys::println("       renamed:  {} -> {}", old_name, p.name);
+                     cell::sys::println("       style:     {}", p.style);
+                     cell::sys::println("       api_style: {}", p.api_style);
+                     cell::sys::println("       base:      {}", p.base);
+                     cell::sys::println("       proxy: {}", p.proxy.empty() ? "(system default)" : p.proxy);
+                     cell::sys::println("       key:   {}", p.key_id.empty() ? "not stored (env var / vault fallback)" : "stored (encrypted vault)");
+                     return cmd_flow::handled;
+                 }
+                 // select a provider by name (persistent)
+                 std::string name = toks[1];
+                 int idx = cell::config::find(cfg, name);
+                 if (idx < 0)
+                 {
+                     cell::sys::error("provider not found: {} (use /provide add openai:URL to add one)", name);
+                     return cmd_flow::handled;
+                 }
+                 cell::config::select_provider(cfg, name);
+                 cell::config::save(cfg);
+                 log.info("provider", std::format("selected name={} model={}", name, cfg.current_model.empty() ? "(none)" : cfg.current_model));
+                 cell::sys::println("provider selected: {}", name);
+                 if (cfg.current_model.empty())
+                     cell::sys::println("  no model set - use /models to list and /model NAME to pick one");
+                 else
+                     cell::sys::println("  model: {}", cfg.current_model);
+                 return cmd_flow::handled;
+             }},
             {"/models", [&](const std::vector<std::string> &, std::string &) -> cmd_flow
-            {
-                    const cell::config::provider_entry *p = cfg.current_provider_entry();
-                    if (!p)
-                    {
-                        cell::sys::error("no provider configured - add one with /provide add openai:URL");
-                        return cmd_flow::handled;
-                    }
-                    if (cfg.current_model.empty())
-                        cell::sys::println("provider {} ({}):", p->name, p->style);
-                    else
-                        cell::sys::println("provider {} ({}) - current model: {}", p->name, p->style, cfg.current_model);
-                    std::vector<std::string> models;
-                    std::string ferr;
-                    if (!fetch_models(*p, models, ferr))
-                    {
-                        cell::sys::error("failed to list models from {}: {}", p->name, ferr.empty() ? "request failed" : ferr);
-                        return cmd_flow::handled;
-                    }
-                    if (models.empty())
-                    {
-                        cell::sys::println("  (no models returned by the provider)");
-                        return cmd_flow::handled;
-                    }
-                    for (auto &m : models)
-                        cell::sys::println("  {}{}", m, (m == cfg.current_model) ? "  <current>" : "");
-                    return cmd_flow::handled;
-            }},
+             {
+                 const cell::config::provider_entry *p = cfg.current_provider_entry();
+                 if (!p)
+                 {
+                     cell::sys::error("no provider configured - add one with /provide add openai:URL");
+                     return cmd_flow::handled;
+                 }
+                 if (cfg.current_model.empty())
+                     cell::sys::println("provider {} ({}):", p->name, p->style);
+                 else
+                     cell::sys::println("provider {} ({}) - current model: {}", p->name, p->style, cfg.current_model);
+                 std::vector<std::string> models;
+                 std::string ferr;
+                 if (!fetch_models(*p, models, ferr))
+                 {
+                     cell::sys::error("failed to list models from {}: {}", p->name, ferr.empty() ? "request failed" : ferr);
+                     return cmd_flow::handled;
+                 }
+                 if (models.empty())
+                 {
+                     cell::sys::println("  (no models returned by the provider)");
+                     return cmd_flow::handled;
+                 }
+                 for (auto &m : models)
+                     cell::sys::println("  {}{}", m, (m == cfg.current_model) ? "  <current>" : "");
+                 return cmd_flow::handled;
+             }},
             {"/model", [&](const std::vector<std::string> &toks, std::string &) -> cmd_flow
-            {
-                    if (toks.size() < 2)
-                    {
-                        cell::sys::println("current: {}", cfg.model_label());
-                        cell::sys::println("  model:     {}", cfg.current_model.empty() ? "(none - use /models to list, /model NAME to switch)" : cfg.current_model);
-                        if (const cell::config::provider_entry *cur = cfg.current_provider_entry(); cur)
-                            cell::sys::println("  api_style: {}", cur->api_style);
-                        return cmd_flow::handled;
-                    }
-                    const cell::config::provider_entry *p = cfg.current_provider_entry();
-                    if (!p)
-                    {
-                        cell::sys::error("no provider configured - add one with /provide add openai:URL");
-                        return cmd_flow::handled;
-                    }
-                    std::string m;
-                    std::string new_api_style;
-                    // extra key:value options after the model name: api_style:STYLE
-                    // switches the API wire style of the current provider on the fly
-                    for (size_t i = 2; i < toks.size(); i++)
-                    {
-                        if (toks[i].rfind("api_style:", 0) == 0)
-                            new_api_style = toks[i].size() > 10 ? toks[i].substr(10) : (i + 1 < toks.size() ? toks[++i] : "");
-                        else
-                            cell::sys::warn("ignoring /model option: {}", toks[i]);
-                    }
-                    bool style_changed = false;
-                    if (!new_api_style.empty())
-                    {
-                        std::string canonical = cell::config::provider_entry::parse_api_style(cell::text::trim(new_api_style));
-                        if (canonical.empty())
-                        {
-                            cell::sys::error("unknown api_style '{}' - usage: /model MODEL [api_style:openai-chat|openai-responses|anthropic]", new_api_style);
-                            return cmd_flow::handled;
-                        }
-                        if (canonical != p->api_style)
-                        {
-                            // mutate the current provider entry in place and persist
-                            cell::config::provider_entry *pe = cfg.current_provider_entry();
-                            if (pe)
-                            {
-                                std::string old_style = pe->api_style;
-                                pe->set_api_style(canonical);
-                                style_changed = true;
-                                log.info("model", std::format("api_style changed provider={} old={} new={}", pe->name, old_style, canonical));
-                            }
-                        }
-                    }
-                    m = toks[1];
-                    cfg.current_model = m;
-                    cell::config::save(cfg);
-                    log.info("model", std::format("switched provider={} model={} api_style={}", p->name, m, p->api_style));
-                    cell::sys::println("switched to {}/{}", p->name, m);
-                    if (style_changed)
-                        cell::sys::println("  api_style: {}", p->api_style);
-                    std::vector<std::string> models;
-                    std::string ferr;
-                    if (fetch_models(*p, models, ferr))
-                    {
-                        if (std::find(models.begin(), models.end(), m) == models.end())
-                            cell::sys::warn("note: '{}' is not in the model list returned by {} (it may still work)", m, p->name);
-                    }
-                    else
-                        cell::sys::warn("[provider unreachable] {}: {}", p->name, ferr.empty() ? "request failed" : ferr);
-                    return cmd_flow::handled;
-            }},
+             {
+                 if (toks.size() < 2)
+                 {
+                     cell::sys::println("current: {}", cfg.model_label());
+                     cell::sys::println("  model:     {}", cfg.current_model.empty() ? "(none - use /models to list, /model NAME to switch)" : cfg.current_model);
+                     if (const cell::config::provider_entry *cur = cfg.current_provider_entry(); cur)
+                         cell::sys::println("  api_style: {}", cur->api_style);
+                     return cmd_flow::handled;
+                 }
+                 const cell::config::provider_entry *p = cfg.current_provider_entry();
+                 if (!p)
+                 {
+                     cell::sys::error("no provider configured - add one with /provide add openai:URL");
+                     return cmd_flow::handled;
+                 }
+                 std::string m;
+                 std::string new_api_style;
+                 // extra key:value options after the model name: api_style:STYLE
+                 // switches the API wire style of the current provider on the fly
+                 for (size_t i = 2; i < toks.size(); i++)
+                 {
+                     if (toks[i].rfind("api_style:", 0) == 0)
+                         new_api_style = toks[i].size() > 10 ? toks[i].substr(10) : (i + 1 < toks.size() ? toks[++i] : "");
+                     else
+                         cell::sys::warn("ignoring /model option: {}", toks[i]);
+                 }
+                 bool style_changed = false;
+                 if (!new_api_style.empty())
+                 {
+                     std::string canonical = cell::config::provider_entry::parse_api_style(cell::text::trim(new_api_style));
+                     if (canonical.empty())
+                     {
+                         cell::sys::error("unknown api_style '{}' - usage: /model MODEL [api_style:openai-chat|openai-responses|anthropic]", new_api_style);
+                         return cmd_flow::handled;
+                     }
+                     if (canonical != p->api_style)
+                     {
+                         // mutate the current provider entry in place and persist
+                         cell::config::provider_entry *pe = cfg.current_provider_entry();
+                         if (pe)
+                         {
+                             std::string old_style = pe->api_style;
+                             pe->set_api_style(canonical);
+                             style_changed = true;
+                             log.info("model", std::format("api_style changed provider={} old={} new={}", pe->name, old_style, canonical));
+                         }
+                     }
+                 }
+                 m = toks[1];
+                 cfg.current_model = m;
+                 cell::config::save(cfg);
+                 log.info("model", std::format("switched provider={} model={} api_style={}", p->name, m, p->api_style));
+                 cell::sys::println("switched to {}/{}", p->name, m);
+                 if (style_changed)
+                     cell::sys::println("  api_style: {}", p->api_style);
+                 std::vector<std::string> models;
+                 std::string ferr;
+                 if (fetch_models(*p, models, ferr))
+                 {
+                     if (std::find(models.begin(), models.end(), m) == models.end())
+                         cell::sys::warn("note: '{}' is not in the model list returned by {} (it may still work)", m, p->name);
+                 }
+                 else
+                     cell::sys::warn("[provider unreachable] {}: {}", p->name, ferr.empty() ? "request failed" : ferr);
+                 return cmd_flow::handled;
+             }},
             {"/think", [&](const std::vector<std::string> &toks, std::string &) -> cmd_flow
-            {
-                    if (toks.size() >= 2)
-                    {
-                        int level = cell::config::settings::parse_think_level(toks[1]);
-                        if (level < 0)
-                        {
-                            cell::sys::error("usage: /think [off|low|med|high|max]");
-                            return cmd_flow::handled;
-                        }
-                        cfg.think_level = level;
-                        cell::config::save(cfg);
-                        log.info("think", std::format("level={} budget={}", cfg.think_level, cfg.think_budget()));
-                    }
-                    cell::sys::println("chain-of-thought: {} (budget={} tokens)", cell::config::settings::think_level_name(cfg.think_level), cfg.think_budget());
-                    return cmd_flow::handled;
-            }},
+             {
+                 if (toks.size() >= 2)
+                 {
+                     int level = cell::config::settings::parse_think_level(toks[1]);
+                     if (level < 0)
+                     {
+                         cell::sys::error("usage: /think [off|low|med|high|max]");
+                         return cmd_flow::handled;
+                     }
+                     cfg.think_level = level;
+                     cell::config::save(cfg);
+                     log.info("think", std::format("level={} budget={}", cfg.think_level, cfg.think_budget()));
+                 }
+                 cell::sys::println("chain-of-thought: {} (budget={} tokens)", cell::config::settings::think_level_name(cfg.think_level), cfg.think_budget());
+                 return cmd_flow::handled;
+             }},
             {"/tool", [&](const std::vector<std::string> &toks, std::string &) -> cmd_flow
-            {
-                    if (toks.size() >= 2)
-                    {
-                        if (toks[1] == "on")
-                            cfg.tools = true;
-                        else if (toks[1] == "off")
-                            cfg.tools = false;
-                        else
-                        {
-                            cell::sys::error("usage: /tool [on|off]");
-                            return cmd_flow::handled;
-                        }
-                    }
-                    else
-                        cfg.tools = !cfg.tools;
-                    cell::config::save(cfg);
-                    log.info("tool", std::format("enabled={}", cfg.tools ? "on" : "off"));
-                    cell::sys::println("tool calls: {}", cfg.tools ? "ON" : "off");
-                    return cmd_flow::handled;
-            }},
+             {
+                 if (toks.size() >= 2)
+                 {
+                     if (toks[1] == "on")
+                         cfg.tools = true;
+                     else if (toks[1] == "off")
+                         cfg.tools = false;
+                     else
+                     {
+                         cell::sys::error("usage: /tool [on|off]");
+                         return cmd_flow::handled;
+                     }
+                 }
+                 else
+                     cfg.tools = !cfg.tools;
+                 cell::config::save(cfg);
+                 log.info("tool", std::format("enabled={}", cfg.tools ? "on" : "off"));
+                 cell::sys::println("tool calls: {}", cfg.tools ? "ON" : "off");
+                 return cmd_flow::handled;
+             }},
             {"/sandbox", [&](const std::vector<std::string> &toks, std::string &) -> cmd_flow
-            {
-                    if (toks.size() >= 2)
-                    {
-                        if (toks[1] == "read-only" || toks[1] == "readonly")
-                            cell::box::sandbox_mode() = cell::box::SandboxMode::ReadOnly;
-                        else if (toks[1] == "edit-only" || toks[1] == "edit")
-                            cell::box::sandbox_mode() = cell::box::SandboxMode::EditOnly;
-                        else if (toks[1] == "full-access" || toks[1] == "full")
-                            cell::box::sandbox_mode() = cell::box::SandboxMode::FullAccess;
-                        else
-                        {
-                            cell::sys::error("usage: /sandbox [read-only|edit-only|full-access]");
-                            return cmd_flow::handled;
-                        }
-                        cfg.sandbox_mode = cell::box::mode_name(cell::box::sandbox_mode());
-                        cell::config::save(cfg);
-                    }
-                    log.info("sandbox", std::format("mode={}", cell::box::mode_name(cell::box::sandbox_mode())));
-                    cell::sys::println("exec sandbox: {} (path-only gate: traversal and sensitive files are blocked; commands themselves are not filtered)", cell::box::mode_name(cell::box::sandbox_mode()));
-                    return cmd_flow::handled;
-            }},
+             {
+                 if (toks.size() >= 2)
+                 {
+                     if (toks[1] == "read-only" || toks[1] == "readonly")
+                         cell::box::sandbox_mode() = cell::box::SandboxMode::ReadOnly;
+                     else if (toks[1] == "edit-only" || toks[1] == "edit")
+                         cell::box::sandbox_mode() = cell::box::SandboxMode::EditOnly;
+                     else if (toks[1] == "full-access" || toks[1] == "full")
+                         cell::box::sandbox_mode() = cell::box::SandboxMode::FullAccess;
+                     else
+                     {
+                         cell::sys::error("usage: /sandbox [read-only|edit-only|full-access]");
+                         return cmd_flow::handled;
+                     }
+                     cfg.sandbox_mode = cell::box::mode_name(cell::box::sandbox_mode());
+                     cell::config::save(cfg);
+                 }
+                 log.info("sandbox", std::format("mode={}", cell::box::mode_name(cell::box::sandbox_mode())));
+                 cell::sys::println("exec sandbox: {} (path-only gate: traversal and sensitive files are blocked; commands themselves are not filtered)", cell::box::mode_name(cell::box::sandbox_mode()));
+                 return cmd_flow::handled;
+             }},
             {"/autoallow", [&](const std::vector<std::string> &toks, std::string &) -> cmd_flow
-            {
-                    if (cell::box::sandbox_mode() != cell::box::SandboxMode::FullAccess)
-                    {
-                        cell::sys::error("/autoallow can only be used in full-access sandbox mode. Current mode: {}", cell::box::mode_name(cell::box::sandbox_mode()));
-                        return cmd_flow::handled;
-                    }
-                    if (toks.size() >= 2)
-                    {
-                        if (toks[1] == "on")
-                            cell::box::autoallow_enabled() = true;
-                        else if (toks[1] == "off")
-                            cell::box::autoallow_enabled() = false;
-                        else
-                        {
-                            cell::sys::error("usage: /autoallow [on|off]");
-                            return cmd_flow::handled;
-                        }
-                    }
-                    else
-                        cell::box::autoallow_enabled() = !cell::box::autoallow_enabled();
-                    cfg.autoallow = cell::box::autoallow_enabled();
-                    cell::config::save(cfg);
-                    log.info("autoallow", std::format("enabled={}", cell::box::autoallow_enabled() ? "on" : "off"));
-                    cell::sys::println("autoallow: {} (LLM decides whether exec commands run)", cell::box::autoallow_enabled() ? "ON" : "off");
-                    return cmd_flow::handled;
-            }},
+             {
+                 if (cell::box::sandbox_mode() != cell::box::SandboxMode::FullAccess)
+                 {
+                     cell::sys::error("/autoallow can only be used in full-access sandbox mode. Current mode: {}", cell::box::mode_name(cell::box::sandbox_mode()));
+                     return cmd_flow::handled;
+                 }
+                 if (toks.size() >= 2)
+                 {
+                     if (toks[1] == "on")
+                         cell::box::autoallow_enabled() = true;
+                     else if (toks[1] == "off")
+                         cell::box::autoallow_enabled() = false;
+                     else
+                     {
+                         cell::sys::error("usage: /autoallow [on|off]");
+                         return cmd_flow::handled;
+                     }
+                 }
+                 else
+                     cell::box::autoallow_enabled() = !cell::box::autoallow_enabled();
+                 cfg.autoallow = cell::box::autoallow_enabled();
+                 cell::config::save(cfg);
+                 log.info("autoallow", std::format("enabled={}", cell::box::autoallow_enabled() ? "on" : "off"));
+                 cell::sys::println("autoallow: {} (LLM decides whether exec commands run)", cell::box::autoallow_enabled() ? "ON" : "off");
+                 return cmd_flow::handled;
+             }},
             {"/sessions", [&](const std::vector<std::string> &, std::string &) -> cmd_flow
-            {
-                    cell::async_io::flush(); // listings must reflect queued session writes
-                    struct s_entry
-                    {
-                        std::string id, cwd, snippet;
-                        long long count = 0;
-                    };
-                    std::vector<s_entry> entries;
-                    std::error_code ec;
-                    std::filesystem::path dir = cell::root / "sessions";
-                    const nlohmann::json &index = cell::sessions_index();
-                    if (std::filesystem::exists(dir, ec))
-                    {
-                        for (auto &g : std::filesystem::directory_iterator(dir, ec))
-                        {
-                            if (ec)
-                                break;
-                            if (!g.is_directory(ec))
-                                continue;
-                            std::string key = g.path().filename().string();
-                            std::string group_cwd = index.value(key, "");
-                            // one folder per session: the transcript is messages.jsonl
-                            for (auto &f : std::filesystem::directory_iterator(g.path(), ec))
-                            {
-                                if (ec)
-                                    break;
-                                if (!f.is_directory(ec))
-                                    continue;
-                                std::filesystem::path tf = f.path() / "messages.jsonl";
-                                std::error_code fec;
-                                if (!std::filesystem::exists(tf, fec))
-                                    continue;
-                                s_entry e;
-                                e.id = f.path().filename().string();
-                                e.cwd = group_cwd;
-                                try
-                                {
-                                    std::ifstream fin(tf);
-                                    std::string ln;
-                                    while (std::getline(fin, ln))
-                                    {
-                                        if (ln.empty())
-                                            continue;
-                                        e.count++;
-                                        if (!e.snippet.empty())
-                                            continue;
-                                        auto mj = nlohmann::json::parse(ln, nullptr, false);
-                                        if (mj.is_discarded() || !mj.is_object() || mj.value("role", "") != "user")
-                                            continue;
-                                        if (mj.contains("content") && mj["content"].is_string())
-                                            e.snippet = mj["content"].get<std::string>();
-                                        else if (mj.contains("content") && mj["content"].is_array())
-                                            for (auto &b : mj["content"])
-                                                if (b.is_object() && b.value("type", "") == "text" &&
-                                                    b.contains("text") && b["text"].is_string())
-                                                {
-                                                    e.snippet = b["text"].get<std::string>();
-                                                    break;
-                                                }
-                                    }
-                                }
-                                catch (const std::exception &)
-                                {
-                                }
-                                if (e.snippet.size() > 60)
-                                    e.snippet = e.snippet.substr(0, 57) + "...";
-                                entries.push_back(std::move(e));
-                            }
-                        }
-                    }
-                    if (entries.empty())
-                    {
-                        cell::sys::println("  (no sessions)");
-                        return cmd_flow::handled;
-                    }
-                    std::sort(entries.begin(), entries.end(), [](const s_entry &a, const s_entry &b)
-                              { return a.cwd != b.cwd ? a.cwd < b.cwd : a.id < b.id; });
-                    std::string cur_cwd = cell::workdir().string();
-                    std::string group;
-                    for (auto &e : entries)
-                    {
-                        if (e.cwd != group)
-                        {
-                            group = e.cwd;
-                            cell::sys::println("  {} cwd: {}", cell::same_path(group, cur_cwd) ? ">" : "-", group.empty() ? "(unknown)" : group);
-                        }
-                        std::string marker = (e.id == h.now().id()) ? " *" : "";
-                        cell::sys::println("    {}{}  messages={}{}", e.id, marker, e.count, e.snippet.empty() ? "" : "  \"" + e.snippet + "\"");
-                    }
-                    return cmd_flow::handled;
-            }},
+             {
+                 cell::async_io::flush(); // listings must reflect queued session writes
+                 struct s_entry
+                 {
+                     std::string id, cwd, snippet;
+                     long long count = 0;
+                 };
+                 std::vector<s_entry> entries;
+                 std::error_code ec;
+                 std::filesystem::path dir = cell::root / "sessions";
+                 const nlohmann::json &index = cell::sessions_index();
+                 if (std::filesystem::exists(dir, ec))
+                 {
+                     for (auto &g : std::filesystem::directory_iterator(dir, ec))
+                     {
+                         if (ec)
+                             break;
+                         if (!g.is_directory(ec))
+                             continue;
+                         std::string key = g.path().filename().string();
+                         std::string group_cwd = index.value(key, "");
+                         // one folder per session: the transcript is messages.jsonl
+                         for (auto &f : std::filesystem::directory_iterator(g.path(), ec))
+                         {
+                             if (ec)
+                                 break;
+                             if (!f.is_directory(ec))
+                                 continue;
+                             std::filesystem::path tf = f.path() / "messages.jsonl";
+                             std::error_code fec;
+                             if (!std::filesystem::exists(tf, fec))
+                                 continue;
+                             s_entry e;
+                             e.id = f.path().filename().string();
+                             e.cwd = group_cwd;
+                             try
+                             {
+                                 std::ifstream fin(tf);
+                                 std::string ln;
+                                 while (std::getline(fin, ln))
+                                 {
+                                     if (ln.empty())
+                                         continue;
+                                     e.count++;
+                                     if (!e.snippet.empty())
+                                         continue;
+                                     auto mj = nlohmann::json::parse(ln, nullptr, false);
+                                     if (mj.is_discarded() || !mj.is_object() || mj.value("role", "") != "user")
+                                         continue;
+                                     if (mj.contains("content") && mj["content"].is_string())
+                                         e.snippet = mj["content"].get<std::string>();
+                                     else if (mj.contains("content") && mj["content"].is_array())
+                                         for (auto &b : mj["content"])
+                                             if (b.is_object() && b.value("type", "") == "text" &&
+                                                 b.contains("text") && b["text"].is_string())
+                                             {
+                                                 e.snippet = b["text"].get<std::string>();
+                                                 break;
+                                             }
+                                 }
+                             }
+                             catch (const std::exception &)
+                             {
+                             }
+                             if (e.snippet.size() > 60)
+                                 e.snippet = e.snippet.substr(0, 57) + "...";
+                             entries.push_back(std::move(e));
+                         }
+                     }
+                 }
+                 if (entries.empty())
+                 {
+                     cell::sys::println("  (no sessions)");
+                     return cmd_flow::handled;
+                 }
+                 std::sort(entries.begin(), entries.end(), [](const s_entry &a, const s_entry &b)
+                           { return a.cwd != b.cwd ? a.cwd < b.cwd : a.id < b.id; });
+                 std::string cur_cwd = cell::workdir().string();
+                 std::string group;
+                 for (auto &e : entries)
+                 {
+                     if (e.cwd != group)
+                     {
+                         group = e.cwd;
+                         cell::sys::println("  {} cwd: {}", cell::same_path(group, cur_cwd) ? ">" : "-", group.empty() ? "(unknown)" : group);
+                     }
+                     std::string marker = (e.id == h.now().id()) ? " *" : "";
+                     cell::sys::println("    {}{}  messages={}{}", e.id, marker, e.count, e.snippet.empty() ? "" : "  \"" + e.snippet + "\"");
+                 }
+                 return cmd_flow::handled;
+             }},
             {"/session", [&](const std::vector<std::string> &toks, std::string &) -> cmd_flow
-            {
-                    if (toks.size() < 2)
-                    {
-                        cell::sys::error("usage: /session SESSION_ID | rm SESSION_ID (see /sessions)");
-                        return cmd_flow::handled;
-                    }
-                    // the id becomes path components (session_dir): accept only the
-                    // shape make_session_id produces
-                    if (const size_t id_at = (toks[1] == "rm" || toks[1] == "del") ? 2 : 1;
-                        toks.size() > id_at && !cell::is_valid_session_id(toks[id_at]))
-                    {
-                        cell::sys::error("invalid session id: {}", toks[id_at]);
-                        return cmd_flow::handled;
-                    }
-                    if (toks[1] == "rm" || toks[1] == "del")
-                    {
-                        if (toks.size() < 3)
-                        {
-                            cell::sys::error("usage: /session rm SESSION_ID");
-                            return cmd_flow::handled;
-                        }
-                        std::string target = toks[2];
-                        cell::async_io::flush(); // a queued write must not resurrect the file
-                        std::error_code ec;
-                        std::filesystem::path p = cell::session_dir(target);
-                        bool existed = std::filesystem::exists(p, ec);
-                        if (existed && std::filesystem::remove_all(p, ec) == 0)
-                        {
-                            cell::sys::error("failed to delete session {}", target);
-                            return cmd_flow::handled;
-                        }
-                        cell::stats::remove(target);
-                        log.info("sess", std::format("deleted id={} file={} usage_cleaned=true", target, existed));
-                        if (target == h.now().id())
-                        {
-                            h.forget_current();
-                            ensure_prompt(h.now());
-                            cell::sys::println("session deleted: {} (usage stats removed); new session: {} cwd={}", target, h.now().id(), cell::workdir().string());
-                        }
-                        else
-                            cell::sys::println("session deleted: {} (usage stats removed)", target);
-                        return cmd_flow::handled;
-                    }
-                    std::string target = toks[1];
-                    if (target == h.now().id())
-                    {
-                        cell::sys::println("already in session {}", target);
-                        return cmd_flow::handled;
-                    }
-                    h.now().unload();
-                    cell::async_io::flush(); // the target file below must reflect all queued writes
-                    // the target session may live under another cwd: follow it so the
-                    // chat context and the process cwd stay consistent (the cwd comes
-                    // from the sessions index, keyed by the id's cwd-hash prefix)
-                    std::string tcwd = cell::cwd_for_key(cell::session_prefix(target));
-                    if (!tcwd.empty() && !cell::same_path(tcwd, cell::workdir().string()))
-                    {
-                        std::error_code ec;
-                        std::filesystem::current_path(tcwd, ec);
-                        cell::reset_workdir_cache();
-                        if (ec)
-                            cell::sys::warn("session cwd unreachable: {} (staying in {})", tcwd, cell::workdir().string());
-                        else
-                            cell::sys::println("cwd -> {}", cell::workdir().string());
-                    }
-                    h.use(target);
-                    ensure_prompt(h.now());
-                    log.info("sess", std::format("switched to={} msgs={} previous={}", target, h.now().msg().size(), cfg.session_id.empty() ? "-" : cfg.session_id));
-                    cell::sys::println("switched to session {} cwd={} ({} message(s))", h.now().id(), cell::workdir().string(), h.now().msg().size());
-                    cell::chat::print_recent_messages(h.now().msg());
-                    return cmd_flow::handled;
-            }},
+             {
+                 if (toks.size() < 2)
+                 {
+                     cell::sys::error("usage: /session SESSION_ID | rm SESSION_ID (see /sessions)");
+                     return cmd_flow::handled;
+                 }
+                 // the id becomes path components (session_dir): accept only the
+                 // shape make_session_id produces
+                 if (const size_t id_at = (toks[1] == "rm" || toks[1] == "del") ? 2 : 1;
+                     toks.size() > id_at && !cell::is_valid_session_id(toks[id_at]))
+                 {
+                     cell::sys::error("invalid session id: {}", toks[id_at]);
+                     return cmd_flow::handled;
+                 }
+                 if (toks[1] == "rm" || toks[1] == "del")
+                 {
+                     if (toks.size() < 3)
+                     {
+                         cell::sys::error("usage: /session rm SESSION_ID");
+                         return cmd_flow::handled;
+                     }
+                     std::string target = toks[2];
+                     cell::async_io::flush(); // a queued write must not resurrect the file
+                     std::error_code ec;
+                     std::filesystem::path p = cell::session_dir(target);
+                     bool existed = std::filesystem::exists(p, ec);
+                     if (existed && std::filesystem::remove_all(p, ec) == 0)
+                     {
+                         cell::sys::error("failed to delete session {}", target);
+                         return cmd_flow::handled;
+                     }
+                     cell::stats::remove(target);
+                     log.info("sess", std::format("deleted id={} file={} usage_cleaned=true", target, existed));
+                     if (target == h.now().id())
+                     {
+                         h.forget_current();
+                         ensure_prompt(h.now());
+                         cell::sys::println("session deleted: {} (usage stats removed); new session: {} cwd={}", target, h.now().id(), cell::workdir().string());
+                     }
+                     else
+                         cell::sys::println("session deleted: {} (usage stats removed)", target);
+                     return cmd_flow::handled;
+                 }
+                 std::string target = toks[1];
+                 if (target == h.now().id())
+                 {
+                     cell::sys::println("already in session {}", target);
+                     return cmd_flow::handled;
+                 }
+                 h.now().unload();
+                 cell::async_io::flush(); // the target file below must reflect all queued writes
+                 // the target session may live under another cwd: follow it so the
+                 // chat context and the process cwd stay consistent (the cwd comes
+                 // from the sessions index, keyed by the id's cwd-hash prefix)
+                 std::string tcwd = cell::cwd_for_key(cell::session_prefix(target));
+                 if (!tcwd.empty() && !cell::same_path(tcwd, cell::workdir().string()))
+                 {
+                     std::error_code ec;
+                     std::filesystem::current_path(tcwd, ec);
+                     cell::reset_workdir_cache();
+                     if (ec)
+                         cell::sys::warn("session cwd unreachable: {} (staying in {})", tcwd, cell::workdir().string());
+                     else
+                         cell::sys::println("cwd -> {}", cell::workdir().string());
+                 }
+                 h.use(target);
+                 ensure_prompt(h.now());
+                 log.info("sess", std::format("switched to={} msgs={} previous={}", target, h.now().msg().size(), cfg.session_id.empty() ? "-" : cfg.session_id));
+                 cell::sys::println("switched to session {} cwd={} ({} message(s))", h.now().id(), cell::workdir().string(), h.now().msg().size());
+                 cell::chat::print_recent_messages(h.now().msg());
+                 return cmd_flow::handled;
+             }},
             {"/saved", [&](const std::vector<std::string> &toks, std::string &) -> cmd_flow
-            {
-                    // access the compaction archives of the current session:
-                    // saved/msg-<UTC time>.jsonl inside the session folder
-                    std::filesystem::path saved_dir = h.now().directory() / "saved";
-                    if (toks.size() < 2 || toks[1] == "list")
-                    {
-                        std::vector<std::filesystem::path> all;
-                        std::error_code ec;
-                        if (std::filesystem::is_directory(saved_dir, ec))
-                            for (std::filesystem::directory_iterator it(saved_dir, ec), end; it != end; it.increment(ec))
-                            {
-                                if (ec)
-                                    break;
-                                std::error_code fec;
-                                if (it->is_regular_file(fec) && it->path().extension() == ".jsonl")
-                                    all.push_back(it->path());
-                            }
-                        std::sort(all.begin(), all.end());
-                        if (all.empty())
-                        {
-                            cell::sys::println("  (no saved archives; one is written automatically on each /compact)");
-                            return cmd_flow::handled;
-                        }
-                        cell::sys::println("  saved archives:");
-                        for (auto &p : all)
-                        {
-                            size_t lines = 0;
-                            std::ifstream f(p);
-                            std::string ln;
-                            while (std::getline(f, ln))
-                                if (!ln.empty())
-                                    lines++;
-                            cell::sys::println("    {}  ({} message(s))", p.stem().string(), lines);
-                        }
-                        return cmd_flow::handled;
-                    }
-                    if (toks[1] == "show" || toks[1] == "rm" || toks[1] == "del")
-                    {
-                        if (toks.size() < 3)
-                        {
-                            cell::sys::error("usage: /saved {} NAME (see /saved list)", toks[1]);
-                            return cmd_flow::handled;
-                        }
-                        std::filesystem::path hit;
-                        std::string err;
-                        if (!cell::chat::resolve_saved(saved_dir, toks[2], hit, err))
-                        {
-                            cell::sys::error("{}", err);
-                            return cmd_flow::handled;
-                        }
-                        if (toks[1] == "show")
-                        {
-                            std::ifstream f(hit);
-                            std::string text((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
-                            nlohmann::json msgs = cell::chat::parse_messages_jsonl(text);
-                            if (msgs.empty())
-                            {
-                                cell::sys::error("saved archive {} is empty or unreadable", hit.filename().string());
-                                return cmd_flow::handled;
-                            }
-                            cell::sys::println("  archive {} ({} message(s)):", hit.stem().string(), msgs.size());
-                            cell::chat::print_recent_messages(msgs, msgs.size());
-                        }
-                        else
-                        {
-                            cell::async_io::flush(); // nothing queued may recreate the archive
-                            std::error_code ec;
-                            if (!std::filesystem::remove(hit, ec))
-                            {
-                                cell::sys::error("failed to delete saved archive {}", hit.filename().string());
-                                return cmd_flow::handled;
-                            }
-                            log.info("sess", std::format("saved archive deleted name={}", hit.filename().string()));
-                            cell::sys::println("saved archive deleted: {}", hit.stem().string());
-                        }
-                        return cmd_flow::handled;
-                    }
-                    cell::sys::error("usage: /saved list | /saved show NAME | /saved rm NAME");
-                    return cmd_flow::handled;
-            }},
+             {
+                 // access the compaction archives of the current session:
+                 // saved/msg-<UTC time>.jsonl inside the session folder
+                 std::filesystem::path saved_dir = h.now().directory() / "saved";
+                 if (toks.size() < 2 || toks[1] == "list")
+                 {
+                     std::vector<std::filesystem::path> all;
+                     std::error_code ec;
+                     if (std::filesystem::is_directory(saved_dir, ec))
+                         for (std::filesystem::directory_iterator it(saved_dir, ec), end; it != end; it.increment(ec))
+                         {
+                             if (ec)
+                                 break;
+                             std::error_code fec;
+                             if (it->is_regular_file(fec) && it->path().extension() == ".jsonl")
+                                 all.push_back(it->path());
+                         }
+                     std::sort(all.begin(), all.end());
+                     if (all.empty())
+                     {
+                         cell::sys::println("  (no saved archives; one is written automatically on each /compact)");
+                         return cmd_flow::handled;
+                     }
+                     cell::sys::println("  saved archives:");
+                     for (auto &p : all)
+                     {
+                         size_t lines = 0;
+                         std::ifstream f(p);
+                         std::string ln;
+                         while (std::getline(f, ln))
+                             if (!ln.empty())
+                                 lines++;
+                         cell::sys::println("    {}  ({} message(s))", p.stem().string(), lines);
+                     }
+                     return cmd_flow::handled;
+                 }
+                 if (toks[1] == "show" || toks[1] == "rm" || toks[1] == "del")
+                 {
+                     if (toks.size() < 3)
+                     {
+                         cell::sys::error("usage: /saved {} NAME (see /saved list)", toks[1]);
+                         return cmd_flow::handled;
+                     }
+                     std::filesystem::path hit;
+                     std::string err;
+                     if (!cell::chat::resolve_saved(saved_dir, toks[2], hit, err))
+                     {
+                         cell::sys::error("{}", err);
+                         return cmd_flow::handled;
+                     }
+                     if (toks[1] == "show")
+                     {
+                         std::ifstream f(hit);
+                         std::string text((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+                         nlohmann::json msgs = cell::chat::parse_messages_jsonl(text);
+                         if (msgs.empty())
+                         {
+                             cell::sys::error("saved archive {} is empty or unreadable", hit.filename().string());
+                             return cmd_flow::handled;
+                         }
+                         cell::sys::println("  archive {} ({} message(s)):", hit.stem().string(), msgs.size());
+                         cell::chat::print_recent_messages(msgs, msgs.size());
+                     }
+                     else
+                     {
+                         cell::async_io::flush(); // nothing queued may recreate the archive
+                         std::error_code ec;
+                         if (!std::filesystem::remove(hit, ec))
+                         {
+                             cell::sys::error("failed to delete saved archive {}", hit.filename().string());
+                             return cmd_flow::handled;
+                         }
+                         log.info("sess", std::format("saved archive deleted name={}", hit.filename().string()));
+                         cell::sys::println("saved archive deleted: {}", hit.stem().string());
+                     }
+                     return cmd_flow::handled;
+                 }
+                 cell::sys::error("usage: /saved list | /saved show NAME | /saved rm NAME");
+                 return cmd_flow::handled;
+             }},
             {"/export", [&](const std::vector<std::string> &toks, std::string &) -> cmd_flow
-            {
-                    // write the transcript (or one compaction archive) as a
-                    // self-contained HTML file; the default lands in the cwd
-                    std::filesystem::path out;
-                    nlohmann::json msgs;
-                    std::string what; // label shown in the page header
-                    if (toks.size() >= 2 && toks[1] == "saved")
-                    {
-                        if (toks.size() < 3)
-                        {
-                            cell::sys::error("usage: /export [PATH] | /export saved NAME [PATH]");
-                            return cmd_flow::handled;
-                        }
-                        std::string err;
-                        std::filesystem::path hit;
-                        if (!cell::chat::resolve_saved(h.now().directory() / "saved", toks[2], hit, err))
-                        {
-                            cell::sys::error("{}", err);
-                            return cmd_flow::handled;
-                        }
-                        std::ifstream f(hit);
-                        std::string text((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
-                        msgs = cell::chat::parse_messages_jsonl(text);
-                        if (msgs.empty())
-                        {
-                            cell::sys::error("saved archive {} is empty or unreadable", hit.filename().string());
-                            return cmd_flow::handled;
-                        }
-                        what = hit.stem().string();
-                        if (toks.size() >= 4)
-                            out = toks[3];
-                    }
-                    else
-                    {
-                        msgs = h.now().msg();
-                        what = h.now().id();
-                        if (toks.size() >= 2)
-                            out = toks[1];
-                    }
-                    if (out.empty())
-                        out = std::format("cell-export-{}.html", cell::utc_stamp());
-                    else
-                    {
-                        std::string ext = out.extension().string();
-                        for (auto &c : ext)
-                            c = (char)std::tolower((unsigned char)c);
-                        if (ext != ".html" && ext != ".htm")
-                            out += ".html";
-                    }
-                    std::string err;
-                    cell::chat::export_context export_ctx;
-                    cell::teamwork::collect_export_jobs(h.now().id(), export_ctx.jobs);
-                    if (!cell::chat::export_transcript_html(msgs, what, out, err, &export_ctx))
-                    {
-                        cell::sys::error("{}", err);
-                        return cmd_flow::handled;
-                    }
-                    log.info("sess", std::format("exported msgs={} teamwork_jobs={} to={}", msgs.size(),
-                                                 export_ctx.jobs.size(), out.string()));
-                    cell::sys::println("exported {} message(s) to {}{}", msgs.size(), out.string(),
-                                       export_ctx.jobs.empty() ? "" : std::format(" (+{} teamwork job(s))", export_ctx.jobs.size()));
-                    return cmd_flow::handled;
-            }},
+             {
+                 // write the transcript (or one compaction archive) as a
+                 // self-contained HTML file; the default lands in the cwd
+                 std::filesystem::path out;
+                 nlohmann::json msgs;
+                 std::string what; // label shown in the page header
+                 if (toks.size() >= 2 && toks[1] == "saved")
+                 {
+                     if (toks.size() < 3)
+                     {
+                         cell::sys::error("usage: /export [PATH] | /export saved NAME [PATH]");
+                         return cmd_flow::handled;
+                     }
+                     std::string err;
+                     std::filesystem::path hit;
+                     if (!cell::chat::resolve_saved(h.now().directory() / "saved", toks[2], hit, err))
+                     {
+                         cell::sys::error("{}", err);
+                         return cmd_flow::handled;
+                     }
+                     std::ifstream f(hit);
+                     std::string text((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+                     msgs = cell::chat::parse_messages_jsonl(text);
+                     if (msgs.empty())
+                     {
+                         cell::sys::error("saved archive {} is empty or unreadable", hit.filename().string());
+                         return cmd_flow::handled;
+                     }
+                     what = hit.stem().string();
+                     if (toks.size() >= 4)
+                         out = toks[3];
+                 }
+                 else
+                 {
+                     msgs = h.now().msg();
+                     what = h.now().id();
+                     if (toks.size() >= 2)
+                         out = toks[1];
+                 }
+                 if (out.empty())
+                     out = std::format("cell-export-{}.html", cell::utc_stamp());
+                 else
+                 {
+                     std::string ext = out.extension().string();
+                     for (auto &c : ext)
+                         c = (char)std::tolower((unsigned char)c);
+                     if (ext != ".html" && ext != ".htm")
+                         out += ".html";
+                 }
+                 std::string err;
+                 cell::chat::export_context export_ctx;
+                 cell::teamwork::collect_export_jobs(h.now().id(), export_ctx.jobs);
+                 if (!cell::chat::export_transcript_html(msgs, what, out, err, &export_ctx))
+                 {
+                     cell::sys::error("{}", err);
+                     return cmd_flow::handled;
+                 }
+                 log.info("sess", std::format("exported msgs={} teamwork_jobs={} to={}", msgs.size(),
+                                              export_ctx.jobs.size(), out.string()));
+                 cell::sys::println("exported {} message(s) to {}{}", msgs.size(), out.string(),
+                                    export_ctx.jobs.empty() ? "" : std::format(" (+{} teamwork job(s))", export_ctx.jobs.size()));
+                 return cmd_flow::handled;
+             }},
             {"/usages", [&](const std::vector<std::string> &, std::string &) -> cmd_flow
-            {
-                    if (cell::stats::prune())
-                        log.info("stats", "pruned orphaned session usage records");
-                    cell::sys::println("{}", cell::stats::summarize());
-                    return cmd_flow::handled;
-            }},
+             {
+                 if (cell::stats::prune())
+                     log.info("stats", "pruned orphaned session usage records");
+                 cell::sys::println("{}", cell::stats::summarize());
+                 return cmd_flow::handled;
+             }},
             {"/compact", [&](const std::vector<std::string> &toks, std::string &) -> cmd_flow
-            {
-                    if (toks.size() >= 2 && toks[1] == "auto")
-                    {
-                        if (toks.size() >= 3 && (toks[2] == "on" || toks[2] == "off"))
-                        {
-                            cfg.compact_auto = (toks[2] == "on");
-                            cell::config::save(cfg);
-                            log.info("ctx", std::format("compact_auto={}", cfg.compact_auto));
-                            cell::sys::println("compact auto: {}", cfg.compact_auto ? "on" : "off");
-                        }
-                        else
-                            cell::sys::println("compact auto: {}", cfg.compact_auto ? "on" : "off");
-                        return cmd_flow::handled;
-                    }
-                    if (toks.size() >= 2 && toks[1] == "model")
-                    {
-                        if (toks.size() >= 3)
-                        {
-                            if (toks[2] == "inherit")
-                            {
-                                cfg.compact_provider.clear();
-                                cfg.compact_model.clear();
-                                cell::config::save(cfg);
-                                log.info("ctx", "compact model reset to session model");
-                                cell::sys::println("compact model: inherit session model");
-                            }
-                            else
-                            {
-                                const size_t sep = toks[2].find(':');
-                                if (sep == std::string::npos || sep == 0 || sep + 1 >= toks[2].size())
-                                {
-                                    cell::sys::error("usage: /compact model provider:model | /compact model inherit");
-                                    return cmd_flow::handled;
-                                }
-                                std::string prov = toks[2].substr(0, sep);
-                                std::string mdl = toks[2].substr(sep + 1);
-                                bool found = false;
-                                for (auto &pe : cfg.providers)
-                                    if (pe.name == prov)
-                                    {
-                                        found = true;
-                                        break;
-                                    }
-                                if (!found)
-                                {
-                                    cell::sys::error("unknown provider: {} (only registered providers can be set)", prov);
-                                    return cmd_flow::handled;
-                                }
-                                cfg.compact_provider = prov;
-                                cfg.compact_model = mdl;
-                                cell::config::save(cfg);
-                                log.info("ctx", std::format("compact model set to {}:{}", prov, mdl));
-                                cell::sys::println("compact model: {}:{}", prov, mdl);
-                            }
-                        }
-                        else
-                        {
-                            if (cfg.compact_provider.empty())
-                                cell::sys::println("compact model: inherit session model");
-                            else
-                                cell::sys::println("compact model: {}:{}", cfg.compact_provider, cfg.compact_model);
-                        }
-                        return cmd_flow::handled;
-                    }
-                    cell::sys::println("{}", compact(h.now()));
-                    cell::box::reset_read_log(); // compaction drops read tool results from context
-                    h.now().unload();
-                    cell::async_io::flush();
-                    cell::config::save(cfg);
-                    return cmd_flow::handled;
-            }},
+             {
+                 if (toks.size() >= 2 && toks[1] == "auto")
+                 {
+                     if (toks.size() >= 3 && (toks[2] == "on" || toks[2] == "off"))
+                     {
+                         cfg.compact_auto = (toks[2] == "on");
+                         cell::config::save(cfg);
+                         log.info("ctx", std::format("compact_auto={}", cfg.compact_auto));
+                         cell::sys::println("compact auto: {}", cfg.compact_auto ? "on" : "off");
+                     }
+                     else
+                         cell::sys::println("compact auto: {}", cfg.compact_auto ? "on" : "off");
+                     return cmd_flow::handled;
+                 }
+                 if (toks.size() >= 2 && toks[1] == "model")
+                 {
+                     if (toks.size() >= 3)
+                     {
+                         if (toks[2] == "inherit")
+                         {
+                             cfg.compact_provider.clear();
+                             cfg.compact_model.clear();
+                             cell::config::save(cfg);
+                             log.info("ctx", "compact model reset to session model");
+                             cell::sys::println("compact model: inherit session model");
+                         }
+                         else
+                         {
+                             const size_t sep = toks[2].find(':');
+                             if (sep == std::string::npos || sep == 0 || sep + 1 >= toks[2].size())
+                             {
+                                 cell::sys::error("usage: /compact model provider:model | /compact model inherit");
+                                 return cmd_flow::handled;
+                             }
+                             std::string prov = toks[2].substr(0, sep);
+                             std::string mdl = toks[2].substr(sep + 1);
+                             bool found = false;
+                             for (auto &pe : cfg.providers)
+                                 if (pe.name == prov)
+                                 {
+                                     found = true;
+                                     break;
+                                 }
+                             if (!found)
+                             {
+                                 cell::sys::error("unknown provider: {} (only registered providers can be set)", prov);
+                                 return cmd_flow::handled;
+                             }
+                             cfg.compact_provider = prov;
+                             cfg.compact_model = mdl;
+                             cell::config::save(cfg);
+                             log.info("ctx", std::format("compact model set to {}:{}", prov, mdl));
+                             cell::sys::println("compact model: {}:{}", prov, mdl);
+                         }
+                     }
+                     else
+                     {
+                         if (cfg.compact_provider.empty())
+                             cell::sys::println("compact model: inherit session model");
+                         else
+                             cell::sys::println("compact model: {}:{}", cfg.compact_provider, cfg.compact_model);
+                     }
+                     return cmd_flow::handled;
+                 }
+                 cell::sys::println("{}", compact(h.now()));
+                 cell::box::reset_read_log(); // compaction drops read tool results from context
+                 h.now().unload();
+                 cell::async_io::flush();
+                 cell::config::save(cfg);
+                 return cmd_flow::handled;
+             }},
             {"/skills", [&](const std::vector<std::string> &, std::string &) -> cmd_flow
-            {
-                    auto all = cell::skills::list();
-                    if (all.empty())
-                    {
-                        cell::sys::println("  (no skills in {})", (cell::root / "skills").string());
-                        return cmd_flow::handled;
-                    }
-                    for (auto &sk : all)
-                        cell::sys::println("  {}{}", cell::text::display_safe(sk.name), sk.description.empty() ? "" : ": " + cell::text::display_safe(sk.description));
-                    return cmd_flow::handled;
-            }},
+             {
+                 auto all = cell::skills::list();
+                 if (all.empty())
+                 {
+                     cell::sys::println("  (no skills in {})", (cell::root / "skills").string());
+                     return cmd_flow::handled;
+                 }
+                 for (auto &sk : all)
+                     cell::sys::println("  {}{}", cell::text::display_safe(sk.name), sk.description.empty() ? "" : ": " + cell::text::display_safe(sk.description));
+                 return cmd_flow::handled;
+             }},
             {"/skill", [&](const std::vector<std::string> &toks, std::string &) -> cmd_flow
-            {
-                    if (toks.size() < 2)
-                    {
-                        cell::sys::error("usage: /skill NAME");
-                        return cmd_flow::handled;
-                    }
-                    auto all = cell::skills::list();
-                    const cell::skills::skill *sk = cell::skills::find(all, toks[1]);
-                    if (!sk)
-                    {
-                        cell::sys::error("skill not found: {}", toks[1]);
-                        return cmd_flow::handled;
-                    }
-                    std::string body;
-                    if (!cell::skills::content(*sk, body))
-                    {
-                        cell::sys::error("failed to read skill: {}", toks[1]);
-                        return cmd_flow::handled;
-                    }
-                    // the skill body enters the conversation verbatim (no heavy
-                    // fingerprint scan for non-tool channels); the skill name is
-                    // untrusted front matter, so control/ANSI chars are stripped
-                    std::string sname = cell::text::display_safe(sk->name);
-                    h.now().msg().push_back({{"role", "system"},
-                                        {"content", std::format("You have loaded the skill \"{}\". Follow its instructions for the rest of this session.\n\n{}", sname, body)}});
-                    cell::chat::fold_system_messages(h.now().msg()); // a skill loaded mid-conversation joins the leading block
-                    h.now().unload();
-                    log.info("skill", std::format("loaded name={} chars={} msgs_now={}", sk->name, body.size(), h.now().msg().size()));
-                    cell::sys::println("skill loaded: {} ({} chars, total msgs={})", cell::text::display_safe(sk->name), body.size(), h.now().msg().size());
-                    return cmd_flow::handled;
-            }},
+             {
+                 if (toks.size() < 2)
+                 {
+                     cell::sys::error("usage: /skill NAME");
+                     return cmd_flow::handled;
+                 }
+                 auto all = cell::skills::list();
+                 const cell::skills::skill *sk = cell::skills::find(all, toks[1]);
+                 if (!sk)
+                 {
+                     cell::sys::error("skill not found: {}", toks[1]);
+                     return cmd_flow::handled;
+                 }
+                 std::string body;
+                 if (!cell::skills::content(*sk, body))
+                 {
+                     cell::sys::error("failed to read skill: {}", toks[1]);
+                     return cmd_flow::handled;
+                 }
+                 // the skill body enters the conversation verbatim (no heavy
+                 // fingerprint scan for non-tool channels); the skill name is
+                 // untrusted front matter, so control/ANSI chars are stripped
+                 std::string sname = cell::text::display_safe(sk->name);
+                 h.now().msg().push_back({{"role", "system"},
+                                          {"content", std::format("You have loaded the skill \"{}\". Follow its instructions for the rest of this session.\n\n{}", sname, body)}});
+                 cell::chat::fold_system_messages(h.now().msg()); // a skill loaded mid-conversation joins the leading block
+                 h.now().unload();
+                 log.info("skill", std::format("loaded name={} chars={} msgs_now={}", sk->name, body.size(), h.now().msg().size()));
+                 cell::sys::println("skill loaded: {} ({} chars, total msgs={})", cell::text::display_safe(sk->name), body.size(), h.now().msg().size());
+                 return cmd_flow::handled;
+             }},
             {"/notices", [&](const std::vector<std::string> &toks, std::string &) -> cmd_flow
-            {
-                    const std::string cur_sid = h.now().id();
-                    std::string sub = toks.size() > 1 ? toks[1] : "list";
-                    if (sub == "list")
-                    {
-                        auto got = cell::notice::peek(cur_sid);
-                        if (got.empty())
-                            cell::sys::println("no pending notices");
-                        for (auto &m : got)
-                            cell::sys::println("{}", cell::notice::render(m));
-                        return cmd_flow::handled;
-                    }
-                    if (sub == "wait")
-                    {
-                        // block WITHOUT any LLM call: the process idles on a
-                        // condition variable until a notice arrives (instant for
-                        // senders in this process, <= ~1s for other processes)
-                        double timeout = 60.0;
-                        std::string from_f, topic_f;
-                        bool bad_token = false;
-                        for (size_t i = 2; i < toks.size(); i++)
-                        {
-                            const std::string &t = toks[i];
-                            if (t.rfind("from:", 0) == 0)
-                                from_f = t.substr(5);
-                            else if (t.rfind("topic:", 0) == 0)
-                                topic_f = t.substr(6);
-                            else
-                            {
-                                try
-                                {
-                                    timeout = std::stod(t);
-                                }
-                                catch (const std::exception &)
-                                {
-                                    bad_token = true;
-                                }
-                            }
-                        }
-                        if (bad_token || toks.size() < 3)
-                        {
-                            cell::sys::error("usage: /notices wait [SECONDS] [from:SUBSTR] [topic:SUBSTR]");
-                            return cmd_flow::handled;
-                        }
-                        if (timeout < 0)
-                            timeout = 60;
-                        if (timeout > 3600)
-                            timeout = 3600;
-                        cell::sys::println("waiting for notices up to {}s ({}; {}) — idle, zero tokens. Ctrl+C exits.",
-                                           timeout,
-                                           from_f.empty() ? "any sender" : "from~" + from_f,
-                                           topic_f.empty() ? "any topic" : "topic~" + topic_f);
-                        std::vector<cell::notice::message> got;
-                        // a human is watching: re-scan more often than the 0.7 s
-                        // default so a cross-process notice feels immediate
-                        bool hit = cell::notice::wait_for(cur_sid, timeout, from_f, topic_f, got, 200);
-                        size_t n = inject_notices(false);
-                        if (hit || n > 0)
-                            cell::sys::println("delivered {} notice(s) into the conversation", n);
-                        else
-                            cell::sys::println("no notices within {}s", timeout);
-                        return cmd_flow::handled;
-                    }
-                    if (sub == "send")
-                    {
-                        // `/notices send` alone has exactly two tokens: requiring
-                        // 3 is what distinguishes "no body" from a target id
-                        if (toks.size() < 3)
-                        {
-                            cell::sys::error("usage: /notices send [SESSION_ID] TEXT...");
-                            return cmd_flow::handled;
-                        }
-                        // the token after "send" is the target only when it
-                        // resolves to a session id; otherwise everything after
-                        // "send" is the message body for the current session
-                        std::string target = "";
-                        size_t text_start = toks.size() >= 3 ? 2 : 1;
-                        if (toks.size() >= 3)
-                        {
-                            std::string resolved = resolve_session_arg(toks[2]);
-                            if (resolved == "\x01")
-                            {
-                                cell::sys::error("session id prefix \"{}\" is ambiguous - be more specific (see /sessions)", toks[2]);
-                                return cmd_flow::handled;
-                            }
-                            if (resolved != "\x02")
-                            {
-                                target = resolved;
-                                text_start = 3;
-                            }
-                        }
-                        std::string text;
-                        for (size_t i = text_start; i < toks.size(); i++)
-                        {
-                            if (i > text_start)
-                                text += ' ';
-                            text += toks[i];
-                        }
-                        if (text.empty())
-                        {
-                            cell::sys::error("usage: /notices send [SESSION_ID] TEXT...");
-                            return cmd_flow::handled;
-                        }
-                        std::string err, id;
-                        if (cell::notice::send_to(target.empty() ? cur_sid : target, "user", "", text, err, &id))
-                            cell::sys::println("notice {} delivered to session {}", id,
-                                               target.empty() ? "(current)" : target);
-                        else
-                            cell::sys::error("{}", err);
-                        return cmd_flow::handled;
-                    }
-                    if (sub == "drain")
-                    {
-                        size_t n = inject_notices(true);
-                        if (n > 0)
-                            cell::sys::println("delivered {} notice(s) into the conversation", n);
-                        return cmd_flow::handled;
-                    }
-                    if (sub == "clear")
-                    {
-                        size_t n = cell::notice::clear(cur_sid);
-                        cell::sys::println("dropped {} pending notice(s)", n);
-                        return cmd_flow::handled;
-                    }
-                    cell::sys::error("usage: /notices [list | wait [SECONDS] [from:SUBSTR] [topic:SUBSTR]");
-                    cell::sys::error("        | send [SESSION_ID] TEXT | drain | clear]");
-                    return cmd_flow::handled;
-            }},
+             {
+                 const std::string cur_sid = h.now().id();
+                 std::string sub = toks.size() > 1 ? toks[1] : "list";
+                 if (sub == "list")
+                 {
+                     auto got = cell::notice::peek(cur_sid);
+                     if (got.empty())
+                         cell::sys::println("no pending notices");
+                     for (auto &m : got)
+                         cell::sys::println("{}", cell::notice::render(m));
+                     return cmd_flow::handled;
+                 }
+                 if (sub == "wait")
+                 {
+                     // block WITHOUT any LLM call: the process idles on a
+                     // condition variable until a notice arrives (instant for
+                     // senders in this process, <= ~1s for other processes)
+                     double timeout = 60.0;
+                     std::string from_f, topic_f;
+                     bool bad_token = false;
+                     for (size_t i = 2; i < toks.size(); i++)
+                     {
+                         const std::string &t = toks[i];
+                         if (t.rfind("from:", 0) == 0)
+                             from_f = t.substr(5);
+                         else if (t.rfind("topic:", 0) == 0)
+                             topic_f = t.substr(6);
+                         else
+                         {
+                             try
+                             {
+                                 timeout = std::stod(t);
+                             }
+                             catch (const std::exception &)
+                             {
+                                 bad_token = true;
+                             }
+                         }
+                     }
+                     if (bad_token || toks.size() < 3)
+                     {
+                         cell::sys::error("usage: /notices wait [SECONDS] [from:SUBSTR] [topic:SUBSTR]");
+                         return cmd_flow::handled;
+                     }
+                     if (timeout < 0)
+                         timeout = 60;
+                     if (timeout > 3600)
+                         timeout = 3600;
+                     cell::sys::println("waiting for notices up to {}s ({}; {}) — idle, zero tokens. Ctrl+C exits.",
+                                        timeout,
+                                        from_f.empty() ? "any sender" : "from~" + from_f,
+                                        topic_f.empty() ? "any topic" : "topic~" + topic_f);
+                     std::vector<cell::notice::message> got;
+                     // a human is watching: re-scan more often than the 0.7 s
+                     // default so a cross-process notice feels immediate
+                     bool hit = cell::notice::wait_for(cur_sid, timeout, from_f, topic_f, got, 200);
+                     size_t n = inject_notices(false);
+                     if (hit || n > 0)
+                         cell::sys::println("delivered {} notice(s) into the conversation", n);
+                     else
+                         cell::sys::println("no notices within {}s", timeout);
+                     return cmd_flow::handled;
+                 }
+                 if (sub == "send")
+                 {
+                     // `/notices send` alone has exactly two tokens: requiring
+                     // 3 is what distinguishes "no body" from a target id
+                     if (toks.size() < 3)
+                     {
+                         cell::sys::error("usage: /notices send [SESSION_ID] TEXT...");
+                         return cmd_flow::handled;
+                     }
+                     // the token after "send" is the target only when it
+                     // resolves to a session id; otherwise everything after
+                     // "send" is the message body for the current session
+                     std::string target = "";
+                     size_t text_start = toks.size() >= 3 ? 2 : 1;
+                     if (toks.size() >= 3)
+                     {
+                         std::string resolved = resolve_session_arg(toks[2]);
+                         if (resolved == "\x01")
+                         {
+                             cell::sys::error("session id prefix \"{}\" is ambiguous - be more specific (see /sessions)", toks[2]);
+                             return cmd_flow::handled;
+                         }
+                         if (resolved != "\x02")
+                         {
+                             target = resolved;
+                             text_start = 3;
+                         }
+                     }
+                     std::string text;
+                     for (size_t i = text_start; i < toks.size(); i++)
+                     {
+                         if (i > text_start)
+                             text += ' ';
+                         text += toks[i];
+                     }
+                     if (text.empty())
+                     {
+                         cell::sys::error("usage: /notices send [SESSION_ID] TEXT...");
+                         return cmd_flow::handled;
+                     }
+                     std::string err, id;
+                     if (cell::notice::send_to(target.empty() ? cur_sid : target, "user", "", text, err, &id))
+                         cell::sys::println("notice {} delivered to session {}", id,
+                                            target.empty() ? "(current)" : target);
+                     else
+                         cell::sys::error("{}", err);
+                     return cmd_flow::handled;
+                 }
+                 if (sub == "drain")
+                 {
+                     size_t n = inject_notices(true);
+                     if (n > 0)
+                         cell::sys::println("delivered {} notice(s) into the conversation", n);
+                     return cmd_flow::handled;
+                 }
+                 if (sub == "clear")
+                 {
+                     size_t n = cell::notice::clear(cur_sid);
+                     cell::sys::println("dropped {} pending notice(s)", n);
+                     return cmd_flow::handled;
+                 }
+                 cell::sys::error("usage: /notices [list | wait [SECONDS] [from:SUBSTR] [topic:SUBSTR]");
+                 cell::sys::error("        | send [SESSION_ID] TEXT | drain | clear]");
+                 return cmd_flow::handled;
+             }},
             {"/teamworks", [&](const std::vector<std::string> &toks, std::string &) -> cmd_flow
-            {
-                    const std::string tw_sid = h.now().id();
-                    auto arg0 = [&]() -> std::string
-                    { return toks.size() > 1 ? toks[1] : ""; };
-                    auto parse_limit = [&](const std::string &s, size_t fallback) -> size_t
-                    {
-                        if (s.empty())
-                            return fallback;
-                        for (char c : s)
-                            if (c < '0' || c > '9')
-                                return fallback;
-                        return std::clamp<size_t>(num_arg(nlohmann::json{{"n", s}}, "n", fallback), (size_t)1, (size_t)200);
-                    };
-                    if (arg0() == "new")
-                    {
-                        nlohmann::json config = {{"work-type", "serial"}, {"list", nlohmann::json::array()}};
-                        std::string id;
-                        if (cell::teamwork::new_job(config, cell::teamwork::max_children(cfg), id, tw_sid))
-                            cell::sys::println("teamwork id: {}  (append children with /teamworks id:{} works:...)", id, id);
-                        else
-                            cell::sys::error("{}", id);
-                        return cmd_flow::handled;
-                    }
-                    if (arg0() == "max")
-                    {
-                        if (toks.size() == 2)
-                        {
-                            cell::sys::println("teamwork max child agents: {}", cell::teamwork::max_children(cfg));
-                            return cmd_flow::handled;
-                        }
-                        bool numeric = !toks[2].empty();
-                        for (char c : toks[2])
-                            if (c < '0' || c > '9')
-                                numeric = false;
-                        if (!numeric)
-                        {
-                            cell::sys::error("/teamworks max expects a number between 1 and 100");
-                            return cmd_flow::handled;
-                        }
-                        size_t n = std::clamp<size_t>(num_arg(nlohmann::json{{"n", toks[2]}}, "n", 5), (size_t)1, (size_t)100);
-                        cfg.teamwork_max_children = n;
-                        cell::async_io::flush();
-                        cell::config::save(cfg);
-                        cell::sys::println("teamwork max child agents: {}", n);
-                        return cmd_flow::handled;
-                    }
-                    if (arg0() == "all")
-                    {
-                        std::string out;
-                        cell::teamwork::list_jobs(out, true, false, tw_sid);
-                        cell::sys::println("{}", out);
-                        return cmd_flow::handled;
-                    }
-                    if (arg0() == "run" && toks.size() >= 3)
-                    {
-                        std::string out;
-                        if (cell::teamwork::run_job(team_rt, toks[2], out))
-                            cell::sys::println("{}", out);
-                        else
-                            cell::sys::error("{}", out);
-                        return cmd_flow::handled;
-                    }
-                    if (arg0() == "run_bg" && toks.size() >= 3)
-                    {
-                        std::string out;
-                        if (cell::teamwork::run_job_bg(team_rt, toks[2], out))
-                            cell::sys::println("{}", out);
-                        else
-                            cell::sys::error("{}", out);
-                        return cmd_flow::handled;
-                    }
-                    if (arg0() == "resume" && toks.size() >= 3)
-                    {
-                        // continue a gated/stopped workflow job from its saved stage
-                        std::string out;
-                        if (cell::teamwork::run_job(team_rt, toks[2], out))
-                            cell::sys::println("{}", out);
-                        else
-                            cell::sys::error("{}", out);
-                        return cmd_flow::handled;
-                    }
-                    if (arg0() == "stop" && toks.size() >= 3)
-                    {
-                        cell::teamwork::request_stop(toks[2]);
-                        cell::sys::println("stop requested for {} (pauses at the next worker round or stage boundary; resume with /teamworks resume)", toks[2]);
-                        return cmd_flow::handled;
-                    }
-                    if (arg0() == "status" && toks.size() >= 3)
-                    {
-                        cell::teamwork::job_ref ref;
-                        if (cell::teamwork::find_job_anywhere(toks[2], ref, tw_sid))
-                            cell::sys::println("{}", cell::teamwork::job_display(ref.job));
-                        else
-                            cell::sys::error("teamwork {} not found (searched this working directory)", toks[2]);
-                        return cmd_flow::handled;
-                    }
-                    if (arg0() == "workflow")
-                    {
-                        // load a workflow/job config from a JSON file in the cwd
-                        // (default teamwork.workflow.json) and create the job
-                        std::string path = toks.size() >= 3 ? toks[2] : "";
-                        nlohmann::json file_config;
-                        std::string err;
-                        if (!cell::teamwork::load_config_file(path, file_config, err))
-                        {
-                            cell::sys::error("{}", err);
-                            return cmd_flow::handled;
-                        }
-                        std::string out;
-                        if (cell::teamwork::new_job(file_config, cell::teamwork::max_children(cfg), out, tw_sid))
-                        {
-                            std::string created = out;
-                            nlohmann::json store = cell::teamwork::load_store(tw_sid);
-                            nlohmann::json *job = cell::teamwork::find_job(store, created);
-                            cell::sys::println("loaded workflow job {}", created);
-                            if (job)
-                                cell::sys::println("{}", cell::teamwork::job_display(*job));
-                        }
-                        else
-                            cell::sys::error("{}", out);
-                        return cmd_flow::handled;
-                    }
-                    if (arg0() == "rm" && toks.size() >= 3)
-                    {
-                        std::string target = toks[2];
-                        std::string out;
-                        auto sep = target.find(':');
-                        if (sep != std::string::npos)
-                        {
-                            if (cell::teamwork::remove_worker(target.substr(0, sep), target.substr(sep + 1), out, tw_sid))
-                                cell::sys::println("{}", out);
-                            else
-                                cell::sys::error("{}", out);
-                        }
-                        else if (cell::teamwork::remove_job(target, false, out, tw_sid))
-                            cell::sys::println("{}", out);
-                        else
-                            cell::sys::error("{}", out);
-                        return cmd_flow::handled;
-                    }
-                    if (arg0() == "history" || arg0() == "reports")
-                    {
-                        bool reports_mode = arg0() == "reports";
-                        bool full = false, all = false;
-                        std::string job_filter, worker_filter;
-                        size_t limit = 20;
-                        for (size_t i = 2; i < toks.size(); i++)
-                        {
-                            const std::string &t = toks[i];
-                            if (t == "full")
-                                full = true;
-                            else if (t == "all")
-                                all = true;
-                            else if (t.rfind("worker:", 0) == 0)
-                                worker_filter = t.substr(7);
-                            else if (t.rfind("n:", 0) == 0)
-                                limit = parse_limit(t.substr(2), 20);
-                            else if (t.rfind("limit:", 0) == 0)
-                                limit = parse_limit(t.substr(6), 20);
-                            else
-                                job_filter = t;
-                        }
-                        std::string out;
-                        if (reports_mode)
-                        {
-                            if (!cell::teamwork::get_reports(job_filter, worker_filter, limit, full, all, out, tw_sid))
-                            {
-                                cell::sys::error("{}", out);
-                                return cmd_flow::handled;
-                            }
-                        }
-                        else
-                        {
-                            std::vector<cell::teamwork::task_row> rows;
-                            cell::teamwork::collect_tasks(all, job_filter, worker_filter, rows, tw_sid);
-                            out = cell::teamwork::format_task_rows(rows, limit);
-                        }
-                        cell::sys::println("{}", out);
-                        return cmd_flow::handled;
-                    }
-                    if (arg0() == "report" && toks.size() >= 3)
-                    {
-                        std::string target = toks[2];
-                        auto sep = target.find(':');
-                        std::string job = sep == std::string::npos ? target : target.substr(0, sep);
-                        std::string worker = sep != std::string::npos
-                                                 ? target.substr(sep + 1)
-                                                 : (toks.size() >= 4 ? toks[3] : std::string());
-                        if (worker.empty())
-                        {
-                            cell::sys::error("usage: /teamworks report JOB:worker  |  /teamworks report JOB worker");
-                            return cmd_flow::handled;
-                        }
-                        std::string out;
-                        if (cell::teamwork::get_report(job, worker, out, tw_sid))
-                            cell::sys::println("{}:{}\n{}", job, worker, out);
-                        else
-                            cell::sys::error("{}", out);
-                        return cmd_flow::handled;
-                    }
-                    if (arg0().rfind("id:", 0) == 0)
-                    {
-                        std::string id = arg0().substr(3);
-                        nlohmann::json extras = nlohmann::json::object();
-                        std::string collecting;
-                        auto set_field = [&](const char *field, const std::string &value)
-                        {
-                            extras[field] = value;
-                            collecting = field;
-                        };
-                        for (size_t i = 2; i < toks.size(); i++)
-                        {
-                            const std::string &t = toks[i];
-                            if (t.rfind("bg:", 0) == 0)
-                            {
-                                extras["background"] = t.substr(3);
-                                collecting.clear();
-                            }
-                            else if (t.rfind("works:", 0) == 0)
-                                set_field("works", t.substr(6));
-                            else if (t.rfind("reuse:", 0) == 0)
-                            {
-                                extras["reuse"] = t.substr(6);
-                                collecting.clear();
-                            }
-                            else if (t.rfind("provider:", 0) == 0)
-                            {
-                                extras["provider"] = t.substr(9);
-                                collecting.clear();
-                            }
-                            else if (t.rfind("model:", 0) == 0)
-                            {
-                                extras["model"] = t.substr(6);
-                                collecting.clear();
-                            }
-                            else if (t.rfind("think:", 0) == 0)
-                            {
-                                extras["think"] = t.substr(6);
-                                collecting.clear();
-                            }
-                            else if (t.rfind("writes:", 0) == 0)
-                            {
-                                // comma-separated list of files this child may modify
-                                nlohmann::json paths = nlohmann::json::array();
-                                std::string rest = t.substr(7);
-                                size_t pos = 0;
-                                for (;;)
-                                {
-                                    size_t comma = rest.find(',', pos);
-                                    std::string one = rest.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
-                                    if (!one.empty())
-                                        paths.push_back(one);
-                                    if (comma == std::string::npos)
-                                        break;
-                                    pos = comma + 1;
-                                }
-                                extras["editable"] = std::move(paths);
-                                collecting.clear();
-                            }
-                            else if (t.rfind("rules:", 0) == 0)
-                                set_field("edit_rules", t.substr(6));
-                            else if (t.rfind("name:", 0) == 0)
-                            {
-                                extras["name"] = t.substr(5);
-                                collecting.clear();
-                            }
-                            else if (!collecting.empty())
-                                extras[collecting] = extras[collecting].get<std::string>() + " " + t;
-                            else
-                                cell::sys::warn("ignoring token: {}", t);
-                        }
-                        std::string out;
-                        if (cell::teamwork::append_worker(id, extras, cell::teamwork::max_children(cfg), out, tw_sid))
-                            cell::sys::println("{}", out);
-                        else
-                            cell::sys::error("{}", out);
-                        return cmd_flow::handled;
-                    }
-                    if (toks.size() == 2 && toks[1].find(':') != std::string::npos)
-                    {
-                        auto sep = toks[1].find(':');
-                        std::string out;
-                        if (cell::teamwork::get_report(toks[1].substr(0, sep), toks[1].substr(sep + 1), out, tw_sid))
-                            cell::sys::println("{}\n{}", toks[1], out);
-                        else
-                            cell::sys::error("{}", out);
-                        return cmd_flow::handled;
-                    }
-                    if (toks.size() == 1)
-                    {
-                        std::string out;
-                        cell::teamwork::list_jobs(out, false, false, tw_sid);
-                        cell::sys::println("{}", out);
-                        return cmd_flow::handled;
-                    }
-                    cell::sys::error("usage: /teamworks [all | new | workflow [FILE] | run ID | run_bg ID | resume ID | stop ID | status ID");
-                    cell::sys::error("        | max [N] | rm ID | rm ID:worker");
-                    cell::sys::error("        | id:ID bg:none|prolegomena works:TEXT [provider:P] [model:M] [think:L] [reuse:JOB/worker] [writes:FILE,...] [rules:TEXT] [name:NAME]");
-                    cell::sys::error("        | history [JOB] [worker:W] [n:N] [all] | reports [JOB] [worker:W] [n:N] [full] [all] | report JOB:worker]");
-                    return cmd_flow::handled;
-            }},
-    };
+             {
+                 const std::string tw_sid = h.now().id();
+                 auto arg0 = [&]() -> std::string
+                 { return toks.size() > 1 ? toks[1] : ""; };
+                 auto parse_limit = [&](const std::string &s, size_t fallback) -> size_t
+                 {
+                     if (s.empty())
+                         return fallback;
+                     for (char c : s)
+                         if (c < '0' || c > '9')
+                             return fallback;
+                     return std::clamp<size_t>(num_arg(nlohmann::json{{"n", s}}, "n", fallback), (size_t)1, (size_t)200);
+                 };
+                 if (arg0() == "new")
+                 {
+                     nlohmann::json config = {{"work-type", "serial"}, {"list", nlohmann::json::array()}};
+                     std::string id;
+                     if (cell::teamwork::new_job(config, cell::teamwork::max_children(cfg), id, tw_sid))
+                         cell::sys::println("teamwork id: {}  (append children with /teamworks id:{} works:...)", id, id);
+                     else
+                         cell::sys::error("{}", id);
+                     return cmd_flow::handled;
+                 }
+                 if (arg0() == "max")
+                 {
+                     if (toks.size() == 2)
+                     {
+                         cell::sys::println("teamwork max child agents: {}", cell::teamwork::max_children(cfg));
+                         return cmd_flow::handled;
+                     }
+                     bool numeric = !toks[2].empty();
+                     for (char c : toks[2])
+                         if (c < '0' || c > '9')
+                             numeric = false;
+                     if (!numeric)
+                     {
+                         cell::sys::error("/teamworks max expects a number between 1 and 100");
+                         return cmd_flow::handled;
+                     }
+                     size_t n = std::clamp<size_t>(num_arg(nlohmann::json{{"n", toks[2]}}, "n", 5), (size_t)1, (size_t)100);
+                     cfg.teamwork_max_children = n;
+                     cell::async_io::flush();
+                     cell::config::save(cfg);
+                     cell::sys::println("teamwork max child agents: {}", n);
+                     return cmd_flow::handled;
+                 }
+                 if (arg0() == "all")
+                 {
+                     std::string out;
+                     cell::teamwork::list_jobs(out, true, false, tw_sid);
+                     cell::sys::println("{}", out);
+                     return cmd_flow::handled;
+                 }
+                 if (arg0() == "run" && toks.size() >= 3)
+                 {
+                     std::string out;
+                     if (cell::teamwork::run_job(team_rt, toks[2], out))
+                         cell::sys::println("{}", out);
+                     else
+                         cell::sys::error("{}", out);
+                     return cmd_flow::handled;
+                 }
+                 if (arg0() == "run_bg" && toks.size() >= 3)
+                 {
+                     std::string out;
+                     if (cell::teamwork::run_job_bg(team_rt, toks[2], out))
+                         cell::sys::println("{}", out);
+                     else
+                         cell::sys::error("{}", out);
+                     return cmd_flow::handled;
+                 }
+                 if (arg0() == "resume" && toks.size() >= 3)
+                 {
+                     // continue a gated/stopped workflow job from its saved stage
+                     std::string out;
+                     if (cell::teamwork::run_job(team_rt, toks[2], out))
+                         cell::sys::println("{}", out);
+                     else
+                         cell::sys::error("{}", out);
+                     return cmd_flow::handled;
+                 }
+                 if (arg0() == "stop" && toks.size() >= 3)
+                 {
+                     cell::teamwork::request_stop(toks[2]);
+                     cell::sys::println("stop requested for {} (pauses at the next worker round or stage boundary; resume with /teamworks resume)", toks[2]);
+                     return cmd_flow::handled;
+                 }
+                 if (arg0() == "status" && toks.size() >= 3)
+                 {
+                     cell::teamwork::job_ref ref;
+                     if (cell::teamwork::find_job_anywhere(toks[2], ref, tw_sid))
+                         cell::sys::println("{}", cell::teamwork::job_display(ref.job));
+                     else
+                         cell::sys::error("teamwork {} not found (searched this working directory)", toks[2]);
+                     return cmd_flow::handled;
+                 }
+                 if (arg0() == "workflow")
+                 {
+                     // load a workflow/job config from a JSON file in the cwd
+                     // (default teamwork.workflow.json) and create the job
+                     std::string path = toks.size() >= 3 ? toks[2] : "";
+                     nlohmann::json file_config;
+                     std::string err;
+                     if (!cell::teamwork::load_config_file(path, file_config, err))
+                     {
+                         cell::sys::error("{}", err);
+                         return cmd_flow::handled;
+                     }
+                     std::string out;
+                     if (cell::teamwork::new_job(file_config, cell::teamwork::max_children(cfg), out, tw_sid))
+                     {
+                         std::string created = out;
+                         nlohmann::json store = cell::teamwork::load_store(tw_sid);
+                         nlohmann::json *job = cell::teamwork::find_job(store, created);
+                         cell::sys::println("loaded workflow job {}", created);
+                         if (job)
+                             cell::sys::println("{}", cell::teamwork::job_display(*job));
+                     }
+                     else
+                         cell::sys::error("{}", out);
+                     return cmd_flow::handled;
+                 }
+                 if (arg0() == "rm" && toks.size() >= 3)
+                 {
+                     std::string target = toks[2];
+                     std::string out;
+                     auto sep = target.find(':');
+                     if (sep != std::string::npos)
+                     {
+                         if (cell::teamwork::remove_worker(target.substr(0, sep), target.substr(sep + 1), out, tw_sid))
+                             cell::sys::println("{}", out);
+                         else
+                             cell::sys::error("{}", out);
+                     }
+                     else if (cell::teamwork::remove_job(target, false, out, tw_sid))
+                         cell::sys::println("{}", out);
+                     else
+                         cell::sys::error("{}", out);
+                     return cmd_flow::handled;
+                 }
+                 if (arg0() == "history" || arg0() == "reports")
+                 {
+                     bool reports_mode = arg0() == "reports";
+                     bool full = false, all = false;
+                     std::string job_filter, worker_filter;
+                     size_t limit = 20;
+                     for (size_t i = 2; i < toks.size(); i++)
+                     {
+                         const std::string &t = toks[i];
+                         if (t == "full")
+                             full = true;
+                         else if (t == "all")
+                             all = true;
+                         else if (t.rfind("worker:", 0) == 0)
+                             worker_filter = t.substr(7);
+                         else if (t.rfind("n:", 0) == 0)
+                             limit = parse_limit(t.substr(2), 20);
+                         else if (t.rfind("limit:", 0) == 0)
+                             limit = parse_limit(t.substr(6), 20);
+                         else
+                             job_filter = t;
+                     }
+                     std::string out;
+                     if (reports_mode)
+                     {
+                         if (!cell::teamwork::get_reports(job_filter, worker_filter, limit, full, all, out, tw_sid))
+                         {
+                             cell::sys::error("{}", out);
+                             return cmd_flow::handled;
+                         }
+                     }
+                     else
+                     {
+                         std::vector<cell::teamwork::task_row> rows;
+                         cell::teamwork::collect_tasks(all, job_filter, worker_filter, rows, tw_sid);
+                         out = cell::teamwork::format_task_rows(rows, limit);
+                     }
+                     cell::sys::println("{}", out);
+                     return cmd_flow::handled;
+                 }
+                 if (arg0() == "report" && toks.size() >= 3)
+                 {
+                     std::string target = toks[2];
+                     auto sep = target.find(':');
+                     std::string job = sep == std::string::npos ? target : target.substr(0, sep);
+                     std::string worker = sep != std::string::npos
+                                              ? target.substr(sep + 1)
+                                              : (toks.size() >= 4 ? toks[3] : std::string());
+                     if (worker.empty())
+                     {
+                         cell::sys::error("usage: /teamworks report JOB:worker  |  /teamworks report JOB worker");
+                         return cmd_flow::handled;
+                     }
+                     std::string out;
+                     if (cell::teamwork::get_report(job, worker, out, tw_sid))
+                         cell::sys::println("{}:{}\n{}", job, worker, out);
+                     else
+                         cell::sys::error("{}", out);
+                     return cmd_flow::handled;
+                 }
+                 if (arg0().rfind("id:", 0) == 0)
+                 {
+                     std::string id = arg0().substr(3);
+                     nlohmann::json extras = nlohmann::json::object();
+                     std::string collecting;
+                     auto set_field = [&](const char *field, const std::string &value)
+                     {
+                         extras[field] = value;
+                         collecting = field;
+                     };
+                     for (size_t i = 2; i < toks.size(); i++)
+                     {
+                         const std::string &t = toks[i];
+                         if (t.rfind("bg:", 0) == 0)
+                         {
+                             extras["background"] = t.substr(3);
+                             collecting.clear();
+                         }
+                         else if (t.rfind("works:", 0) == 0)
+                             set_field("works", t.substr(6));
+                         else if (t.rfind("reuse:", 0) == 0)
+                         {
+                             extras["reuse"] = t.substr(6);
+                             collecting.clear();
+                         }
+                         else if (t.rfind("provider:", 0) == 0)
+                         {
+                             extras["provider"] = t.substr(9);
+                             collecting.clear();
+                         }
+                         else if (t.rfind("model:", 0) == 0)
+                         {
+                             extras["model"] = t.substr(6);
+                             collecting.clear();
+                         }
+                         else if (t.rfind("think:", 0) == 0)
+                         {
+                             extras["think"] = t.substr(6);
+                             collecting.clear();
+                         }
+                         else if (t.rfind("writes:", 0) == 0)
+                         {
+                             // comma-separated list of files this child may modify
+                             nlohmann::json paths = nlohmann::json::array();
+                             std::string rest = t.substr(7);
+                             size_t pos = 0;
+                             for (;;)
+                             {
+                                 size_t comma = rest.find(',', pos);
+                                 std::string one = rest.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
+                                 if (!one.empty())
+                                     paths.push_back(one);
+                                 if (comma == std::string::npos)
+                                     break;
+                                 pos = comma + 1;
+                             }
+                             extras["editable"] = std::move(paths);
+                             collecting.clear();
+                         }
+                         else if (t.rfind("rules:", 0) == 0)
+                             set_field("edit_rules", t.substr(6));
+                         else if (t.rfind("name:", 0) == 0)
+                         {
+                             extras["name"] = t.substr(5);
+                             collecting.clear();
+                         }
+                         else if (!collecting.empty())
+                             extras[collecting] = extras[collecting].get<std::string>() + " " + t;
+                         else
+                             cell::sys::warn("ignoring token: {}", t);
+                     }
+                     std::string out;
+                     if (cell::teamwork::append_worker(id, extras, cell::teamwork::max_children(cfg), out, tw_sid))
+                         cell::sys::println("{}", out);
+                     else
+                         cell::sys::error("{}", out);
+                     return cmd_flow::handled;
+                 }
+                 if (toks.size() == 2 && toks[1].find(':') != std::string::npos)
+                 {
+                     auto sep = toks[1].find(':');
+                     std::string out;
+                     if (cell::teamwork::get_report(toks[1].substr(0, sep), toks[1].substr(sep + 1), out, tw_sid))
+                         cell::sys::println("{}\n{}", toks[1], out);
+                     else
+                         cell::sys::error("{}", out);
+                     return cmd_flow::handled;
+                 }
+                 if (toks.size() == 1)
+                 {
+                     std::string out;
+                     cell::teamwork::list_jobs(out, false, false, tw_sid);
+                     cell::sys::println("{}", out);
+                     return cmd_flow::handled;
+                 }
+                 cell::sys::error("usage: /teamworks [all | new | workflow [FILE] | run ID | run_bg ID | resume ID | stop ID | status ID");
+                 cell::sys::error("        | max [N] | rm ID | rm ID:worker");
+                 cell::sys::error("        | id:ID bg:none|prolegomena works:TEXT [provider:P] [model:M] [think:L] [reuse:JOB/worker] [writes:FILE,...] [rules:TEXT] [name:NAME]");
+                 cell::sys::error("        | history [JOB] [worker:W] [n:N] [all] | reports [JOB] [worker:W] [n:N] [full] [all] | report JOB:worker]");
+                 return cmd_flow::handled;
+             }},
+        };
         while (running)
         {
             std::string input;
