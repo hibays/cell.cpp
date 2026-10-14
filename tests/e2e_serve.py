@@ -38,6 +38,15 @@ class MockLLM(BaseHTTPRequestHandler):
     def log_message(self, *a):  # silence
         pass
 
+    def do_GET(self):
+        # the kernel probes GET {base}/models at startup / before a turn
+        payload = json.dumps({"data": [{"id": "mock-model"}], "object": "list"}).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
     def do_POST(self):
         n = int(self.headers.get("Content-Length", 0))
         body = json.loads(self.rfile.read(n) or b"{}")
