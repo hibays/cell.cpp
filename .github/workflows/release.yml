@@ -108,10 +108,10 @@ jobs:
       - name: Package
         run: |
           New-Item -ItemType Directory -Force -Path pkg/cell-${{ inputs.tag }} | Out-Null
-          Copy-Item build/bin/cell.exe pkg/cell-${{ inputs.tag }}/
-          Copy-Item README.md LICENSE pkg/cell-${{ inputs.tag }}/
-          Compress-Archive -Path pkg/cell-${{ inputs.tag }} `
-            -DestinationPath cell-${{ inputs.tag }}-windows-x64-msvc.zip
+          Copy-Item -Path build/bin/cell.exe -Destination pkg/cell-${{ inputs.tag }}/
+          Copy-Item -Path README.md -Destination pkg/cell-${{ inputs.tag }}/
+          Copy-Item -Path LICENSE -Destination pkg/cell-${{ inputs.tag }}/
+          Compress-Archive -Path pkg/cell-${{ inputs.tag }} -DestinationPath cell-${{ inputs.tag }}-windows-x64-msvc.zip
         if: matrix.name == 'windows-x64-msvc'
 
       - name: Package (posix)
