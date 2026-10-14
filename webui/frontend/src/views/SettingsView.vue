@@ -4,11 +4,13 @@ import { api } from '../lib/api'
 import { errorMessage } from '../lib/bridge'
 import { refreshConfig, store, toast } from '../store'
 import { applyPreset, fromKernelConfig, PRESETS, toKernelPatch } from '../lib/permissions'
+import AgentPanel from '../components/AgentPanel.vue'
 
 const emit = defineEmits<{ (e: 'close'): void }>()
 
 const open = ref(true)
 const busy = ref(false)
+const tab = ref<'settings' | 'agent'>('settings')
 
 // The fence is one choice, not two independent switches: a preset sets
 // sandbox_mode and autoallow together, so the UI never leaves them in a
@@ -50,11 +52,14 @@ async function patch(patch: Record<string, unknown>): Promise<void> {
   <div v-if="open" class="backdrop" @click.self="emit('close')">
     <div class="panel">
       <header>
-        <h3>设置</h3>
+        <div class="tabs">
+          <button class="tab" :class="{ on: tab === 'settings' }" @click="tab = 'settings'">设置</button>
+          <button class="tab" :class="{ on: tab === 'agent' }" @click="tab = 'agent'">Agent 能力</button>
+        </div>
         <button class="x" @click="emit('close')">✕</button>
       </header>
 
-      <section v-if="store.config">
+      <section v-if="tab === 'settings' && store.config">
         <label>思考深度</label>
         <div class="row">
           <button
@@ -132,6 +137,7 @@ async function patch(patch: Record<string, unknown>): Promise<void> {
 
         <p class="note">autoallow 仅在 full-access 下生效；开启后 exec 由模型自行判断是否放行。</p>
       </section>
+      <AgentPanel v-else-if="tab === 'agent'" />
     </div>
   </div>
 </template>
@@ -213,5 +219,27 @@ input[type='range'] {
   margin: 16px 0 0;
   color: var(--ink-faint);
   font-size: 12px;
+}
+
+.tabs {
+  display: flex;
+  gap: 4px;
+}
+
+.tab {
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--ink-faint);
+  border-radius: 8px;
+  padding: 3px 10px;
+  font: inherit;
+  font-size: 12.5px;
+  cursor: pointer;
+}
+
+.tab.on {
+  border-color: var(--line);
+  color: var(--ink);
+  background: var(--bg-elev-2);
 }
 </style>
