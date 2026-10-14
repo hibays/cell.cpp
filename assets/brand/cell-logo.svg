@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <!--
+    cell brand mark — "the agent cell"
+    * rounded container: the membrane (single-file boundary)
+    * 270° arc with an opening in the top-right: the cell takes in signals
+    * off-centre nucleus on the opening side: the agent, oriented outward
+    Reads at 16 px: ring + dot. Gradient matches the front-end accent
+    (#3b82f6 -> #8b5cf6) on the app's dark surface.
+  -->
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0b1220"/>
+      <stop offset="1" stop-color="#111b33"/>
+    </linearGradient>
+    <linearGradient id="ac" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#3b82f6"/>
+      <stop offset="1" stop-color="#8b5cf6"/>
+    </linearGradient>
+  </defs>
+  <rect width="512" height="512" rx="115" fill="url(#bg)"/>
+  <path d="M 256 96 A 160 160 0 1 0 416 256"
+        fill="none" stroke="url(#ac)" stroke-width="44" stroke-linecap="round"/>
+  <circle cx="300" cy="212" r="58" fill="url(#ac)"/>
+</svg>

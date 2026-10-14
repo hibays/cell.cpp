@@ -22,7 +22,22 @@ onMounted(async () => {
     <HeroShader />
     <div ref="content" class="content">
       <div class="brand">
-        <span class="dot" />
+        <svg class="mark" viewBox="0 0 512 512" aria-hidden="true">
+          <defs>
+            <linearGradient id="cell-mark-ac" x1="0" y1="0" x2="1" y2="1">
+              <stop offset="0" stop-color="#3b82f6" />
+              <stop offset="1" stop-color="#8b5cf6" />
+            </linearGradient>
+          </defs>
+          <path
+            d="M 256 96 A 160 160 0 1 0 416 256"
+            fill="none"
+            stroke="url(#cell-mark-ac)"
+            stroke-width="44"
+            stroke-linecap="round"
+          />
+          <circle cx="300" cy="212" r="58" fill="url(#cell-mark-ac)" />
+        </svg>
         <span class="name">cell</span>
         <span class="ver">{{ store.bootstrap?.version ?? '' }}</span>
       </div>
@@ -77,12 +92,10 @@ onMounted(async () => {
   font-family: var(--mono);
 }
 
-.dot {
-  width: 10px;
-  height: 10px;
-  border-radius: 50%;
-  background: var(--accent);
-  box-shadow: 0 0 18px var(--accent);
+.mark {
+  width: 26px;
+  height: 26px;
+  filter: drop-shadow(0 0 12px rgba(59, 130, 246, 0.45));
 }
 
 .name {
