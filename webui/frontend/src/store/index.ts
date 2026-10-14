@@ -3,6 +3,8 @@
 
 import { reactive } from 'vue'
 import { api } from '../lib/api'
+import { classifyError } from '../lib/errors'
+import { createFrameScheduler } from '../lib/scheduler'
 import type {
   Approval,
   Bootstrap,
@@ -281,6 +283,43 @@ export async function deleteSession(id: string): Promise<void> {
   }
 }
 
+// A turn can emit hundreds of deltas per second; assigning each straight into
+// reactive state means a render per token and a page that stops taking input.
+// Deltas are buffered and published at most once per frame window instead.
+let streamBuffer = ''
+const publishStream = createFrameScheduler(
+  () => {
+    if (!streamBuffer) return
+    state.streamText += streamBuffer
+    streamBuffer = ''
+  },
+  {
+    raf: (cb) => window.requestAnimationFrame(cb),
+    cancel: (h) => window.cancelAnimationFrame(h),
+  },
+)
+
+function onStreamEvent(e: TurnEvent): void {
+  if (e.type === 'output') {
+    streamBuffer += e.data.text
+    publishStream.request()
+  } else if (e.type === 'approval_request') {
+    onApproval(e.data)
+  } else if (e.type === 'error') {
+    // route on code, never on provider-dependent message text
+    const v = classifyError(e.data)
+    toast(v.retryable ? 'warn' : 'bad', v.title)
+  } else if (e.type === 'turn_start') {
+    state.streamModel = e.data.model
+  }
+}
+
+/** End a turn: drop any unpublished buffer, it is superseded by the transcript. */
+function endStream(): void {
+  publishStream.cancel()
+  streamBuffer = ''
+}
+
 export async function send(text: string): Promise<void> {
   const id = state.currentSession
   if (!id || !text.trim() || state.streaming) return
@@ -290,21 +329,18 @@ export async function send(text: string): Promise<void> {
   state.streamStartedAt = Date.now()
   state.lastInterrupted = false
   try {
-    await api.streamTurn(id, text, (e: TurnEvent) => {
-      if (e.type === 'output') state.streamText += e.data.text
-      else if (e.type === 'approval_request') onApproval(e.data)
-      else if (e.type === 'error') toast('bad', e.data.message)
-      else if (e.type === 'turn_start') state.streamModel = e.data.model
-    })
+    await api.streamTurn(id, text, onStreamEvent)
   } catch (e) {
-    if (String(e).includes('aborted')) {
+    const v = classifyError(e)
+    if (v.code === 'aborted') {
       state.lastInterrupted = true
     } else {
-      toast('bad', `turn failed: ${String(e)}`)
+      toast(v.retryable ? 'warn' : 'bad', `${v.title} — ${v.hint}`)
     }
   } finally {
     // the streamed text is already persisted server-side: reload the transcript
     // so tool calls, reasoning and usage all show up in their structured form
+    endStream()
     const { messages } = await api.sessionMessages(id).catch(() => ({ messages: [] }))
     state.messages = normalizeTranscript(messages)
     state.streaming = false
@@ -332,14 +368,12 @@ export async function resume(): Promise<void> {
   state.streamStartedAt = Date.now()
   state.lastInterrupted = false
   try {
-    await api.streamResume(id, (e: TurnEvent) => {
-      if (e.type === 'output') state.streamText += e.data.text
-      else if (e.type === 'approval_request') onApproval(e.data)
-      else if (e.type === 'error') toast('bad', e.data.message)
-    })
+    await api.streamResume(id, onStreamEvent)
   } catch (e) {
-    toast('bad', `resume failed: ${String(e)}`)
+    const v = classifyError(e)
+    toast(v.retryable ? 'warn' : 'bad', `${v.title} — ${v.hint}`)
   } finally {
+    endStream()
     const { messages } = await api.sessionMessages(id).catch(() => ({ messages: [] }))
     state.messages = normalizeTranscript(messages)
     state.streaming = false
