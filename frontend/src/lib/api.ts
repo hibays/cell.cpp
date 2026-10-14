@@ -187,6 +187,7 @@ export class ApiClient {
     const decoder = new TextDecoder()
     let buf = ''
     for (;;) {
+      // oxlint-disable-next-line no-await-in-loop -- stream frames arrive in order
       const { done, value } = await reader.read()
       if (done) break
       buf += decoder.decode(value, { stream: true })
@@ -217,7 +218,8 @@ export class ApiClient {
       const decoder = new TextDecoder()
       let buf = ''
       for (;;) {
-        const { done, value } = await reader.read()
+        // oxlint-disable-next-line no-await-in-loop -- stream frames arrive in order
+      const { done, value } = await reader.read()
         if (done) break
         buf += decoder.decode(value, { stream: true })
         let idx: number

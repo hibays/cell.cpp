@@ -1,7 +1,7 @@
 // Animation helpers (GSAP). Kept in one module so the animation library can be
 // swapped (anime.js / osmo) without touching the components.
 
-import gsap from 'gsap'
+import { gsap } from 'gsap'
 
 /** Staggered entrance for landing text blocks. */
 export function revealStagger(targets: string | Element[], delay = 0): void {
@@ -29,4 +29,3 @@ export function slideIn(element: Element): void {
   gsap.from(element, { y: 10, opacity: 0, duration: 0.28, ease: 'power2.out' })
 }
 
-export { gsap }
