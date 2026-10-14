@@ -75,6 +75,11 @@ endif()
 
 if(MSVC)
     string(APPEND CMAKE_CXX_FLAGS " ${CELL_CXX_FLAG}")
+    # make the optimisation level visible in the configure log — the MSVC CI job
+    # spends ~15 min in the self-test (vs ~25 s with MinGW) and "is Release even
+    # on?" is the first question that comes up every time.
+    message(STATUS "MSVC base flags   : ${CMAKE_CXX_FLAGS}")
+    message(STATUS "MSVC Release flags: ${CMAKE_CXX_FLAGS_RELEASE}")
 elseif(CMAKE_VERSION VERSION_GREATER_EQUAL 3.30)
     set(CMAKE_CXX_STANDARD ${CELL_CXX_STANDARD})
     set(CMAKE_CXX_STANDARD_REQUIRED ON)
