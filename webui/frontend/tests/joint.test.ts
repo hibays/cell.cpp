@@ -207,5 +207,21 @@ describe('built front-end embeds the native bridge', () => {
     const header = readFileSync(`${outDir}/cellui_web.h`, 'utf8')
     expect(header).toContain('CELLUI_HAVE_EMBEDDED_WEB')
     expect(header).toContain('/webui.js')
+
+    // The payload must be chunked. MSVC caps any single literal at ~16380 bytes
+    // (C2026 "string too big, trailing characters truncated"), so emitting the
+    // ~400 KiB bundle as one raw string compiles on GCC/Clang and fails only in
+    // MSVC builds — exactly how the v0.1.1 release job first broke.
+    const chunks = [...header.matchAll(/R"(cellui\w*)\(([\s\S]*?)\)\1"/g)].map((m) => m[2])
+    expect(chunks.length).toBeGreaterThan(1)
+    for (const c of chunks) expect(c.length).toBeLessThan(16380)
+
+    // Lossless round-trip: joining the chunks must equal the reserved length.
+    const reserved = Number(/out\.reserve\((\d+)\)/.exec(header)?.[1])
+    expect(Number.isFinite(reserved)).toBe(true)
+    const joined = chunks.join('')
+    expect(joined.length).toBe(reserved)
+    expect(joined).toContain('/webui.js')
+    expect(joined.trimEnd().endsWith('</html>')).toBe(true)
   })
 })
