@@ -67,6 +67,64 @@ namespace cell
     };
 }
 #endif
+
+// <thread> — libc++ has no std::jthread either. cell.cpp never uses stop
+// tokens (its workers poll condition variables with their own stop flags), so
+// a plain thread wrapper with the jthread destructor semantics (join on
+// destruction / reassignment) covers every call site.
+#if !defined(CELL_FORCE_FALLBACK_JTHREAD) && \
+    defined(__cpp_lib_jthread) && __cpp_lib_jthread >= 201911L
+#include <thread>
+namespace cell
+{
+    using jthread = std::jthread;
+}
+#else
+#include <thread>
+namespace cell
+{
+    class jthread final
+    {
+        std::thread t_{};
+
+      public:
+        jthread() noexcept = default;
+        template <class F, class... A>
+            requires(!std::is_same_v<std::remove_cvref_t<F>, jthread>)
+        explicit jthread(F &&f, A &&...a)
+            : t_(std::forward<F>(f), std::forward<A>(a)...)
+        {
+        }
+        jthread(jthread &&other) noexcept = default;
+        jthread &operator=(jthread &&other) noexcept
+        {
+            if (this != &other)
+            {
+                if (t_.joinable())
+                    t_.join();
+                t_ = std::move(other.t_);
+            }
+            return *this;
+        }
+        jthread(const jthread &) = delete;
+        jthread &operator=(const jthread &) = delete;
+        ~jthread()
+        {
+            if (t_.joinable())
+                t_.join();
+        }
+
+        bool joinable() const noexcept { return t_.joinable(); }
+        void join()
+        {
+            if (t_.joinable())
+                t_.join();
+        }
+        std::thread::id get_id() const noexcept { return t_.get_id(); }
+        void swap(jthread &other) noexcept { t_.swap(other.t_); }
+    };
+}
+#endif
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -525,7 +583,7 @@ namespace cell
             // flight (its "durability barrier" was not one).
             size_t in_flight = 0;
             bool stopping = false;
-            std::jthread worker;
+            cell::jthread worker;
 
             static void write_file(const job &j)
             {
@@ -560,7 +618,7 @@ namespace cell
         public:
             file_writer()
             {
-                worker = std::jthread([this]
+                worker = cell::jthread([this]
                                       { run(); });
             }
             ~file_writer()
@@ -5931,7 +5989,7 @@ namespace cell
             size_t active = 0; // submitted jobs not yet finished
             size_t max_workers = 16;
             bool stopping = false;
-            std::vector<std::jthread> workers;
+            std::vector<cell::jthread> workers;
 
             void spawn_locked()
             {
@@ -14940,9 +14998,9 @@ details{break-inside:avoid}
             static bool s = false;
             return s;
         }
-        static std::jthread &bg_thread()
+        static cell::jthread &bg_thread()
         {
-            static std::jthread t;
+            static cell::jthread t;
             return t;
         }
         static void bg_runner()
@@ -15046,7 +15104,7 @@ details{break-inside:avoid}
             {
                 std::lock_guard<std::mutex> lk(bg_mutex());
                 if (!bg_thread().joinable())
-                    bg_thread() = std::jthread(bg_runner);
+                    bg_thread() = cell::jthread(bg_runner);
                 bg_queue().push_back({job_id, ref.store, snapshot, rt, start_stage});
             }
             bg_cv().notify_all();
