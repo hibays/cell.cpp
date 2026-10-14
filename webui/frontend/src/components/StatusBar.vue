@@ -38,7 +38,14 @@ const pillText = computed(() => {
   return '内核离线'
 })
 
+// A slow kernel must not stack health requests: the interval, the retry button
+// and a manual poll would otherwise all be in flight at once, which is exactly
+// when the kernel is least able to answer.
+let polling = false
+
 async function poll(): Promise<void> {
+  if (polling) return
+  polling = true
   try {
     health.value = (await api.health()) as Health
     conn.markConnected()
@@ -49,18 +56,25 @@ async function poll(): Promise<void> {
     health.value = null
     failure.value = view
     conn.markDisconnected(view.title)
+  } finally {
+    polling = false
   }
 }
 
+let unsubscribe: (() => void) | null = null
+
 onMounted(() => {
-  conn.onStateChange((s) => {
+  unsubscribe = conn.onStateChange((s) => {
     connState.value = s
   })
   void poll()
   timer = window.setInterval(() => void poll(), 5000)
 })
 
-onUnmounted(() => window.clearInterval(timer))
+onUnmounted(() => {
+  window.clearInterval(timer)
+  unsubscribe?.()
+})
 </script>
 
 <template>
