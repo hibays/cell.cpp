@@ -49,6 +49,9 @@ class MockLLM(BaseHTTPRequestHandler):
         # the kernel always requests stream=true — answer in OpenAI SSE chunks
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
+        # close-delimited body: without this the macOS curl build treats the
+        # missing length as a broken response ("connection closed")
+        self.send_header("Connection", "close")
         self.end_headers()
         first = json.dumps(
             {"choices": [{"delta": {"role": "assistant", "content": text}}]}
