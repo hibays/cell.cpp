@@ -128,8 +128,16 @@ def run_once(attempt: int) -> bool:
     port = free_port()
     env["CELL_SERVE_PORT"] = str(port)  # not used by the kernel; --port is explicit
     err_file = open(root / "kernel-stderr.log", "wb")
+    argv = [str(BIN), "--serve", "--port", str(port), "--host", "127.0.0.1"]
+    if sys.platform == "darwin" and os.environ.get("CELL_LLDB") == "1":
+        # the known macOS SIGABRT (unreachable-provider turn): wrap the kernel
+        # in lldb batch so the abort leaves a full backtrace in the log
+        argv = ["lldb", "--batch", "-o", "run",
+                "-k", "thread backtrace all", "-k", "detach", "-k", "quit",
+                "--", str(BIN), "--serve", "--port", str(port), "--host", "127.0.0.1"]
+        print("  running under lldb (CELL_LLDB=1)")
     proc = subprocess.Popen(
-        [str(BIN), "--serve", "--port", str(port), "--host", "127.0.0.1"],
+        argv,
         env=env,
         cwd=str(root),
         stdout=subprocess.DEVNULL,

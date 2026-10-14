@@ -66,7 +66,18 @@ jobs:
           vcpkgDirectory: ${{ github.workspace }}/vcpkg
           vcpkgGitCommitId: 3dd44b17ecb69a268d0b04daa9d0748f3ea9b587
 
-      - name: Configure
+      - name: Configure (Windows MSVC — runner-bundled vcpkg, same as CI)
+        if: runner.os == 'Windows'
+        run: >
+          cmake -S . -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
+          -DCELL_BUILD_CLI=ON
+          -DCELL_BUILD_SHARED=OFF
+          -DCELL_BUILD_WEBUI=OFF
+
+      - name: Configure (POSIX)
+        if: runner.os != 'Windows'
         run: >
           cmake -S . -B build -G Ninja
           -DCMAKE_BUILD_TYPE=Release
@@ -80,6 +91,8 @@ jobs:
 
       - name: Test (the self-test must stay fast on every platform)
         run: ctest --test-dir build --output-on-failure
+        env:
+          CELL_LLDB: ${{ runner.os == 'macOS' && '1' || '0' }}
 
       - name: Package
         run: |
