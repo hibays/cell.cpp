@@ -415,6 +415,13 @@ namespace cellui
         // NOTE: do NOT call webui_set_hide() — it starts the window in hidden
         // mode and the WebView would never become visible.
         // no fixed port: if the port is busy, webui would fail to show the window
+        //
+        // webui_show_wv() waits for the page to open its WebSocket before it
+        // returns. WebUI's default budget is 15 s, which a cold WebView2 start
+        // (first run creates the browser environment) plus a ~400 KB embedded
+        // bundle can easily exceed — the window then appears *after* webui has
+        // already given up and reported failure. Wait a full minute instead.
+        webui_set_timeout(60);
 
         webui_bind(w, "cell_hello", bind_hello);
         webui_bind(w, "cell_bootstrap", bind_bootstrap);
@@ -438,7 +445,10 @@ namespace cellui
         if (force_browser || !webui_show_wv(w, html.c_str()))
         {
             std::fprintf(stderr,
-                         "cellui: WebView2 window failed to open (is the WebView2 runtime installed?).\n"
+                         "cellui: the WebView2 window did not open within 60s.\n"
+                         "        Likely causes: the WebView2 runtime is not installed, %%TEMP%% is\n"
+                         "        not writable (WebView2 needs a user-data folder) or the disk is full,\n"
+                         "        or there is no interactive desktop session.\n"
                          "        Trying the default browser instead…\n");
             if (!webui_show_browser(w, html.c_str(), AnyBrowser))
             {
