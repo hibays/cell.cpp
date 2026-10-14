@@ -182,6 +182,27 @@ namespace cellui
         webui_return_string(e, "cell native bridge ok");
     }
 
+    // All-events hook (bound to the empty element). Without it the shell is
+    // deaf: it never learns when the UI attached, detached or navigated, so a
+    // closed window looks exactly like a hung one.
+    static void bind_events(webui_event_t *e)
+    {
+        switch (e->event_type)
+        {
+            case WEBUI_EVENT_CONNECTED:
+                std::fprintf(stderr, "cellui: ui connected (client %zu)\n", e->client_id);
+                break;
+            case WEBUI_EVENT_DISCONNECTED:
+                std::fprintf(stderr, "cellui: ui disconnected (client %zu)\n", e->client_id);
+                break;
+            case WEBUI_EVENT_NAVIGATION:
+                std::fprintf(stderr, "cellui: navigated to %s\n", e->element);
+                break;
+            default:
+                break; // mouse clicks / callbacks are handled by their binds
+        }
+    }
+
     static void bind_bootstrap(webui_event_t *e)
     {
         // Everything the front-end needs to talk to the in-process agent.
@@ -336,7 +357,7 @@ namespace cellui
         int port = 0; // 0 = let the OS pick; the real port lands in server.json
         std::string host = "127.0.0.1";
         unsigned width = 1280, height = 860;
-        bool force_browser = false;
+        bool use_webview = false;
 
         // cellui accepts a small flag set of its own; everything else is passed
         // through to the agent CLI.
@@ -372,10 +393,12 @@ namespace cellui
                 }
             }
             else if (a == "--browser")
-                force_browser = true;
+                use_webview = true;
             else if (a == "--help" || a == "-h")
             {
-                std::printf("usage: cellui [--size WxH] [--port N] [--host ADDR] [--no-serve] [--browser]\n");
+                std::printf("usage: cellui [--size WxH] [--port N] [--host ADDR] [--no-serve] [--webview]\n"
+                            "  default opens an app-mode browser window (DSHL-proven);\n"
+                            "  --webview tries the WebView2 backend instead\n");
                 return 0;
             }
             else
@@ -409,19 +432,28 @@ namespace cellui
         }
 
         // ---- the window ------------------------------------------------------
+        // Window strategy follows the DSHL launcher's hard-won invariant
+        // (G:/Projects/dsh-launcher, src/ui/browser.rs): the only reliable
+        // surface webui gives you is a BROWSER APP WINDOW — its WebView2
+        // backend drops show() calls depending on how the process was started
+        // (console vs detached), so it must never be the default. `--webview`
+        // keeps it reachable for experiments.
+        //
+        // Ground truth for "the UI is up" is a visible top-level window, which
+        // we get for free by watching the process' own window (see the wait
+        // loop below); bare return codes from webui_show_* are hints only.
         size_t w = webui_new_window();
         webui_set_runtime(w, None); // no Deno/Node/Bun needed
         webui_set_size(w, width, height);
         // NOTE: do NOT call webui_set_hide() — it starts the window in hidden
-        // mode and the WebView would never become visible.
-        // no fixed port: if the port is busy, webui would fail to show the window
-        //
-        // webui_show_wv() waits for the page to open its WebSocket before it
-        // returns. WebUI's default budget is 15 s, which a cold WebView2 start
-        // (first run creates the browser environment) plus a ~400 KB embedded
-        // bundle can easily exceed — the window then appears *after* webui has
-        // already given up and reported failure. Wait a full minute instead.
-        webui_set_timeout(60);
+        // mode and the window would never become visible.
+        // no fixed port: if the port is busy, webui would fail to show it
+        webui_set_timeout(60); // cold browser/WebView start needs more than 15s
+
+        // Hook the full event stream (connected / disconnected / navigation /
+        // callback) so the shell reacts to the UI instead of only answering
+        // calls. Binding to the empty element installs the all-events handler.
+        webui_bind(w, "", bind_events);
 
         webui_bind(w, "cell_hello", bind_hello);
         webui_bind(w, "cell_bootstrap", bind_bootstrap);
@@ -439,27 +471,38 @@ namespace cellui
         const std::string html = std::string{kFallbackHtml};
 #endif
 
-        // WebView2 first — cellui is a *native window* shell, a browser tab is
-        // only the last-resort fallback (webui would otherwise happily pick
-        // Edge/Chrome in app mode and never touch the WebView).
-        if (force_browser || !webui_show_wv(w, html.c_str()))
+        bool shown = false;
+        if (use_webview)
+        {
+            shown = webui_show_wv(w, html.c_str());
+            if (!shown)
+                std::fprintf(stderr,
+                             "cellui: WebView2 did not open (runtime missing, %%TEMP%% unwritable,\n"
+                             "        full disk, or no interactive desktop session) — falling back…\n");
+        }
+        if (!shown)
+        {
+            // app-mode browser window: the path DSHL ships on
+            shown = webui_show_browser(w, html.c_str(), AnyBrowser);
+        }
+        if (!shown && !use_webview)
+        {
+            // last resort, still worth one try before giving up
+            shown = webui_show_wv(w, html.c_str());
+        }
+        if (!shown)
         {
             std::fprintf(stderr,
-                         "cellui: the WebView2 window did not open within 60s.\n"
-                         "        Likely causes: the WebView2 runtime is not installed, %%TEMP%% is\n"
-                         "        not writable (WebView2 needs a user-data folder) or the disk is full,\n"
-                         "        or there is no interactive desktop session.\n"
-                         "        Trying the default browser instead…\n");
-            if (!webui_show_browser(w, html.c_str(), AnyBrowser))
-            {
-                std::fprintf(stderr,
-                             "cellui: failed to open a window. Start 'cell --serve' from the same "
-                             "directory and open the printed URL.\n");
-                return 2;
-            }
+                         "cellui: no window could be opened. Start 'cell --serve' from the same\n"
+                         "        directory and open the printed URL instead.\n");
+            if (serve_thread.joinable())
+                serve_thread.join();
+            return 2;
         }
 
         webui_wait(); // blocks until the window closes
+        webui_exit(); // canonical teardown: stop servers, wake webui_wait()
+        webui_clean();
 
         if (serve)
         {
