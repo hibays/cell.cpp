@@ -59,6 +59,15 @@
 #include <io.h>
 #include <windows.h>
 #include <aclapi.h>
+// NOMINMAX above stops windows.h from defining them, but other SDK headers
+// (and some third-party ones) re-introduce min/max on their own; cell.cpp is
+// std::min/std::max throughout, so drop them for good.
+#ifdef min
+#undef min
+#endif
+#ifdef max
+#undef max
+#endif
 #else
 #include <unistd.h>
 #include <sys/wait.h>
