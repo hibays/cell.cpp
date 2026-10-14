@@ -547,7 +547,9 @@ namespace cellui
         webui_bind(w, "cell_notify", guarded<bind_notify>);
 
 #ifdef CELLUI_HAVE_EMBEDDED_WEB
-        std::string html = std::string{cellui_web_html};
+        // the payload arrives as chunks (MSVC caps any single literal at
+        // ~16380 bytes); cellui_web_html() stitches them back together
+        std::string html = cellui_web_html();
 #else
         std::string html = std::string{kFallbackHtml};
 #endif
