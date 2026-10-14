@@ -127,14 +127,13 @@ jobs:
       - name: Build
         run: cmake --build build --config Release --parallel
 
-      # MSVC's standard library makes the self-test roughly 30x slower than the
-      # MinGW one on the same runner (842 tests: ~15 min vs ~25 s), so this job
-      # gets a long leash. -V streams the self-test's own log lines so a
-      # platform-specific stall shows up instead of only "Timeout".
+      # -V streams the self-test's own log lines so a platform-specific stall
+      # shows up in the log instead of only "Timeout" (the self-test watchdog
+      # prints the exact test that stalls).
       - name: Test
         shell: pwsh
-        timeout-minutes: 45
-        run: ctest --test-dir build -C Release --output-on-failure --timeout 2400 -V
+        timeout-minutes: 15
+        run: ctest --test-dir build -C Release --output-on-failure --timeout 900 -V
 
   # ---------------------------------------------------------------------------
   windows-msys2:

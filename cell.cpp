@@ -18627,7 +18627,14 @@ static int run_selftest()
             std::atomic<int> merged{0};
             std::thread merger([&]
                                {
-                                   for (int i = 0; keep_going.load(); i++)
+                                   // BOUNDED: every iteration is a real atomic
+                                   // store (temp + flush + rename). Unbounded,
+                                   // this loop hammers the disk until the main
+                                   // thread finishes its 150 jobs — seconds on
+                                   // Linux/MinGW, ~170s on a slow MSVC runner.
+                                   // 500 rounds is far more than enough to
+                                   // cover the main thread's window.
+                                   for (int i = 0; i < 500 && keep_going.load(); i++)
                                    {
                                        tw::mutate_store_at(tw::store_path("current"), [&](nlohmann::json &st)
                                                            {
