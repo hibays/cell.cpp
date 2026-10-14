@@ -45,6 +45,11 @@
 #include <cerrno>
 #include <cstdint>
 #ifdef _WIN32
+// windows.h defines min/max as macros unless asked not to; cell.cpp uses
+// std::min/std::max (and std::clamp) everywhere, so keep the macros out
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 // winsock2 must precede windows.h (windows.h would otherwise pull in the
 // incompatible winsock 1.1 headers)
 #include <winsock2.h>

@@ -211,6 +211,25 @@ bin/cell --serve --port 8737
 bin/cell --selftest
 ```
 
+### Desktop app (cellui)
+
+`cellui` hosts the same agent in a native window — WebUI + WebView2 on Windows
+(loader linked statically), with a Vue front-end embedded in the binary and a
+JS↔C++ bridge for shell integration and the HTML exports:
+
+```bash
+# build the front-end once (bun), then the shell
+bun --cwd frontend install && bun --cwd frontend run build
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release && cmake --build build
+
+build/bin/cellui            # one portable binary, no runtime DLLs to ship
+```
+
+The front-end dev loop runs in a browser (`bun --cwd frontend run dev`); see
+[frontend/README.md](frontend/README.md) for the UI stack and
+[docs/BUILDING.md](docs/BUILDING.md) §7 for the bridge/export API and the
+static-WebView2 details.
+
 Inside the REPL, providers are managed without restarting:
 
 ```
