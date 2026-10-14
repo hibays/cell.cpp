@@ -34,17 +34,14 @@ jobs:
         include:
           - name: windows-x64-msvc
             os: windows-2022
-            shell: pwsh
             cmake_extra: -DCELL_BUILD_STATIC=ON
             pkg: zip
           - name: linux-x64-gcc14
             os: ubuntu-24.04
-            shell: bash
             cmake_extra: -DCMAKE_CXX_COMPILER=g++-14 -DCELL_BUILD_STATIC=ON
             pkg: tar
           - name: macos-arm64-appleclang
             os: macos-15
-            shell: bash
             cmake_extra: -DCELL_BUILD_STATIC=ON
             pkg: tar
     steps:
@@ -70,7 +67,6 @@ jobs:
           vcpkgGitCommitId: 3dd44b17ecb69a268d0b04daa9d0748f3ea9b587
 
       - name: Configure
-        shell: ${{ matrix.shell }}
         run: >
           cmake -S . -B build -G Ninja
           -DCMAKE_BUILD_TYPE=Release
@@ -80,15 +76,12 @@ jobs:
           ${{ matrix.cmake_extra }}
 
       - name: Build
-        shell: ${{ matrix.shell }}
         run: cmake --build build --parallel
 
       - name: Test (the self-test must stay fast on every platform)
-        shell: ${{ matrix.shell }}
         run: ctest --test-dir build --output-on-failure
 
       - name: Package
-        shell: ${{ matrix.shell }}
         run: |
           New-Item -ItemType Directory -Force -Path pkg/cell-${{ inputs.tag }} | Out-Null
           Copy-Item build/bin/cell.exe pkg/cell-${{ inputs.tag }}/
@@ -99,7 +92,6 @@ jobs:
 
       - name: Package (posix)
         if: matrix.name != 'windows-x64-msvc'
-        shell: ${{ matrix.shell }}
         run: |
           mkdir -p pkg/cell-${{ inputs.tag }}
           cp build/bin/cell pkg/cell-${{ inputs.tag }}/
