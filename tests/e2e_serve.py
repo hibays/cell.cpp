@@ -118,12 +118,13 @@ def run_once(attempt: int) -> bool:
 
     port = free_port()
     env["CELL_SERVE_PORT"] = str(port)  # not used by the kernel; --port is explicit
+    err_file = open(root / "kernel-stderr.log", "wb")
     proc = subprocess.Popen(
         [str(BIN), "--serve", "--port", str(port), "--host", "127.0.0.1"],
         env=env,
         cwd=str(root),
         stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        stderr=err_file,
     )
     try:
         print(f"attempt {attempt}: CELL_ROOT={root}")
@@ -161,12 +162,20 @@ def run_once(attempt: int) -> bool:
         api(base, token, "POST", "/v1/shutdown")
         proc.wait(timeout=15)
         return True
-    except Exception:
+    except Exception as e:
+        print(f"  failed while alive={proc.poll() is None} rc={proc.poll()}")
+        try:
+            err_file.flush()
+            tail = (root / "kernel-stderr.log").read_text(errors="replace")[-1500:]
+            print("  --- kernel stderr tail ---\n" + tail)
+        except Exception as e2:
+            print(f"  (no kernel stderr: {e2})")
         if proc.poll() is None:
             proc.kill()
         raise
     finally:
         llm.shutdown()
+        err_file.close()
 
 
 def main() -> int:
