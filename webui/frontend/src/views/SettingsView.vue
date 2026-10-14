@@ -1,13 +1,36 @@
 <script setup lang="ts">
-import { ref } from 'vue'
+import { computed, ref } from 'vue'
 import { api } from '../lib/api'
 import { errorMessage } from '../lib/bridge'
 import { refreshConfig, store, toast } from '../store'
+import { applyPreset, fromKernelConfig, PRESETS, toKernelPatch } from '../lib/permissions'
 
 const emit = defineEmits<{ (e: 'close'): void }>()
 
 const open = ref(true)
 const busy = ref(false)
+
+// The fence is one choice, not two independent switches: a preset sets
+// sandbox_mode and autoallow together, so the UI never leaves them in a
+// combination the kernel will not honour (autoallow outside full-access).
+const fence = computed(() =>
+  fromKernelConfig({
+    sandbox_mode: store.config?.sandbox_mode,
+    autoallow: store.config?.autoallow,
+  }),
+)
+
+const presetIds = ['safe', 'standard', 'auto'] as const
+
+const fenceNote = computed(() =>
+  fence.value.preset === 'custom'
+    ? `自定义组合：${fence.value.sandbox} + ${fence.value.approval === 'never' ? 'autoallow' : '逐个确认'}`
+    : PRESETS[fence.value.preset as 'safe' | 'standard' | 'auto'].description,
+)
+
+function applyFence(id: (typeof presetIds)[number]): void {
+  void patch(toKernelPatch(applyPreset(id)))
+}
 
 async function patch(patch: Record<string, unknown>): Promise<void> {
   busy.value = true
@@ -44,6 +67,21 @@ async function patch(patch: Record<string, unknown>): Promise<void> {
             {{ lvl }}
           </button>
         </div>
+
+        <label>围栏预设</label>
+        <div class="row">
+          <button
+            v-for="id in presetIds"
+            :key="id"
+            class="seg"
+            :class="{ on: fence.preset === id }"
+            :title="PRESETS[id].description"
+            @click="applyFence(id)"
+          >
+            {{ PRESETS[id].name }}
+          </button>
+        </div>
+        <p class="note">{{ fenceNote }}</p>
 
         <label>沙箱模式</label>
         <div class="row">
