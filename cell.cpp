@@ -7,6 +7,7 @@
 #include <unordered_set>
 #include <vector>
 #include <list>
+#include <deque>
 #include <memory>
 #include <regex>
 #include <utility>
