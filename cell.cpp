@@ -17000,6 +17000,34 @@ namespace selftest
         std::vector<std::pair<std::string, std::function<void()>>> tests;
     };
 
+    static std::atomic<bool> &selftest_watchdog_stop()
+    {
+        static std::atomic<bool> stop{false};
+        return stop;
+    }
+    static std::atomic<int> &selftest_progress()
+    {
+        static std::atomic<int> p{0};
+        return p;
+    }
+    static std::atomic<int> &selftest_progress_line()
+    {
+        static std::atomic<int> l{0};
+        return l;
+    }
+    static std::atomic<long long> &selftest_started()
+    {
+        static std::atomic<long long> t{0}; // steady_clock ms since epoch-ish
+        return t;
+    }
+    static void selftest_start_clock()
+    {
+        selftest_started().store(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count());
+    }
+
     // Test runner with statistics
     class TestRunner
     {
@@ -17010,9 +17038,53 @@ namespace selftest
 
     public:
         // Enhanced expect macro with source location
+        // ---- stall watchdog -------------------------------------------------
+        // The self-test must finish in seconds; when a platform takes minutes
+        // (MSVC did: ~30x MinGW) something specific is pathological, and "add
+        // timeout" hides it instead of fixing it. expect() records what just
+        // completed; a watchdog prints progress every 2s once the run passes
+        // the 30s mark, so the log pinpoints the exact test that stalls — its
+        // argument expression is whatever is between the last two counters.
+        std::atomic<int> progress{0};
+        std::atomic<int> progress_line{0};
+        std::atomic<bool> watchdog_stop{false};
+
+        void start_watchdog()
+        {
+            std::thread(
+                []
+                {
+                    const auto start = std::chrono::steady_clock::now();
+                    int last_seen = -1;
+                    while (!selftest_watchdog_stop().load(std::memory_order_relaxed))
+                    {
+                        std::this_thread::sleep_for(std::chrono::seconds(2));
+                        const auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+                                                 std::chrono::steady_clock::now() - start)
+                                                 .count();
+                        if (elapsed < 30) // healthy runs stay silent
+                            continue;
+                        const int n = selftest_progress().load(std::memory_order_relaxed);
+                        const int line = selftest_progress_line().load(std::memory_order_relaxed);
+                        std::fprintf(stderr, "[perf] t=%llds tests=%d (after line %d)\n",
+                                     (long long)elapsed, n, line);
+                        std::fflush(stderr);
+                        if (n == last_seen)
+                            std::fprintf(stderr, "[perf] STALLED on test #%d — the slow "
+                                                 "expression is the next R.expect in the source\n",
+                                         n + 1);
+                        last_seen = n;
+                    }
+                })
+                .detach();
+        }
+
+
         void expect(bool cond, const char *what,
                     std::source_location loc = std::source_location::current())
         {
+            selftest_progress().store(++progress, std::memory_order_relaxed);
+            selftest_progress_line().store((int)loc.line(), std::memory_order_relaxed);
             if (!cond)
             {
                 std::cerr << "  FAIL: " << what
@@ -17090,10 +17162,16 @@ namespace selftest
         // Print summary
         void print_summary()
         {
+            selftest_watchdog_stop().store(true, std::memory_order_relaxed);
+            const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                    std::chrono::steady_clock::now().time_since_epoch())
+                                    .count();
+            const auto elapsed = now_ms - selftest_started().load();
             std::cout << std::endl;
             if (total_failed == 0)
             {
-                std::cout << "selftest OK (" << total_passed << " tests passed)" << std::endl;
+                std::cout << "selftest OK (" << total_passed << " tests passed, "
+                          << elapsed << " ms)" << std::endl;
             }
             else
             {
@@ -17146,6 +17224,8 @@ static int run_selftest()
 {
     selftest::SandboxGuard guard;
     selftest::TestRunner R;
+    selftest::selftest_start_clock();
+    R.start_watchdog();
 
     std::string out;
     R.expect(cell::box::is_high_risk("rm -rf /"), "is_high_risk catches rm -rf");
