@@ -79,10 +79,22 @@ jobs:
           -DCELL_BUILD_WEBUI=OFF
           ${{ matrix.cmake_extra }}
 
-      - name: Build
+      - name: Build (Windows MSVC)
+        if: runner.os == 'Windows'
+        run: cmake --build build --config Release --parallel
+
+      - name: Build (POSIX)
+        if: runner.os != 'Windows'
         run: cmake --build build --parallel
 
-      - name: Test (the self-test must stay fast on every platform)
+      - name: Test (Windows MSVC)
+        if: runner.os == 'Windows'
+        run: ctest --test-dir build -C Release --output-on-failure
+        env:
+          CELL_LLDB: ${{ runner.os == 'macOS' && '1' || '0' }}
+
+      - name: Test (POSIX)
+        if: runner.os != 'Windows'
         run: ctest --test-dir build --output-on-failure
         env:
           CELL_LLDB: ${{ runner.os == 'macOS' && '1' || '0' }}

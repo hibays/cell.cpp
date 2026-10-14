@@ -183,7 +183,7 @@ def run_once(attempt: int) -> bool:
         print(f"  failed while alive={proc.poll() is None} rc={proc.poll()}")
         try:
             err_file.flush()
-            tail = (root / "kernel-stderr.log").read_text(errors="replace")[-1500:]
+            tail = (root / "kernel-stderr.log").read_text(errors="replace")[-8000:]
             print("  --- kernel stderr tail ---\n" + tail)
         except Exception as e2:
             print(f"  (no kernel stderr: {e2})")
