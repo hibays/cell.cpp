@@ -114,8 +114,13 @@ jobs:
       - name: Build
         run: cmake --build build --config Release --parallel
 
+      # -V streams the self-test's own log lines, so a platform-specific stall
+      # shows up in the job log instead of only "Timeout" (the MSVC build is
+      # noticeably slower than the MinGW one; 900s of head-room).
       - name: Test
-        run: ctest --test-dir build -C Release --output-on-failure
+        shell: pwsh
+        timeout-minutes: 25
+        run: ctest --test-dir build -C Release --output-on-failure --timeout 900 -V
 
   # ---------------------------------------------------------------------------
   windows-msys2:
