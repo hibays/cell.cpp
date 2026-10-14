@@ -15837,13 +15837,17 @@ details{break-inside:avoid}
                 responder res;
                 res.plain = [&](int status, const std::string &ctype, const std::string &body) -> bool
                 {
-                    std::string h = std::format("HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nCache-Control: no-store\r\n{}\r\nConnection: close\r\n\r\n",
+                    // kCors already ends each line with CRLF, so it must be
+                    // followed directly by the next header — an extra "\r\n"
+                    // here ends the header block early and leaks
+                    // "Connection: close" into the body (breaks every response).
+                    std::string h = std::format("HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nCache-Control: no-store\r\n{}Connection: close\r\n\r\n",
                                                 status, status_text(status), ctype, body.size(), kCors);
                     return send_all(c, h.data(), h.size()) && (body.empty() || send_all(c, body.data(), body.size()));
                 };
                 res.stream_open = [&](const std::string &ctype, int status) -> bool
                 {
-                    std::string h = std::format("HTTP/1.1 {} {}\r\nContent-Type: {}\r\nCache-Control: no-store\r\n{}\r\nConnection: close\r\nX-Accel-Buffering: no\r\n\r\n",
+                    std::string h = std::format("HTTP/1.1 {} {}\r\nContent-Type: {}\r\nCache-Control: no-store\r\n{}Connection: close\r\nX-Accel-Buffering: no\r\n\r\n",
                                                 status, status_text(status), ctype, kCors);
                     return send_all(c, h.data(), h.size());
                 };
