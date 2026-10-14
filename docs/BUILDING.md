@@ -448,6 +448,16 @@ against the *static* libstdc++ archive. The CMake build avoids it by only
 passing `-static-libgcc -static-libstdc++` for optimized configurations —
 Debug builds use the dynamic runtime (or build `Release`).
 
+**MSVC: `error C2589: '(': illegal token on right side of '::'` on every `std::min`/`std::max`**
+The Windows SDK's `min`/`max` macros. `cell.cpp` defines `NOMINMAX` before
+`windows.h` *and* `#undef`s both macros after the SDK includes, because some
+third-party headers re-introduce them. If you add a new SDK/third-party include
+to the top block, keep it above that guard.
+
+**MSVC: `error C2039: 'deque': is not a member of 'std'` (or similar)**
+libstdc++ pulls several standard headers in transitively; MSVC's STL does not.
+Include what you use — the CI MSVC job is the check.
+
 **`The toolchain cannot compile the C++26 standard library features`**
 That is the configure-time probe doing its job — read the message it prints,
 it lists the minimum toolchains. Override with `-DCELL_TOOLCHAIN_CHECKS=OFF`

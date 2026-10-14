@@ -26,6 +26,17 @@
 
 #include "webui.h"
 
+// webui.h pulls in the Windows SDK; keep min/max out of this TU as well (the
+// agent core compiled above is already guarded, this protects shell code).
+#if defined(_WIN32)
+#ifdef min
+#undef min
+#endif
+#ifdef max
+#undef max
+#endif
+#endif
+
 // The generated embedding header (scripts/embed_webui.mjs). When the front-end
 // has not been built yet the build falls back to CELLUI_FALLBACK_HTML below,
 // so `cmake --build` always produces a runnable binary.
