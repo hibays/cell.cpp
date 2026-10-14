@@ -140,7 +140,7 @@ def run_once(attempt: int) -> bool:
         argv,
         env=env,
         cwd=str(root),
-        stdout=subprocess.DEVNULL,
+        stdout=err_file,  # lldb prints the -k backtraces on stdout
         stderr=err_file,
     )
     try:

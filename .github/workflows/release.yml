@@ -59,13 +59,6 @@ jobs:
         if: runner.os == 'macOS'
         run: brew install ninja libsodium nlohmann-json
 
-      - name: Install dependencies (Windows MSVC)
-        if: runner.os == 'Windows'
-        uses: lukka/run-vcpkg@v11
-        with:
-          vcpkgDirectory: ${{ github.workspace }}/vcpkg
-          vcpkgGitCommitId: 3dd44b17ecb69a268d0b04daa9d0748f3ea9b587
-
       - name: Configure (Windows MSVC — runner-bundled vcpkg, same as CI)
         if: runner.os == 'Windows'
         run: >
