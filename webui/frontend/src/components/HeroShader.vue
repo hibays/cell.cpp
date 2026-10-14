@@ -4,6 +4,7 @@
 // fixed background, never a layout participant.
 
 import { onMounted, onUnmounted, ref } from 'vue'
+import { createRafLoop, type RafLoop } from '../lib/rafLoop'
 
 const WGSL = /* wgsl */ `
 struct VertexOut {
@@ -42,8 +43,22 @@ fn fs(in: VertexOut) -> @location(0) vec4f {
 }
 `
 
-// module-level so onUnmounted can stop the loop when the landing disappears
-let heroRaf = 0
+// GPU init is awaited, so the component can unmount before the shader is even
+// live. `disposed` makes teardown total: it stops a loop started by a late
+// resolution and refuses to start a new one afterwards.
+const rafOpts = {
+  raf: (cb: () => void) => requestAnimationFrame(cb),
+  cancel: (h: number) => cancelAnimationFrame(h),
+}
+let shaderLoop: RafLoop | null = null
+let disposed = false
+
+/** Start the render loop. No-op after teardown, and idempotent per start(). */
+function startLoop(body: () => void): void {
+  if (disposed) return
+  shaderLoop = createRafLoop(body, rafOpts)
+  shaderLoop.start()
+}
 
 async function runWebGpu(canvas: HTMLCanvasElement): Promise<boolean> {
   if (!('gpu' in navigator)) return false
@@ -98,9 +113,8 @@ async function runWebGpu(canvas: HTMLCanvasElement): Promise<boolean> {
       pass.draw(3)
       pass.end()
       device.queue.submit([encoder.finish()])
-      heroRaf = requestAnimationFrame(frame)
     }
-    frame()
+    startLoop(frame)
     return true
   } catch {
     return false
@@ -145,9 +159,8 @@ function runWebgl2(canvas: HTMLCanvasElement): boolean {
   const frame = () => {
     gl.uniform1f(uTime, (performance.now() - start) / 1000)
     gl.drawArrays(gl.TRIANGLES, 0, 3)
-    heroRaf = requestAnimationFrame(frame)
   }
-  heroRaf = requestAnimationFrame(frame)
+  startLoop(frame)
   return true
 }
 
@@ -166,11 +179,18 @@ onMounted(async () => {
   resizeHandler = resize
   window.addEventListener('resize', resize)
   const ok = await runWebGpu(canvas)
+  if (disposed) {
+    // unmounted while the GPU probe was in flight — a loop started by the
+    // resolved branch must not outlive the component
+    shaderLoop?.stop()
+    return
+  }
   if (!ok) runWebgl2(canvas)
 })
 
 onUnmounted(() => {
-  if (heroRaf) cancelAnimationFrame(heroRaf)
+  disposed = true
+  shaderLoop?.stop()
   if (resizeHandler) window.removeEventListener('resize', resizeHandler)
 })
 </script>
