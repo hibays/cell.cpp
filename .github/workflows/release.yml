@@ -59,15 +59,21 @@ jobs:
         if: runner.os == 'macOS'
         run: brew install ninja libsodium nlohmann-json
 
-      - name: Configure (Windows MSVC — runner-bundled vcpkg, same as CI)
+      # No -G here on purpose: let CMake pick the installed Visual Studio via
+      # vswhere (VS 2022 on the windows-2022 runner, or a newer VS 17/18 on a
+      # developer machine). Forcing -G Ninja in a non-VS shell made CMake pick
+      # the runner's MinGW c++ and fail on MSVC-only macros. The VS generator is
+      # multi-config, so --config Release drives the build and -C Release the test.
+      - name: Configure (Windows MSVC — auto-detect installed VS, vcpkg from runner)
         if: runner.os == 'Windows'
+        shell: pwsh
         run: >
-          cmake -S . -B build -G Ninja
-          -DCMAKE_BUILD_TYPE=Release
+          cmake -S . -B build
           -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
           -DCELL_BUILD_CLI=ON
           -DCELL_BUILD_SHARED=OFF
           -DCELL_BUILD_WEBUI=OFF
+          ${{ matrix.cmake_extra }}
 
       - name: Configure (POSIX)
         if: runner.os != 'Windows'

@@ -15975,6 +15975,51 @@ details{break-inside:avoid}
             int saved_out_ = -1, saved_err_ = -1, read_fd_ = -1;
         };
 
+        // Replace any byte sequence that is not valid UTF-8 with U+FFFD. The
+        // capture sink forwards raw stdout/stderr bytes (tool/agent output, which
+        // may carry non-UTF-8 bytes depending on locale) into a JSON event, and
+        // nlohmann::json::dump() throws type_error.316 on invalid UTF-8. The
+        // sink runs on a detached thread with no try/catch, so an uncaught throw
+        // there aborts the whole process — sanitizing at the source avoids it.
+        static std::string to_valid_utf8(std::string_view s)
+        {
+            std::string out;
+            out.reserve(s.size());
+            const size_t n = s.size();
+            auto is_cont = [](unsigned char c) -> bool { return (c & 0xC0) == 0x80; };
+            size_t i = 0;
+            while (i < n)
+            {
+                unsigned char c = (unsigned char)s[i];
+                if (c < 0x80)
+                {
+                    out.push_back((char)c);
+                    i += 1;
+                }
+                else if ((c & 0xE0) == 0xC0 && i + 1 < n && is_cont((unsigned char)s[i + 1]))
+                {
+                    out.append(s.substr(i, 2));
+                    i += 2;
+                }
+                else if ((c & 0xF0) == 0xE0 && i + 2 < n && is_cont((unsigned char)s[i + 1]) && is_cont((unsigned char)s[i + 2]))
+                {
+                    out.append(s.substr(i, 3));
+                    i += 3;
+                }
+                else if ((c & 0xF8) == 0xF0 && i + 3 < n && is_cont((unsigned char)s[i + 1]) && is_cont((unsigned char)s[i + 2]) && is_cont((unsigned char)s[i + 3]))
+                {
+                    out.append(s.substr(i, 4));
+                    i += 4;
+                }
+                else
+                {
+                    out += "\xEF\xBF\xBD"; // U+FFFD
+                    i += 1;
+                }
+            }
+            return out;
+        }
+
         // ---- turn stream + bridge -------------------------------------------
         struct turn_stream
         {
@@ -15989,7 +16034,10 @@ details{break-inside:avoid}
             {
                 {
                     std::lock_guard<std::mutex> lk(m);
-                    events.push_back(j.dump());
+                    // error_handler_t::replace: a stray invalid UTF-8 byte must
+                    // never turn a push (often on the detached capture thread)
+                    // into an uncaught exception that terminates the process.
+                    events.push_back(j.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace));
                 }
                 cv.notify_all();
             }
@@ -23845,12 +23893,12 @@ int repl::run()
                                           ts->push(json{{"type", "turn_start"},
                                                         {"data", {{"session", h.now().id()}, {"model", cfg.model_label()}}}});
                                           std::string cap_err;
-                                          auto cap = cell::serve::capture::begin(
-                                              [ts](std::string chunk)
-                                              {
-                                                  ts->push(json{{"type", "output"}, {"data", {{"text", std::move(chunk)}}}});
-                                              },
-                                              cap_err);
+                auto cap = cell::serve::capture::begin(
+                    [ts](std::string chunk)
+                    {
+                        ts->push(json{{"type", "output"}, {"data", {{"text", cell::serve::to_valid_utf8(chunk)}}}});
+                    },
+                    cap_err);
                                           if (!cap)
                                               ts->push(json{{"type", "error"}, {"data", {{"code", "capture_failed"}, {"message", cap_err}}}});
                                           run_turn(resume, text);
