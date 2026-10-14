@@ -2,7 +2,71 @@
 #include <fstream>
 #include <filesystem>
 #include <string>
+// <functional> — same story as <generator> above: libc++ still ships without
+// cell::move_only_function, so a small type-erased move-only callable stands in
+// when the real one is absent.
+#if !defined(CELL_FORCE_FALLBACK_MOVE_ONLY_FUNCTION) && \
+    defined(__cpp_lib_move_only_function) && __cpp_lib_move_only_function >= 202110L
 #include <functional>
+namespace cell
+{
+    template <class Sig>
+    using move_only_function = std::move_only_function<Sig>;
+}
+#else
+#include <memory>
+#include <span>
+#include <type_traits>
+#include <utility>
+namespace cell
+{
+    // Move-only type-erased callable. Supports the signatures cell.cpp uses:
+    // R(Args...) with no cv/ref qualifiers.
+    template <class Sig>
+    class move_only_function; // primary template intentionally undefined
+
+    template <class R, class... Args>
+    class move_only_function<R(Args...)> final
+    {
+        struct base
+        {
+            virtual ~base() = default;
+            virtual R call(Args...) = 0;
+        };
+        template <class F>
+        struct impl final : base
+        {
+            F f;
+            explicit impl(F &&fn) : f(std::move(fn)) {}
+            R call(Args... args) override { return f(std::forward<Args>(args)...); }
+        };
+
+        std::unique_ptr<base> target{};
+
+      public:
+        move_only_function() noexcept = default;
+        move_only_function(std::nullptr_t) noexcept {}
+        move_only_function(move_only_function &&) noexcept = default;
+        move_only_function &operator=(move_only_function &&) noexcept = default;
+        move_only_function(const move_only_function &) = delete;
+        move_only_function &operator=(const move_only_function &) = delete;
+
+        template <class F>
+            requires(!std::is_same_v<std::remove_cvref_t<F>, move_only_function>)
+        move_only_function(F &&fn)
+            : target(std::make_unique<impl<std::decay_t<F>>>(std::forward<F>(fn)))
+        {
+        }
+
+        explicit operator bool() const noexcept { return target != nullptr; }
+
+        R operator()(Args... args)
+        {
+            return target->call(std::forward<Args>(args)...);
+        }
+    };
+}
+#endif
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -5294,7 +5358,7 @@ namespace cell
             return n;
         }
 
-        using StreamCallback = std::move_only_function<void(std::span<const char>)>;
+        using StreamCallback = cell::move_only_function<void(std::span<const char>)>;
         using XferCallback = int (*)(void *userdata, curl_off_t dltotal, curl_off_t dlnow, curl_off_t ultotal, curl_off_t ulnow);
         size_t WriteCallback(char *ptr, size_t size, size_t nmemb, void *userdata)
         {
@@ -5863,7 +5927,7 @@ namespace cell
         private:
             std::mutex mx;
             std::condition_variable cv;
-            std::deque<std::move_only_function<void()>> jobs;
+            std::deque<cell::move_only_function<void()>> jobs;
             size_t active = 0; // submitted jobs not yet finished
             size_t max_workers = 16;
             bool stopping = false;
@@ -5880,7 +5944,7 @@ namespace cell
             {
                 for (;;)
                 {
-                    std::move_only_function<void()> job;
+                    cell::move_only_function<void()> job;
                     {
                         std::unique_lock lk(mx);
                         cv.wait(lk, [&]
@@ -5923,7 +5987,7 @@ namespace cell
             thread_pool(const thread_pool &) = delete;
             thread_pool &operator=(const thread_pool &) = delete;
 
-            void submit(std::move_only_function<void()> job)
+            void submit(cell::move_only_function<void()> job)
             {
                 {
                     std::lock_guard lk(mx);
@@ -5992,7 +6056,7 @@ namespace cell
             // the CRT's signal thread on Windows) — never from inside an
             // asynchronous signal handler — so allocation, locks and JSON
             // serialization are all safe there.
-            inline std::move_only_function<void()> on_exit_signal;
+            inline cell::move_only_function<void()> on_exit_signal;
             inline bool exit_hook_armed = false; // guarded by exit_hook_mutex()
             inline std::mutex &exit_hook_mutex()
             {
@@ -6036,7 +6100,7 @@ namespace cell
         } // namespace detail
 
         // install (or replace) the persistence hook; called once by main
-        inline void arm_exit_hook(std::move_only_function<void()> hook)
+        inline void arm_exit_hook(cell::move_only_function<void()> hook)
         {
             std::lock_guard<std::mutex> lk(detail::exit_hook_mutex());
             detail::on_exit_signal = std::move(hook);
@@ -7099,7 +7163,7 @@ namespace cell
             // the tool's own logic: pre-parsed arguments (a discarded json means
             // the raw input was not valid JSON) plus the runtime, producing an
             // output. never touches the sandbox gates — those run first.
-            using handler_t = std::move_only_function<ToolOutput(const nlohmann::json &, const runtime &)>;
+            using handler_t = cell::move_only_function<ToolOutput(const nlohmann::json &, const runtime &)>;
             handler_t handler_;
             std::atomic<bool> blocked_{false};
             std::atomic<rejection_reason> rejected_for_{rejection_reason::none};
@@ -16354,7 +16418,7 @@ static std::pair<std::unordered_map<std::string, std::shared_ptr<cell::tools::to
     { return nlohmann::json{{"type", "boolean"}, {"description", desc}}; };
     auto add = [&](const std::string &name, const std::string &desc, const nlohmann::json &props,
                    const std::vector<std::string> &required, Policy policy, ToolKind kind,
-                   std::move_only_function<cell::ToolOutput(const nlohmann::json &, const cell::tools::runtime &)> fn,
+                   cell::move_only_function<cell::ToolOutput(const nlohmann::json &, const cell::tools::runtime &)> fn,
                    Phase phase = Phase::Concurrent)
     {
         list[name] = std::make_shared<cell::tools::callable_tool>(

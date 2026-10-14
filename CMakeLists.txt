@@ -138,7 +138,7 @@ int main() {
     return 0;
     }")
 
-    set(_cell_probes format expected span_concepts move_only_function)
+    set(_cell_probes format expected span_concepts)
     set(CELL_MISSING_FEATURES "")
     set(CELL_NEEDS_SIZED_DEALLOC OFF)
     foreach(_cell_p IN LISTS _cell_probes)
@@ -168,11 +168,6 @@ int main() {
         # Re-run the first missing feature through try_compile so the real
         # compiler diagnostics end up in the configure log.
         list(GET CELL_MISSING_FEATURES 0 _cell_first)
-        string(TOUPPER "${_cell_first}" _cell_firstu)
-        try_compile(_cell_diag "${CMAKE_BINARY_DIR}/CMakeFiles/cell-toolprobe-${_cell_first}"
-            SOURCES "${CMAKE_BINARY_DIR}/CMakeFiles/cell-toolprobe-${_cell_first}/probe.cpp"
-            COMPILE_DEFINITIONS "${CELL_CXX_FLAG}"
-            OUTPUT_VARIABLE _cell_diag_out)
         file(WRITE "${CMAKE_BINARY_DIR}/CMakeFiles/cell-toolprobe-${_cell_first}/probe.cpp"
             "${_cell_probe_${_cell_first}}")
         try_compile(_cell_diag "${CMAKE_BINARY_DIR}/CMakeFiles/cell-toolprobe-${_cell_first}"
@@ -185,7 +180,8 @@ int main() {
         message(FATAL_ERROR
             "The toolchain cannot compile the C++${CELL_CXX_STANDARD} standard library features "
             "cell.cpp requires (missing: ${CELL_MISSING_FEATURES}).\n"
-            "  (<generator> is optional: cell.cpp ships a portable fallback for libc++.)\n"
+            "  (<generator> and std::move_only_function are optional: cell.cpp ships portable\n"
+            "   fallbacks for libc++, which still lacks both.)\n"
             "  Compiler: ${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION}\n"
             "  Flag tried: ${CELL_CXX_FLAG}\n"
             "Minimum known-good toolchains://n"
