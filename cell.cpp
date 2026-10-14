@@ -2,7 +2,129 @@
 #include <fstream>
 #include <filesystem>
 #include <string>
+// <functional> — same story as <generator> above: libc++ still ships without
+// cell::move_only_function, so a small type-erased move-only callable stands in
+// when the real one is absent.
+#if !defined(CELL_FORCE_FALLBACK_MOVE_ONLY_FUNCTION) && \
+    defined(__cpp_lib_move_only_function) && __cpp_lib_move_only_function >= 202110L
 #include <functional>
+namespace cell
+{
+    template <class Sig>
+    using move_only_function = std::move_only_function<Sig>;
+}
+#else
+#include <memory>
+#include <span>
+#include <type_traits>
+#include <utility>
+namespace cell
+{
+    // Move-only type-erased callable. Supports the signatures cell.cpp uses:
+    // R(Args...) with no cv/ref qualifiers.
+    template <class Sig>
+    class move_only_function; // primary template intentionally undefined
+
+    template <class R, class... Args>
+    class move_only_function<R(Args...)> final
+    {
+        struct base
+        {
+            virtual ~base() = default;
+            virtual R call(Args...) = 0;
+        };
+        template <class F>
+        struct impl final : base
+        {
+            F f;
+            explicit impl(F &&fn) : f(std::move(fn)) {}
+            R call(Args... args) override { return f(std::forward<Args>(args)...); }
+        };
+
+        std::unique_ptr<base> target{};
+
+      public:
+        move_only_function() noexcept = default;
+        move_only_function(std::nullptr_t) noexcept {}
+        move_only_function(move_only_function &&) noexcept = default;
+        move_only_function &operator=(move_only_function &&) noexcept = default;
+        move_only_function(const move_only_function &) = delete;
+        move_only_function &operator=(const move_only_function &) = delete;
+
+        template <class F>
+            requires(!std::is_same_v<std::remove_cvref_t<F>, move_only_function>)
+        move_only_function(F &&fn)
+            : target(std::make_unique<impl<std::decay_t<F>>>(std::forward<F>(fn)))
+        {
+        }
+
+        explicit operator bool() const noexcept { return target != nullptr; }
+
+        R operator()(Args... args)
+        {
+            return target->call(std::forward<Args>(args)...);
+        }
+    };
+}
+#endif
+
+// <thread> — libc++ has no cell::jthread either. cell.cpp never uses stop
+// tokens (its workers poll condition variables with their own stop flags), so
+// a plain thread wrapper with the jthread destructor semantics (join on
+// destruction / reassignment) covers every call site.
+#if !defined(CELL_FORCE_FALLBACK_JTHREAD) && \
+    defined(__cpp_lib_jthread) && __cpp_lib_jthread >= 201911L
+#include <thread>
+namespace cell
+{
+    using jthread = std::jthread;
+}
+#else
+#include <thread>
+namespace cell
+{
+    class jthread final
+    {
+        std::thread t_{};
+
+      public:
+        jthread() noexcept = default;
+        template <class F, class... A>
+            requires(!std::is_same_v<std::remove_cvref_t<F>, jthread>)
+        explicit jthread(F &&f, A &&...a)
+            : t_(std::forward<F>(f), std::forward<A>(a)...)
+        {
+        }
+        jthread(jthread &&other) noexcept = default;
+        jthread &operator=(jthread &&other) noexcept
+        {
+            if (this != &other)
+            {
+                if (t_.joinable())
+                    t_.join();
+                t_ = std::move(other.t_);
+            }
+            return *this;
+        }
+        jthread(const jthread &) = delete;
+        jthread &operator=(const jthread &) = delete;
+        ~jthread()
+        {
+            if (t_.joinable())
+                t_.join();
+        }
+
+        bool joinable() const noexcept { return t_.joinable(); }
+        void join()
+        {
+            if (t_.joinable())
+                t_.join();
+        }
+        std::thread::id get_id() const noexcept { return t_.get_id(); }
+        void swap(jthread &other) noexcept { t_.swap(other.t_); }
+    };
+}
+#endif
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -32,7 +154,118 @@
 #include <optional>
 #include <concepts>
 #include <csignal>
+// <generator> — cell::generator is still missing from libc++ (AppleClang), so a
+// small portable stand-in keeps the single file buildable everywhere. On
+// toolchains that do ship it (GCC 14+, Clang 19+/libstdc++, MSVC 19.40+) the
+// standard implementation is used, which is what the minimum-toolchain table
+// in docs/BUILDING.md describes.
+#if !defined(CELL_FORCE_FALLBACK_GENERATOR) && \
+    defined(__cpp_lib_generator) && __cpp_lib_generator >= 202207L
+#include <optional>
 #include <generator>
+namespace cell
+{
+    template <class T>
+    using generator = std::generator<T>;
+}
+#else
+#include <coroutine>
+#include <iterator>
+#include <utility>
+namespace cell
+{
+    // Minimal synchronous coroutine generator: enough for `co_yield` ranges,
+    // range-for, and early `break` (the coroutine is destroyed with the
+    // generator). Move-only, like cell::generator.
+    template <class T>
+    class generator final
+    {
+      public:
+        struct promise_type
+        {
+            std::optional<T> value{};
+            std::exception_ptr exception{};
+
+            generator get_return_object() noexcept
+            {
+                return generator{std::coroutine_handle<promise_type>::from_promise(*this)};
+            }
+            std::suspend_always initial_suspend() noexcept { return {}; }
+            std::suspend_always final_suspend() noexcept { return {}; }
+            std::suspend_always yield_value(T v) noexcept
+            {
+                value.emplace(std::move(v));
+                return {};
+            }
+            void return_void() noexcept {}
+            void unhandled_exception() noexcept { exception = std::current_exception(); }
+        };
+
+        class iterator final
+        {
+          public:
+            using value_type = T;
+            using difference_type = std::ptrdiff_t;
+
+            explicit iterator(std::coroutine_handle<promise_type> h) noexcept : h_(h) {}
+
+            const T &operator*() const noexcept { return *h_.promise().value; }
+
+            iterator &operator++()
+            {
+                h_.resume();
+                if (h_.done() && h_.promise().exception)
+                    std::rethrow_exception(h_.promise().exception);
+                return *this;
+            }
+            void operator++(int) { ++*this; }
+
+            bool operator==(std::default_sentinel_t) const noexcept { return !h_ || h_.done(); }
+
+          private:
+            std::coroutine_handle<promise_type> h_;
+        };
+
+        generator() noexcept = default;
+        explicit generator(std::coroutine_handle<promise_type> h) noexcept : h_(h) {}
+        generator(generator &&other) noexcept : h_(std::exchange(other.h_, {})) {}
+        generator &operator=(generator &&other) noexcept
+        {
+            if (this != &other)
+            {
+                if (h_)
+                    h_.destroy();
+                h_ = std::exchange(other.h_, {});
+            }
+            return *this;
+        }
+        generator(const generator &) = delete;
+        generator &operator=(const generator &) = delete;
+        ~generator()
+        {
+            if (h_)
+                h_.destroy();
+        }
+
+        iterator begin()
+        {
+            if (h_ && !started_)
+            {
+                started_ = true;
+                h_.resume();
+                if (h_.done() && h_.promise().exception)
+                    std::rethrow_exception(h_.promise().exception);
+            }
+            return iterator{h_};
+        }
+        std::default_sentinel_t end() const noexcept { return {}; }
+
+      private:
+        std::coroutine_handle<promise_type> h_{};
+        bool started_ = false;
+    };
+}
+#endif
 #include <expected>
 #include <source_location>
 #include <exception>
@@ -289,7 +522,7 @@ namespace cell
             // flight (its "durability barrier" was not one).
             size_t in_flight = 0;
             bool stopping = false;
-            std::jthread worker;
+            cell::jthread worker;
 
             static void write_file(const job &j)
             {
@@ -324,7 +557,7 @@ namespace cell
         public:
             file_writer()
             {
-                worker = std::jthread([this]
+                worker = cell::jthread([this]
                                       { run(); });
             }
             ~file_writer()
@@ -2061,7 +2294,7 @@ namespace cell
     namespace text
     {
         // Zero-copy line generator: yields string_views, strips trailing '\r'.
-        static std::generator<std::string_view> lines(std::string_view text)
+        static cell::generator<std::string_view> lines(std::string_view text)
         {
             size_t start = 0;
             while (start < text.size())
@@ -3851,7 +4084,7 @@ namespace cell
         // lazy depth-first walk shared by rg/glob/find: yields (absolute path, rel
         // path, is_directory) for every non-hidden entry, one level at a time, in
         // sorted order. consumers break out of the range-for to stop early.
-        static std::generator<std::tuple<std::filesystem::path, std::string, bool>> walk_entries(const std::filesystem::path &root_path)
+        static cell::generator<std::tuple<std::filesystem::path, std::string, bool>> walk_entries(const std::filesystem::path &root_path)
         {
             struct frame
             {
@@ -5257,7 +5490,7 @@ namespace cell
             return n;
         }
 
-        using StreamCallback = std::move_only_function<void(std::span<const char>)>;
+        using StreamCallback = cell::move_only_function<void(std::span<const char>)>;
         using XferCallback = int (*)(void *userdata, curl_off_t dltotal, curl_off_t dlnow, curl_off_t ultotal, curl_off_t ulnow);
         size_t WriteCallback(char *ptr, size_t size, size_t nmemb, void *userdata)
         {
@@ -5826,11 +6059,11 @@ namespace cell
         private:
             std::mutex mx;
             std::condition_variable cv;
-            std::deque<std::move_only_function<void()>> jobs;
+            std::deque<cell::move_only_function<void()>> jobs;
             size_t active = 0; // submitted jobs not yet finished
             size_t max_workers = 16;
             bool stopping = false;
-            std::vector<std::jthread> workers;
+            std::vector<cell::jthread> workers;
 
             void spawn_locked()
             {
@@ -5843,7 +6076,7 @@ namespace cell
             {
                 for (;;)
                 {
-                    std::move_only_function<void()> job;
+                    cell::move_only_function<void()> job;
                     {
                         std::unique_lock lk(mx);
                         cv.wait(lk, [&]
@@ -5886,7 +6119,7 @@ namespace cell
             thread_pool(const thread_pool &) = delete;
             thread_pool &operator=(const thread_pool &) = delete;
 
-            void submit(std::move_only_function<void()> job)
+            void submit(cell::move_only_function<void()> job)
             {
                 {
                     std::lock_guard lk(mx);
@@ -5955,7 +6188,7 @@ namespace cell
             // the CRT's signal thread on Windows) — never from inside an
             // asynchronous signal handler — so allocation, locks and JSON
             // serialization are all safe there.
-            inline std::move_only_function<void()> on_exit_signal;
+            inline cell::move_only_function<void()> on_exit_signal;
             inline bool exit_hook_armed = false; // guarded by exit_hook_mutex()
             inline std::mutex &exit_hook_mutex()
             {
@@ -5999,7 +6232,7 @@ namespace cell
         } // namespace detail
 
         // install (or replace) the persistence hook; called once by main
-        inline void arm_exit_hook(std::move_only_function<void()> hook)
+        inline void arm_exit_hook(cell::move_only_function<void()> hook)
         {
             std::lock_guard<std::mutex> lk(detail::exit_hook_mutex());
             detail::on_exit_signal = std::move(hook);
@@ -7062,7 +7295,7 @@ namespace cell
             // the tool's own logic: pre-parsed arguments (a discarded json means
             // the raw input was not valid JSON) plus the runtime, producing an
             // output. never touches the sandbox gates — those run first.
-            using handler_t = std::move_only_function<ToolOutput(const nlohmann::json &, const runtime &)>;
+            using handler_t = cell::move_only_function<ToolOutput(const nlohmann::json &, const runtime &)>;
             handler_t handler_;
             std::atomic<bool> blocked_{false};
             std::atomic<rejection_reason> rejected_for_{rejection_reason::none};
@@ -7304,7 +7537,7 @@ namespace cell
             return std::string::npos;
         }
         // lazy coroutine SSE parser: yields parsed JSON events without copying line bytes
-        static std::generator<nlohmann::json> sse_events(const std::string &buf, size_t &consumed)
+        static cell::generator<nlohmann::json> sse_events(const std::string &buf, size_t &consumed)
         {
             std::string_view payload;
             size_t pos = consumed;
@@ -14950,9 +15183,9 @@ details{break-inside:avoid}
             static bool s = false;
             return s;
         }
-        static std::jthread &bg_thread()
+        static cell::jthread &bg_thread()
         {
-            static std::jthread t;
+            static cell::jthread t;
             return t;
         }
         static void bg_runner()
@@ -15056,7 +15289,7 @@ details{break-inside:avoid}
             {
                 std::lock_guard<std::mutex> lk(bg_mutex());
                 if (!bg_thread().joinable())
-                    bg_thread() = std::jthread(bg_runner);
+                    bg_thread() = cell::jthread(bg_runner);
                 bg_queue().push_back({job_id, ref.store, snapshot, rt, start_stage});
             }
             bg_cv().notify_all();
@@ -15428,7 +15661,7 @@ static std::pair<std::unordered_map<std::string, std::shared_ptr<cell::tools::to
     { return nlohmann::json{{"type", "boolean"}, {"description", desc}}; };
     auto add = [&](const std::string &name, const std::string &desc, const nlohmann::json &props,
                    const std::vector<std::string> &required, Policy policy, ToolKind kind,
-                   std::move_only_function<cell::ToolOutput(const nlohmann::json &, const cell::tools::runtime &)> fn,
+                   cell::move_only_function<cell::ToolOutput(const nlohmann::json &, const cell::tools::runtime &)> fn,
                    Phase phase = Phase::Concurrent)
     {
         list[name] = std::make_shared<cell::tools::callable_tool>(
