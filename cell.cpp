@@ -55,6 +55,9 @@
 #include <termios.h>
 #include <fcntl.h>
 #include <poll.h>
+#ifdef __APPLE__
+#include <mach-o/dyld.h>
+#endif
 #endif
 
 // Parse JSON number or quoted numeric string; returns fallback on missing/invalid.
@@ -1694,6 +1697,22 @@ namespace cell
             buf.resize(n);
             return std::filesystem::path(buf).parent_path();
 #else
+#ifdef __APPLE__
+            // macOS has no /proc: ask dyld for the executable path
+            // (_NSGetExecutablePath may return a symlinked or relative path,
+            // so canonicalize before taking the directory)
+            uint32_t cap = 0;
+            _NSGetExecutablePath(nullptr, &cap);
+            std::string buf(cap ? cap : 4096, '\0');
+            if (_NSGetExecutablePath(buf.data(), &cap) == 0)
+            {
+                std::error_code ec;
+                std::filesystem::path p(buf.c_str());
+                auto canon = std::filesystem::weakly_canonical(p, ec);
+                return (ec ? p : canon).parent_path();
+            }
+            return std::filesystem::current_path();
+#else
             std::string buf(4096, '\0');
             ssize_t n = ::readlink("/proc/self/exe", buf.data(), buf.size());
             if (n > 0)
@@ -1702,6 +1721,7 @@ namespace cell
                 return std::filesystem::path(buf).parent_path();
             }
             return std::filesystem::current_path();
+#endif
 #endif
         }
 
@@ -18885,6 +18905,1372 @@ static int run_selftest()
 }
 
 // =============================================================================
+//  provider-key resolution — shared by cell::engine::runner and the REPL shell
+//  (model-list probes and provider management). Lookup order: the provider's
+//  vault entry, the style-specific environment variable, then the generic
+//  "api_key" entry.
+// =============================================================================
+static cell::encrypt::secure_string resolve_provider_key(const cell::config::provider_entry &p, cell::encrypt::crypt &vault)
+{
+    if (!p.key_id.empty())
+    {
+        auto k = vault.get(p.key_id);
+        if (!k.empty())
+            return k;
+    }
+    const char *env = std::getenv(p.api_style == "anthropic" ? "ANTHROPIC_API_KEY" : "OPENAI_API_KEY");
+    if (env && *env)
+        return cell::encrypt::secure_string(env);
+    return vault.get("api_key");
+}
+
+// =============================================================================
+//  engine — the agent turn runner, decoupled from any frontend. A turn's
+//  streamed answer text, reasoning, tool activity, approvals, retries,
+//  compaction and interrupts are all reported through the `events` callbacks
+//  instead of stdout, so the terminal REPL and the WebView desktop shell
+//  (cell-app.cpp) drive the SAME rounds. The turn logic — round loop, retry
+//  policy, pass-1 concurrent / pass-2 deferred tool scheduling, overflow
+//  compaction, stats, transcript writes — lives HERE and only here: the REPL
+//  runs its turns through runner too, its former inline copy is gone.
+//  Threading contract: run_turn() runs on the caller's thread, the callbacks
+//  may fire on that thread or on tool worker threads, and one turn runs at a
+//  time per runner.
+// =============================================================================
+namespace cell
+{
+    namespace engine
+    {
+        // ---- turn event payloads ---------------------------------------------
+        struct tool_view
+        {
+            size_t seq = 0;        // 1-based position in the model's tool_call list
+            std::string name;      // tool key (ls / read / exec / ...)
+            std::string args;      // raw arguments JSON, truncated for display
+            std::string policy;    // begin: allow|defer|ask|deny; end: unchanged
+            std::string status;    // end: ok|failed|blocked|unknown|exception
+            std::string display;   // end: console-safe output, truncated for display
+            std::string marker;    // end: path/cmd marker extracted by harden_tool_result
+            double sec = 0;        // end: wall time of the execution
+            long long chars = 0;   // end: full output size before display truncation
+            size_t multimodal = 0; // end: number of image/audio blocks returned
+        };
+        struct round_view
+        {
+            int round = 0;            // 1-based round within the turn
+            long long tok_in = -1;    // prompt tokens  (-1 = not reported)
+            long long tok_out = -1;   // completion tokens
+            long long tok_total = -1; // total tokens
+            double cache_hit = -1;    // cached/total prompt tokens, -1 = unknown
+            double seconds = 0;       // round wall time
+            double ttft = -1;         // time to first streamed token, -1 = none
+            long long answer_chars = 0;
+        };
+        struct turn_view
+        {
+            bool natural_end = true; // false: aborted (error/cancel/refusal/limit)
+            int rounds = 0;
+            long long tool_calls = 0;
+            long long thinking_entries = 0;
+        };
+        // The frontend contract. Every callback is optional; the ones that matter
+        // for a working UI are on_answer, on_status, on_error, on_tool_end and
+        // on_approval. Callbacks may fire on the caller's thread or on tool worker
+        // threads — implementations must marshal to their UI thread themselves.
+        struct events
+        {
+            std::function<void(std::string_view)> on_answer;  // assistant text delta
+            std::function<void(std::string_view)> on_reason;  // reasoning delta
+            std::function<void(std::string_view)> on_summary; // compaction summary delta
+            std::function<void()> on_answer_begin;            // first answer delta of a round
+            std::function<void(long long)> on_progress;       // ~500ms while waiting for the first token
+            std::function<void(std::string_view)> on_status;  // informational line (retry, compact, ...)
+            std::function<void(std::string_view)> on_error;   // error line
+            std::function<void(std::string_view)> on_notice;  // notice rendered + delivered to the session
+            std::function<void(const round_view &)> on_round_end;
+            std::function<void(const tool_view &)> on_tool_begin; // about to execute
+            std::function<void(const tool_view &)> on_tool_end;   // executed (echo + marker)
+            // Blocks the calling thread until the user answers. reason is set on
+            // refusal; an unset/false channel denies with a generic reason.
+            std::function<bool(const std::string &tool, const std::string &args, std::string &reason)> on_approval;
+            // Polled frequently during a transfer (must be cheap + thread-safe).
+            std::function<bool()> cancelled;
+            // Recorded on the transcript when a turn is cut short by cancellation.
+            std::string cancel_reason = "interrupted by the user during streaming";
+            std::function<void(const turn_view &)> on_turn_end;
+        };
+
+        // ---- helpers (ported from repl::run()'s local lambdas) ----------------
+        static std::string trunc_str(const std::string &s, size_t n)
+        {
+            return s.size() <= n ? s : s.substr(0, n) + "...";
+        }
+        // character count of any JSON value without building a serialized copy
+        static long long json_chars_impl(const nlohmann::json &j)
+        {
+            long long n = 0;
+            if (j.is_string())
+                n += (long long)j.get_ref<const std::string &>().size();
+            else if (j.is_array())
+                for (auto &e : j)
+                    n += json_chars_impl(e);
+            else if (j.is_object())
+                for (auto &[k, v] : j.items())
+                    n += (long long)k.size() + json_chars_impl(v);
+            return n;
+        }
+        static long long content_chars(const nlohmann::json &msgs)
+        {
+            long long n = 0;
+            for (auto &m : msgs)
+            {
+                auto it = m.find("content");
+                if (it == m.end())
+                    continue;
+                n += json_chars_impl(*it);
+            }
+            return n;
+        }
+        static std::string reply_text(const nlohmann::json &reply)
+        {
+            auto it = reply.find("content");
+            if (it == reply.end())
+                return "";
+            if (it->is_string())
+                return it->get<std::string>();
+            if (it->is_array())
+            {
+                std::string t;
+                for (auto &b : *it)
+                    if (b.value("type", "") == "text" && b.contains("text"))
+                        t += b["text"].get<std::string>();
+                return t;
+            }
+            return "";
+        }
+        static long long reply_text_len(const nlohmann::json &reply)
+        {
+            auto it = reply.find("content");
+            if (it == reply.end())
+                return 0;
+            if (it->is_string())
+                return (long long)it->get_ref<const std::string &>().size();
+            long long n = 0;
+            if (it->is_array())
+                for (auto &b : *it)
+                    if (b.value("type", "") == "text" && b.contains("text") && b["text"].is_string())
+                        n += (long long)b["text"].get_ref<const std::string &>().size();
+            return n;
+        }
+        static std::optional<long long> usage_in(const nlohmann::json &u)
+        {
+            if (u.is_object())
+            {
+                if (u.contains("prompt_tokens") && u["prompt_tokens"].is_number_integer())
+                    return u["prompt_tokens"].get<long long>();
+                if (u.contains("input_tokens") && u["input_tokens"].is_number_integer())
+                    return u["input_tokens"].get<long long>();
+            }
+            return std::nullopt;
+        }
+        static std::optional<long long> usage_out(const nlohmann::json &u)
+        {
+            if (u.is_object())
+            {
+                if (u.contains("completion_tokens") && u["completion_tokens"].is_number_integer())
+                    return u["completion_tokens"].get<long long>();
+                if (u.contains("output_tokens") && u["output_tokens"].is_number_integer())
+                    return u["output_tokens"].get<long long>();
+            }
+            return std::nullopt;
+        }
+        static std::optional<long long> usage_total(const nlohmann::json &u)
+        {
+            if (u.is_object())
+            {
+                if (u.contains("total_tokens") && u["total_tokens"].is_number_integer())
+                    return u["total_tokens"].get<long long>();
+                auto in = usage_in(u), out = usage_out(u);
+                if (in && out)
+                    return *in + *out;
+            }
+            return std::nullopt;
+        }
+        // cache hit rate = cached prompt tokens / total prompt tokens
+        // OpenAI: usage.prompt_tokens_details.cached_tokens within usage.prompt_tokens (total incl. cache)
+        // Anthropic (llama.cpp): usage.cache_read_input_tokens disjoint from usage.input_tokens, so total = cache + input
+        static std::optional<double> usage_cache_hit(const nlohmann::json &u)
+        {
+            if (!u.is_object())
+                return std::nullopt;
+            long long cached = -1, total = -1;
+            if (u.contains("prompt_tokens_details") && u["prompt_tokens_details"].is_object())
+            {
+                cached = (long long)num_arg(u["prompt_tokens_details"], "cached_tokens", 0);
+                if (u.contains("prompt_tokens") && u["prompt_tokens"].is_number_integer())
+                    total = u["prompt_tokens"].get<long long>();
+            }
+            else if (u.contains("input_tokens_details") && u["input_tokens_details"].is_object())
+            {
+                // Responses API: {input_tokens, output_tokens, input_tokens_details:{cached_tokens}}
+                cached = (long long)num_arg(u["input_tokens_details"], "cached_tokens", 0);
+                if (u.contains("input_tokens") && u["input_tokens"].is_number_integer())
+                    total = u["input_tokens"].get<long long>();
+            }
+            else if (u.contains("cache_read_input_tokens") && u["cache_read_input_tokens"].is_number_integer())
+            {
+                // Anthropic: input_tokens excludes both cache reads and cache writes
+                // (cache_creation_input_tokens), so the prompt total is their sum
+                cached = u["cache_read_input_tokens"].get<long long>();
+                if (u.contains("input_tokens") && u["input_tokens"].is_number_integer())
+                    total = cached + u["input_tokens"].get<long long>() + (long long)num_arg(u, "cache_creation_input_tokens", 0);
+            }
+            if (cached < 0 || total <= 0)
+                return std::nullopt;
+            return (double)cached / (double)total;
+        }
+        // stream bookkeeping for one LLM round (ported from repl's StreamUI)
+        struct stream_ui
+        {
+            bool got = false, cancelled = false, answer_begun = false;
+            long long last_timer_ms = 0;
+            cell::sys::detail::clock::time_point t0;
+            cell::sys::detail::clock::time_point tok0;
+        };
+        struct xfer_ctx
+        {
+            stream_ui *ui = nullptr;
+            const events *ev = nullptr;
+        };
+        // libcurl progress poll: drives cancellation and the TTFB ticker while the
+        // request is blocked on the network (single-threaded, same as the REPL's)
+        static int xfer_poll(void *pp, curl_off_t, curl_off_t, curl_off_t, curl_off_t)
+        {
+            auto *xc = (xfer_ctx *)pp;
+            stream_ui &ui = *xc->ui;
+            const events &ev = *xc->ev;
+            if (ev.cancelled && ev.cancelled())
+                ui.cancelled = true;
+            if (!ui.got && !ui.cancelled && ev.on_progress)
+            {
+                long long ms = cell::sys::elapsed_ms(ui.t0);
+                if (ms - ui.last_timer_ms >= 500)
+                {
+                    ui.last_timer_ms = ms;
+                    ev.on_progress(ms);
+                }
+            }
+            return ui.cancelled ? 1 : 0;
+        }
+        // display caps for the tool events (full outputs stay in the transcript;
+        // these bounds only keep one event payload sane for a frontend)
+        constexpr size_t kToolArgsDisplayMax = 2048;
+        constexpr size_t kToolOutputDisplayMax = 64 * 1024;
+
+        // ---- the turn runner --------------------------------------------------
+        class runner
+        {
+        public:
+            runner(cell::config::settings &cfg, cell::encrypt::crypt &vault, cell::chat::history &h)
+                : cfg_(cfg), vault_(vault), h_(h)
+            {
+                auto tools_o = build_tools(false);
+                auto tools_a = build_tools(true);
+                auto tools_r = build_tools(false, true); // Responses API format
+                tool_list_ = std::move(tools_o.first);
+                tool_defs_openai_ = std::move(tools_o.second);
+                tool_defs_anthropic_ = std::move(tools_a.second);
+                tool_defs_responses_ = std::move(tools_r.second);
+                install_runtime();
+            }
+
+            cell::tools::runtime &tools_rt() { return tool_rt_; }
+            // the attached teamwork machinery (the REPL's /teamworks command
+            // drives jobs through it); the GUI reaches it via tools_rt().team_rt
+            cell::teamwork::runtime_context &team_rt() { return team_rt_; }
+            long long llm_requests() const { return llm_requests_.load(); }
+            long long tool_calls() const { return tool_calls_.load(); }
+
+            // inject the base system prompt + skills metadata into an empty session
+            struct prompt_info
+            {
+                size_t prompt_chars = 0, skills_chars = 0, skill_count = 0;
+                bool injected = false;
+            };
+            prompt_info ensure_prompt()
+            {
+                prompt_info info;
+                cell::chat::session &sess = h_.now();
+                if (!sess.msg().empty())
+                    return info;
+                sess.msg().push_back({{"role", "system"}, {"content", cfg_.system_prompt}});
+                auto skills_all = cell::skills::list();
+                std::string skills_prompt = cell::skills::metadata_prompt(skills_all);
+                if (!skills_prompt.empty())
+                    sess.msg().push_back({{"role", "system"}, {"content", skills_prompt}});
+                cell::sys::logger::instance().debug("ctx", std::format("inject system_prompt={}chars{}", cfg_.system_prompt.size(),
+                                                                       skills_prompt.empty() ? "" : std::format(", skills_metadata={}chars", skills_prompt.size())));
+                info.injected = true;
+                info.prompt_chars = cfg_.system_prompt.size();
+                info.skills_chars = skills_prompt.size();
+                info.skill_count = skills_all.size();
+                return info;
+            }
+
+            // run one agent turn to completion on the calling thread
+            turn_view run_turn(const std::string &input, bool resume_turn, const events &ev);
+
+            // compact the live session on demand (a frontend's /compact)
+            std::string compact_now(const events &ev) { return compact(h_.now(), ev); }
+
+            // pending notices -> transcript (+ on_notice events); also runs at the
+            // start of every fresh turn. Returns how many were delivered.
+            size_t inject_notices(bool report_empty, const events &ev);
+
+        private:
+            // ---- request machinery -------------------------------------------
+            // per-(provider, base) client cache
+            struct client_cache
+            {
+                std::unordered_map<std::string, std::unique_ptr<cell::llm::OpenAI>> openai;
+                std::unordered_map<std::string, std::unique_ptr<cell::llm::OpenAIResponses>> openai_responses;
+                std::unordered_map<std::string, std::unique_ptr<cell::llm::Anthropic>> anthropic;
+                cell::llm::OpenAI &o(const std::string &base)
+                {
+                    auto it = openai.find(base);
+                    if (it != openai.end())
+                    {
+                        cell::sys::logger::instance().debug("llm", std::format("client_cache_hit provider=openai base={}", base));
+                        return *it->second;
+                    }
+                    cell::sys::logger::instance().debug("llm", std::format("client_cache_miss provider=openai base={}", base));
+                    auto &p = openai[base];
+                    p = std::make_unique<cell::llm::OpenAI>(base);
+                    return *p;
+                }
+                cell::llm::OpenAIResponses &r(const std::string &base)
+                {
+                    auto it = openai_responses.find(base);
+                    if (it != openai_responses.end())
+                    {
+                        cell::sys::logger::instance().debug("llm", std::format("client_cache_hit provider=openai-responses base={}", base));
+                        return *it->second;
+                    }
+                    cell::sys::logger::instance().debug("llm", std::format("client_cache_miss provider=openai-responses base={}", base));
+                    auto &p = openai_responses[base];
+                    p = std::make_unique<cell::llm::OpenAIResponses>(base);
+                    return *p;
+                }
+                cell::llm::Anthropic &a(const std::string &base)
+                {
+                    auto it = anthropic.find(base);
+                    if (it != anthropic.end())
+                    {
+                        cell::sys::logger::instance().debug("llm", std::format("client_cache_hit provider=anthropic base={}", base));
+                        return *it->second;
+                    }
+                    cell::sys::logger::instance().debug("llm", std::format("client_cache_miss provider=anthropic base={}", base));
+                    auto &p = anthropic[base];
+                    p = std::make_unique<cell::llm::Anthropic>(base);
+                    return *p;
+                }
+            };
+            client_cache cache_;
+
+            // unified request dispatch: picks the right client + tool schema for
+            // any provider entry (ported verbatim from repl::run()'s do_chat)
+            bool do_chat(const cell::config::provider_entry &p, const cell::encrypt::secure_string &key,
+                         const std::string &model, const nlohmann::json &msgs, bool stream,
+                         cell::net::StreamCallback on_tok, cell::net::StreamCallback on_reason,
+                         const nlohmann::json *override_tools, nlohmann::json &reply,
+                         nlohmann::json &tc, nlohmann::json &usage, std::string &err,
+                         bool with_tools = true, int think_level = 0,
+                         cell::net::XferCallback on_xfer = nullptr, void *xfer_data = nullptr,
+                         long *http_status = nullptr)
+            {
+                nlohmann::json no_tools = nlohmann::json::array();
+                if (p.api_style == "anthropic")
+                {
+                    const nlohmann::json &tools = override_tools ? *override_tools : (with_tools ? tool_defs_anthropic_ : no_tools);
+                    auto &client = cache_.a(p.base);
+                    client.set_proxy(p.proxy);
+                    if (stream)
+                        return client.chat_stream(key, model, msgs, tools, std::move(on_tok), std::move(on_reason), reply, tc, usage, err, think_level, on_xfer, xfer_data, http_status);
+                    return client.chat(key, model, msgs, tools, reply, tc, usage, err, think_level, http_status);
+                }
+                if (p.api_style == "openai-responses")
+                {
+                    const nlohmann::json &tools = override_tools ? *override_tools : (with_tools ? tool_defs_responses_ : no_tools);
+                    auto &client = cache_.r(p.base);
+                    client.set_proxy(p.proxy);
+                    if (stream)
+                        return client.chat_stream(key, model, msgs, tools, std::move(on_tok), std::move(on_reason), reply, tc, usage, err, on_xfer, xfer_data, http_status);
+                    return client.chat(key, model, msgs, tools, reply, tc, usage, err, http_status);
+                }
+                // default: openai-chat (Chat Completions)
+                const nlohmann::json &tools = override_tools ? *override_tools : (with_tools ? tool_defs_openai_ : no_tools);
+                auto &client = cache_.o(p.base);
+                client.set_proxy(p.proxy);
+                if (stream)
+                    return client.chat_stream(key, model, msgs, tools, std::move(on_tok), std::move(on_reason), reply, tc, usage, err, on_xfer, xfer_data, http_status);
+                return client.chat(key, model, msgs, tools, reply, tc, usage, err, http_status);
+            }
+
+            // autoallow asks the model to evaluate only this action, not the session,
+            // prior tool output, or the user's system prompt. The check is fail-closed.
+            std::string autoallow_check(const std::string &tool_name, const std::string &action)
+            {
+                const cell::config::provider_entry *p = cfg_.current_provider_entry();
+                if (!p || cfg_.current_model.empty())
+                    return "internal error: no provider";
+                cell::encrypt::secure_string key = resolve_provider_key(*p, vault_);
+                if (key.empty())
+                    return "internal error: no API key";
+                const nlohmann::json messages = nlohmann::json::array({
+                    {{"role", "system"}, {"content", "You are an action safety gate. Determine whether this tool action is safe and legal to execute. If ALLOW, reply with exactly one word: ALLOW. If DENY, reply with a short explanation of why this action is unsafe (1-2 sentences)."}},
+                    {{"role", "user"}, {"content", std::format("Tool: {}\nArguments JSON:\n{}\n\nIs this action safe and legal to execute? ALLOW or explain why DENY.", tool_name, action)}},
+                });
+                nlohmann::json reply, tc, usage;
+                std::string err;
+                ++llm_requests_;
+                if (!do_chat(*p, key, cfg_.current_model, messages, false, nullptr, nullptr, nullptr,
+                             reply, tc, usage, err, false, cfg_.think_level))
+                {
+                    cell::sys::logger::instance().warn("autoallow", std::format("request_failed err={}", err.empty() ? "n/a" : err));
+                    return "autoallow request failed";
+                }
+                std::string answer = cell::text::trim(reply_text(reply));
+                cell::lower_ascii(answer);
+                if (answer == "allow")
+                    return "";
+                return answer;
+            }
+
+            // install the approval / safety channels + teamwork machinery on the
+            // the runner-owned tool runtime (approval / safety channels, the
+            // live session, the teamwork machinery)
+            void install_runtime();
+            // one summarization request for compaction (streams via ev.on_summary)
+            std::string summarize_part(const std::string &instruction, const std::string &body,
+                                       const std::string &label, const std::string &stream_header,
+                                       const events &ev);
+            // context compaction: archive the transcript, summarize conversation
+            // and thinking separately, rebuild the tail (the full rationale is
+            // attached to the definition below)
+            std::string compact(cell::chat::session &sess, const events &ev);
+
+            cell::config::settings &cfg_;
+            cell::encrypt::crypt &vault_;
+            cell::chat::history &h_;
+            std::unordered_map<std::string, std::shared_ptr<cell::tools::tool>> tool_list_;
+            nlohmann::json tool_defs_openai_, tool_defs_anthropic_, tool_defs_responses_;
+            cell::tools::runtime tool_rt_;
+            cell::teamwork::runtime_context team_rt_;
+            std::atomic<long long> llm_requests_{0};
+            std::atomic<long long> tool_calls_{0};
+            // the events of the turn currently running (approval + cancellation
+            // channels read it from worker threads; one turn at a time)
+            std::atomic<const events *> current_events_{nullptr};
+        };
+
+        void runner::install_runtime()
+        {
+            tool_rt_.autoallow_validator = [this](const std::string &tool, const std::string &action) -> std::string
+            { return autoallow_check(tool, action); };
+            tool_rt_.approval_required = [](const std::string &tool, const std::string &operation) -> bool
+            {
+                return !(tool == "tw" && operation != "run");
+            };
+            tool_rt_.action_enricher = [this](const std::string &tool_name, const std::string &action_json) -> std::string
+            {
+                if (tool_name != "tw")
+                    return action_json;
+                try
+                {
+                    auto parsed = nlohmann::json::parse(action_json);
+                    if (!parsed.is_object() || parsed.value("operation", "") != "run")
+                        return action_json;
+                    std::string job_id = parsed.value("id", "");
+                    if (job_id.empty())
+                        return action_json;
+                    auto store = cell::teamwork::load_store(h_.now().id());
+                    auto *job = cell::teamwork::find_job(store, job_id);
+                    if (!job)
+                        return action_json;
+                    nlohmann::json enriched = parsed;
+                    if (job->contains("work_type"))
+                        enriched["work_type"] = (*job)["work_type"];
+                    if (job->contains("list"))
+                        enriched["list"] = (*job)["list"];
+                    return enriched.dump();
+                }
+                catch (const std::exception &)
+                {
+                    return action_json;
+                }
+            };
+            // The interactive approval channel: forwards to the running turn's
+            // on_approval. The thread-affinity policy (the REPL denies approvals
+            // from worker threads because its prompt reads stdin) belongs to the
+            // frontend — a GUI can serve worker-thread approvals naturally.
+            tool_rt_.approval_prompt = [this](const std::string &tool, const std::string &args, std::string &reason) -> bool
+            {
+                const events *ev = current_events_.load(std::memory_order_acquire);
+                if (!ev || !ev->on_approval)
+                {
+                    reason = "needs approval but no interactive approval channel is available";
+                    return false;
+                }
+                return ev->on_approval(tool, args, reason);
+            };
+            tool_rt_.live_session = [this]() -> cell::chat::session *
+            { return &h_.now(); };
+            tool_rt_.session_id = [this]() -> std::string
+            { return h_.now().id(); };
+            tool_rt_.team_rt = [this]() -> cell::teamwork::runtime_context
+            { return team_rt_; };
+
+            // teamwork needs the same provider/request machinery as the main
+            // agent, but runs child requests non-streaming. Every child builds its
+            // own LLM client once (keyed to its own provider), which is then
+            // reused across all rounds: no shared curl handle between children and
+            // no per-round client churn.
+            team_rt_.settings = &cfg_;
+            team_rt_.tool_list = &tool_list_;
+            team_rt_.tool_defs_openai = &tool_defs_openai_;
+            team_rt_.tool_defs_anthropic = &tool_defs_anthropic_;
+            team_rt_.tool_defs_responses = &tool_defs_responses_;
+            team_rt_.make_chat = [](const cell::config::provider_entry &p,
+                                    const cell::encrypt::secure_string &key) -> cell::teamwork::worker_chat_fn
+            {
+                const std::string style = p.api_style;
+                const std::string base = p.base;
+                const std::string proxy = p.proxy;
+                cell::encrypt::secure_string secret = key; // kept in sodium memory for the worker's lifetime
+                const nlohmann::json no_tools = nlohmann::json::array();
+                if (style == "anthropic")
+                {
+                    auto client = std::make_shared<cell::llm::Anthropic>(base);
+                    client->set_proxy(proxy);
+                    return [client, secret, no_tools](const std::string &model, int think_level,
+                                                      const nlohmann::json &msgs, const nlohmann::json *tools,
+                                                      nlohmann::json &reply, nlohmann::json &tc,
+                                                      nlohmann::json &usage, std::string &err) -> bool
+                    {
+                        return client->chat(secret, model, msgs, tools ? *tools : no_tools, reply, tc, usage, err, think_level);
+                    };
+                }
+                if (style == "openai-responses")
+                {
+                    auto client = std::make_shared<cell::llm::OpenAIResponses>(base);
+                    client->set_proxy(proxy);
+                    return [client, secret, no_tools](const std::string &model, int,
+                                                      const nlohmann::json &msgs, const nlohmann::json *tools,
+                                                      nlohmann::json &reply, nlohmann::json &tc,
+                                                      nlohmann::json &usage, std::string &err) -> bool
+                    {
+                        return client->chat(secret, model, msgs, tools ? *tools : no_tools, reply, tc, usage, err);
+                    };
+                }
+                auto client = std::make_shared<cell::llm::OpenAI>(base);
+                client->set_proxy(proxy);
+                return [client, secret, no_tools](const std::string &model, int,
+                                                  const nlohmann::json &msgs, const nlohmann::json *tools,
+                                                  nlohmann::json &reply, nlohmann::json &tc,
+                                                  nlohmann::json &usage, std::string &err) -> bool
+                {
+                    return client->chat(secret, model, msgs, tools ? *tools : no_tools, reply, tc, usage, err);
+                };
+            };
+            team_rt_.resolve_key = [this](const cell::config::provider_entry &p) -> cell::encrypt::secure_string
+            { return resolve_provider_key(p, vault_); };
+            // teamwork runs share the same machinery; the live conversation is
+            // snapshotted per run on the thread that starts it
+            // (see teamwork::snapshot_foreground_context), never read from a worker
+            team_rt_.live_session = [this]() -> cell::chat::session *
+            { return &h_.now(); };
+            team_rt_.tools_rt = &tool_rt_;
+        }
+
+        size_t runner::inject_notices(bool report_empty, const events &ev)
+        {
+            auto got = cell::notice::drain(h_.now().id());
+            if (got.empty())
+            {
+                if (report_empty && ev.on_status)
+                    ev.on_status("no pending notices");
+                return 0;
+            }
+            for (auto &m : got)
+            {
+                if (ev.on_notice)
+                    ev.on_notice(cell::notice::render(m));
+                h_.now().msg().push_back({{"role", "system"},
+                                          {"content", std::format("A notice was delivered to this session (from={}{}). Treat it as context from the user or a supervised agent.\n{}",
+                                                                  m.from, m.topic.empty() ? "" : " topic=" + m.topic, m.body)}});
+            }
+            // notices arrive mid-conversation: lift them into the leading system
+            // block so a chat template never sees a system message behind a user turn
+            cell::chat::fold_system_messages(h_.now().msg());
+            cell::sys::logger::instance().info("notice", std::format("injected count={} session={}", got.size(), h_.now().id()));
+            return got.size();
+        }
+
+        // run one summarization request via the compression model (or session
+        // model) and return the summary text; empty on failure (caller falls back).
+        std::string runner::summarize_part(const std::string &instruction, const std::string &body,
+                                           const std::string &label, const std::string &stream_header,
+                                           const events &ev)
+        {
+            auto &log = cell::sys::logger::instance();
+            const cell::config::provider_entry *p = nullptr;
+            std::string model;
+            if (!cfg_.compact_provider.empty())
+            {
+                for (auto &pe : cfg_.providers)
+                    if (pe.name == cfg_.compact_provider)
+                    {
+                        p = &pe;
+                        break;
+                    }
+                if (!p)
+                {
+                    log.warn("ctx", std::format("compact provider '{}' not registered, falling back to session model", cfg_.compact_provider));
+                    p = cfg_.current_provider_entry();
+                    model = cfg_.current_model;
+                }
+                else
+                    model = cfg_.compact_model.empty() ? cfg_.current_model : cfg_.compact_model;
+            }
+            else
+            {
+                p = cfg_.current_provider_entry();
+                model = cfg_.current_model;
+            }
+            if (!p || model.empty())
+                return "";
+            cell::encrypt::secure_string key = resolve_provider_key(*p, vault_);
+            if (key.empty())
+                return "";
+            nlohmann::json prompt = nlohmann::json::array();
+            const std::string safe_body = cell::text::utf8_safe(body);
+            prompt.push_back({{"role", "user"},
+                              {"content", std::format("{}\n\n{}", instruction, safe_body)}});
+            nlohmann::json reply, tc, usage;
+            std::string err;
+            log.info("ctx", std::format("summarizing {} via={}:{} chars={} tools=off", label, p->name, model, body.size()));
+            if (ev.on_status && !stream_header.empty())
+                ev.on_status(stream_header);
+            auto t0 = cell::sys::detail::clock::now();
+            ++llm_requests_;
+            cell::net::StreamCallback stream_cb = [&ev](std::span<const char> data)
+            {
+                if (!data.empty() && ev.on_summary)
+                    ev.on_summary(std::string_view(data.data(), data.size()));
+            };
+            if (!do_chat(*p, key, model, prompt, true, std::move(stream_cb), nullptr, nullptr, reply, tc, usage, err, false, 0))
+            {
+                log.warn("ctx", std::format("summarization_failed part={} err={}", label, err.empty() ? "n/a" : err));
+                return "";
+            }
+            double sec = cell::sys::elapsed_ms(t0) / 1000.0;
+            std::string summary = reply_text(reply);
+            if (summary.empty())
+                return "";
+            // prompt-injection defence: re-sanitize the summary so a re-stated
+            // malicious instruction cannot survive into the new system message
+            summary = cell::text::utf8_safe(cell::box::sanitize_output(summary));
+            log.info("ctx", std::format("summary {} chars={} time={:.2f}s tok_in={} tok_out={}",
+                                        label, summary.size(), sec,
+                                        usage_in(usage).has_value() ? std::to_string(*usage_in(usage)) : "n/a",
+                                        usage_out(usage).has_value() ? std::to_string(*usage_out(usage)) : "n/a"));
+            cell::stats::add(h_.now().id(), std::format("{}:{}", p->name, model), content_chars(prompt), (long long)summary.size(), usage_in(usage), usage_out(usage), usage_total(usage), 0);
+            return summary;
+        }
+
+        // context compaction: keep every system message (the base prompt plus any
+        // injected skills — they are session state, not conversation), split the rest
+        // into conversation text and thinking text, summarize each separately, then
+        // rebuild the tail as the last user message followed by one {"role":
+        // "assistant","content": …} summary message. The summary is backfilled
+        // directly BEHIND the surviving user turn, so the transcript reads as a
+        // normal turn boundary (user → assistant) and the next user input lands
+        // behind the summary instead of piling onto an unanswered user message. The
+        // full transcript is archived to saved/msg-<UTC time>.jsonl inside the
+        // session folder before anything is rewritten; if either the archive or the
+        // conversation summary cannot be produced the context is left EXACTLY as it
+        // was: replacing real history with a placeholder would be irreversible data
+        // loss, and the whole point of compacting is to preserve the information.
+        std::string runner::compact(cell::chat::session &sess, const events &ev)
+        {
+            auto &msgs = sess.msg();
+            std::vector<size_t> sys_indexes;
+            nlohmann::json rest = nlohmann::json::array();
+            for (size_t i = 0; i < msgs.size(); i++)
+            {
+                if (!msgs[i].is_object())
+                    continue;
+                if (msgs[i].value("role", "") == "system")
+                    sys_indexes.push_back(i);
+                else
+                    rest.push_back(msgs[i]);
+            }
+            if (rest.size() <= 12)
+                return std::format("context already small ({} messages to aggregate)", rest.size());
+            std::string conv_text, think_text;
+            cell::chat::extract_parts(rest, conv_text, think_text);
+            std::string conv_summary = summarize_part(
+                "Summarize the conversation content as the memory, preserving key decisions, facts, file paths and unfinished tasks. Output only the memory.",
+                conv_text, "conversation", "Context Summary", ev);
+            if (conv_summary.empty())
+                return "compaction aborted: summarization failed, context left unchanged";
+            std::string think_summary;
+            if (!think_text.empty())
+                think_summary = summarize_part(
+                    "Summarize the agent's reasoning based on the preceding thinking. Focus on the key insights, decisions, and conclusions reached. Output only the summary of thinking step by step as the trace.",
+                    think_text, "reasoning", "Thinking Summary", ev);
+            // a chat template also needs at least one real turn left: replacing the
+            // whole conversation with system messages alone is rejected ("No user
+            // query found in messages"), and a caller that compacted on a context
+            // overflow would have nothing to re-send. The most recent REAL user
+            // message therefore survives next to the summary — never a tool_result
+            // carrier (role=user in the Anthropic format): keeping one without its
+            // assistant tool_use would make every provider reject the transcript.
+            const nlohmann::json *tail_user = nullptr;
+            for (size_t i = rest.size(); i-- > 0;)
+                if (cell::chat::is_user_turn(rest[i]))
+                {
+                    tail_user = &rest[i];
+                    break;
+                }
+            // archive the full transcript (system messages included) before the
+            // context is rewritten — /saved list|show|rm works on these archives
+            std::filesystem::path archive = cell::chat::archive_transcript(sess.directory(), msgs);
+            if (archive.empty())
+                return "compaction aborted: transcript archive failed, context left unchanged";
+            std::string content = std::format(
+                "# Here is a summary that captures the previous conversation:\n{}", conv_summary);
+            if (!think_summary.empty())
+                content += std::format(
+                    "\n# Summary of the agent's reasoning based on the preceding conversation:\n{}",
+                    think_summary);
+            nlohmann::json new_msgs = nlohmann::json::array();
+            for (size_t idx : sys_indexes)
+                new_msgs.push_back(msgs[idx]);
+            // fold first, while the array holds only system messages, so the
+            // leading block stays canonical for strict chat templates
+            cell::chat::fold_system_messages(new_msgs);
+            if (tail_user)
+                new_msgs.push_back(*tail_user);
+            // the summary is the assistant's own memory of the compacted run: a
+            // standalone assistant message directly behind the surviving user turn
+            // (the transcript ends on a turn boundary; the retry after an overflow
+            // continues from the summary, like /reload continues a partial reply)
+            new_msgs.push_back({{"role", "assistant"}, {"content", content}});
+            size_t removed = rest.size() - (tail_user ? 1 : 0);
+            msgs = std::move(new_msgs);
+            return std::format("context compacted: archived to {}, aggregated {} message(s) into 1 summary, {} message(s) remain",
+                               archive.filename().string(), removed, msgs.size());
+        }
+
+        // One agent turn: fold pending notices in, add the user message (a
+        // /reload resumes the interrupted turn without one), then run the
+        // LLM/tool rounds to completion. This is the only copy of the turn
+        // logic left: the REPL and the desktop shell both drive it, and every
+        // console write the REPL used to perform is an event here.
+        turn_view runner::run_turn(const std::string &input, bool resume_turn, const events &ev)
+        {
+            auto &log = cell::sys::logger::instance();
+            turn_view tv;
+            // one turn at a time: a second caller would race the approval channel
+            const events *expected = nullptr;
+            if (!current_events_.compare_exchange_strong(expected, &ev, std::memory_order_acq_rel))
+            {
+                log.warn("engine", "run_turn called while another turn is running");
+                if (ev.on_error)
+                    ev.on_error("a turn is already running on this engine");
+                tv.natural_end = false;
+                if (ev.on_turn_end)
+                    ev.on_turn_end(tv);
+                return tv;
+            }
+            // the events slot must be cleared no matter how the turn leaves
+            struct slot_guard
+            {
+                std::atomic<const events *> &slot;
+                ~slot_guard() { slot.store(nullptr, std::memory_order_release); }
+            } guard{current_events_};
+
+            if (!resume_turn)
+            {
+                // teamwork progress / cross-session notices join the turn
+                // silently — the agent sees them without ever having to poll
+                inject_notices(false, ev);
+                h_.now().msg().push_back({{"role", "user"}, {"content", input}});
+                log.info("user", std::format("chars={} text={}", input.size(), input));
+                // a new user message supersedes an interrupted turn: it is no
+                // longer the last thing in the transcript — nothing left to resume
+                if (!h_.now().interrupt_state().empty())
+                {
+                    log.info("llm", std::format("interrupt_cleared id={} why=new user input", h_.now().id()));
+                    h_.now().clear_interrupt();
+                }
+            }
+
+            bool done = false;
+            bool natural_end = true; // false when the turn aborted early (error, cancel, refusal)
+            int rounds = 0;
+            long long turn_tool_calls = 0;
+            long long turn_thinking_entries = 0;
+            // Safety valve: a model that keeps calling tools would otherwise loop
+            // (and bill) without bound. Teamwork children are capped at 8 rounds;
+            // the main loop legitimately needs far more, so this sits well above it.
+            constexpr int kMaxRoundsPerTurn = 200;
+            while (!done)
+            {
+                if (++rounds > kMaxRoundsPerTurn)
+                {
+                    log.warn("llm", std::format("turn aborted at the {} round limit", kMaxRoundsPerTurn));
+                    if (ev.on_error)
+                        ev.on_error(std::format("[aborted] this turn hit the {} round limit - the model kept requesting tools", kMaxRoundsPerTurn));
+                    natural_end = false;
+                    break;
+                }
+                const cell::config::provider_entry *p = cfg_.current_provider_entry();
+                if (!p || cfg_.current_model.empty())
+                {
+                    if (ev.on_error)
+                        ev.on_error("no model configured - add a provider with /provide add openai:URL, then pick a model with /models and /model NAME");
+                    done = true;
+                    natural_end = false;
+                    break;
+                }
+                cell::encrypt::secure_string key = resolve_provider_key(*p, vault_);
+                if (key.empty())
+                {
+                    if (ev.on_error)
+                        ev.on_error(std::format("no api key for {}: set the {} env var, or use /provide add {}:URL key:KEY",
+                                                p->name, p->style == "anthropic" ? "ANTHROPIC_API_KEY" : "OPENAI_API_KEY", p->style));
+                    done = true;
+                    natural_end = false;
+                    break;
+                }
+                size_t before = h_.now().msg().size();
+                long long in_chars = content_chars(h_.now().msg());
+                nlohmann::json reply, tool_calls, usage;
+                stream_ui ui;
+                auto t0 = cell::sys::detail::clock::now();
+                ui.t0 = t0;
+                xfer_ctx xc{&ui, &ev};
+                // retry loop for LLM requests: up to 5 attempts with 5s delay between retries (attempt resets on success)
+                constexpr int kMaxRetries = 5;
+                constexpr double kRetryDelaySec = 5.0;
+                bool ok = false;
+                std::string err;
+                int attempt = 0;
+                long http_status = 0;
+                bool compacted_this_round = false;
+                while (attempt < kMaxRetries)
+                {
+                    if (attempt > 0)
+                    {
+                        log.info("llm", std::format("retry attempt={}/{} delay={:.0f}s model={} round={}", attempt + 1, kMaxRetries, kRetryDelaySec, cfg_.model_label(), rounds));
+                        if (ev.on_status)
+                            ev.on_status(std::format("[retrying in {:.0f}s... attempt {}/{}]", kRetryDelaySec, attempt + 1, kMaxRetries));
+                        std::this_thread::sleep_for(std::chrono::milliseconds((int)(kRetryDelaySec * 1000)));
+                        // reset UI state for retry
+                        ui = stream_ui{};
+                        ui.t0 = cell::sys::detail::clock::now();
+                        reply = nlohmann::json{};
+                        tool_calls = nlohmann::json{};
+                        usage = nlohmann::json{};
+                        err.clear();
+                    }
+                    cell::net::StreamCallback tok_cb = [&ev, &ui](std::span<const char> data)
+                    {
+                        if (data.empty())
+                            return;
+                        if (!ui.got)
+                        {
+                            ui.got = true;
+                            ui.tok0 = cell::sys::detail::clock::now();
+                        }
+                        // end an open reasoning line before the answer text starts
+                        if (!ui.answer_begun)
+                        {
+                            ui.answer_begun = true;
+                            if (ev.on_answer_begin)
+                                ev.on_answer_begin();
+                        }
+                        if (ev.on_answer)
+                            ev.on_answer(std::string_view(data.data(), data.size()));
+                    };
+                    // chain-of-thought output: streamed ahead of the answer
+                    cell::net::StreamCallback reason_cb = [&ev](std::span<const char> data)
+                    {
+                        if (data.empty())
+                            return;
+                        if (ev.on_reason)
+                            ev.on_reason(std::string_view(data.data(), data.size()));
+                    };
+                    ++llm_requests_;
+                    // last line of defence: whatever injected a system message
+                    // (a notice, a skill, an interrupt, an old transcript read
+                    // back from disk) must not leave it behind the conversation
+                    cell::chat::fold_system_messages(h_.now().msg());
+                    http_status = 0;
+                    ok = do_chat(*p, key, cfg_.current_model, h_.now().msg(), true, std::move(tok_cb), std::move(reason_cb), nullptr, reply, tool_calls, usage, err, cfg_.tools, cfg_.think_level, &xfer_poll, &xc, &http_status);
+                    // context overflow: compress and retry immediately instead of
+                    // burning retry attempts on an error that compaction can fix
+                    if (!ok && !compacted_this_round && cell::chat::is_context_overflow(err) &&
+                        compact(h_.now(), ev).find("context compacted") != std::string::npos)
+                    {
+                        log.info("ctx", std::format("auto_compact_on_overflow ctx_msgs={} round={}", (long long)h_.now().msg().size(), rounds));
+                        if (ev.on_status)
+                            ev.on_status("[auto-compact on context overflow]");
+                        cell::box::reset_read_log();
+                        h_.now().unload();
+                        cell::async_io::flush();
+                        ui = stream_ui{};
+                        ui.t0 = cell::sys::detail::clock::now();
+                        reply = nlohmann::json{};
+                        tool_calls = nlohmann::json{};
+                        usage = nlohmann::json{};
+                        err.clear();
+                        compacted_this_round = true;
+                        // the transcript just shrank: re-baseline the per-turn
+                        // stats, otherwise the delta below underflows size_t
+                        before = h_.now().msg().size();
+                        in_chars = content_chars(h_.now().msg());
+                        // the compacted context may now fit: give it one more try
+                        // without counting this as a normal failed attempt
+                        continue; // retry the same round against the compacted context
+                    }
+                    if (ui.cancelled)
+                    {
+                        log.warn("llm", std::format("cancelled model={} round={} partial_chars={}", cfg_.model_label(), rounds, reply_text_len(reply)));
+                        if (ev.on_error)
+                            ev.on_error("[cancelled]");
+                        // Ctrl+C prints nothing and exits through the signal hook;
+                        // this path (a stop request) keeps the interrupted turn on disk
+                        cell::chat::record_interrupt(h_.now(), reply, ev.cancel_reason);
+                        if (ev.on_status)
+                            ev.on_status("[interrupted] partial output kept, pending tool calls cancelled");
+                        done = true;
+                        natural_end = false;
+                        break;
+                    }
+                    if (ok)
+                    {
+                        // success: reset attempt count and break out of retry loop
+                        attempt = 0;
+                        double final_sec = cell::sys::elapsed_ms(t0) / 1000.0;
+                        double final_ttf = !ui.got ? -1.0 : cell::sys::diff_ms(t0, ui.tok0) / 1000.0;
+                        log.info("llm", std::format("round={} model={} stream=true ctx_msgs={} tok_in={} tok_out={} cache={} time={:.2f}s ttf={} tools={} attempts={}",
+                                                    rounds, cfg_.model_label(), (long long)h_.now().msg().size(),
+                                                    usage_in(usage).has_value() ? std::to_string(*usage_in(usage)) : "n/a",
+                                                    usage_out(usage).has_value() ? std::to_string(*usage_out(usage)) : "n/a",
+                                                    usage_cache_hit(usage).has_value() ? std::format("{:.1f}%", *usage_cache_hit(usage) * 100.0) : "n/a",
+                                                    final_sec, final_ttf < 0 ? "n/a" : std::format("{:.2f}s", final_ttf),
+                                                    tool_calls.size(), attempt + 1));
+                        round_view rv;
+                        rv.round = rounds;
+                        rv.tok_in = usage_in(usage).value_or(-1);
+                        rv.tok_out = usage_out(usage).value_or(-1);
+                        rv.tok_total = usage_total(usage).value_or(-1);
+                        rv.cache_hit = usage_cache_hit(usage).value_or(-1.0);
+                        rv.seconds = final_sec;
+                        rv.ttft = final_ttf;
+                        rv.answer_chars = reply_text_len(reply);
+                        if (ev.on_round_end)
+                            ev.on_round_end(rv);
+                        break;
+                    }
+                    // request failed: retry only transient failures. A 4xx other
+                    // than 408/409/429 is deterministic (bad request, model or
+                    // base, auth, validation) — retrying it only burns 5s per
+                    // attempt; transport aborts report 0 here and stay retryable
+                    bool retryable = !(http_status >= 400 && http_status < 500 &&
+                                       http_status != 408 && http_status != 409 && http_status != 429);
+                    if (retryable && attempt < kMaxRetries - 1)
+                    {
+                        log.warn("llm", std::format("request_failed model={} round={} attempt={}/{} err={} -> retrying", cfg_.model_label(), rounds, attempt + 1, kMaxRetries, err.empty() ? "n/a" : err));
+                        attempt++;
+                    }
+                    else
+                    {
+                        // final attempt failed or a non-retryable client error: the
+                        // reply assembled so far is kept (do_chat assembles it even
+                        // after an aborted transfer) and the turn is recorded as
+                        // interrupted, so the user can reload instead of retyping
+                        double final_sec = cell::sys::elapsed_ms(t0) / 1000.0;
+                        log.error("llm", std::format("request_failed model={} round={} ctx_msgs={} time={:.2f}s err={} attempts={}", cfg_.model_label(), rounds, (long long)h_.now().msg().size(), final_sec, err.empty() ? "n/a" : err, attempt + 1));
+                        if (ev.on_error)
+                            ev.on_error(std::format("[llm error after {} attempt(s)] {}", attempt + 1, err.empty() ? "request failed" : err));
+                        cell::chat::record_interrupt(h_.now(), reply,
+                                                     std::format("LLM client error after {} attempt(s): {}", attempt + 1,
+                                                                 trunc_str(err.empty() ? "request failed" : err, 300)));
+                        if (ev.on_status)
+                            ev.on_status("[interrupted] partial output kept, pending tool calls cancelled");
+                        done = true;
+                        natural_end = false;
+                        break;
+                    }
+                }
+                if (done || ui.cancelled)
+                    break;
+                long long out_chars = reply_text_len(reply);
+                h_.now().msg().push_back(reply);
+                // count reasoning/thinking entries for the auto-compact threshold
+                if (reply.contains("content") && reply["content"].is_array())
+                    for (auto &b : reply["content"])
+                        if (b.is_object() && (b.value("type", "") == "reasoning" || b.value("type", "") == "thinking"))
+                            turn_thinking_entries++;
+                if (!tool_calls.empty())
+                {
+                    struct tresult
+                    {
+                        std::string name, args, policy, status, output;
+                        double sec = 0;
+                        bool blocked = false;
+                        cell::tools::rejection_reason rejected_for = cell::tools::rejection_reason::none;
+                        std::vector<cell::ContentBlock> multimodal_blocks;
+                    };
+                    std::vector<tresult> res(tool_calls.size());
+                    tool_calls_ += tool_calls.size();
+                    turn_tool_calls += (long long)tool_calls.size();
+                    // frontends see every call as soon as its policy is known
+                    auto emit_begin = [&](size_t i)
+                    {
+                        if (!ev.on_tool_begin)
+                            return;
+                        tool_view tvb;
+                        tvb.seq = i + 1;
+                        tvb.name = res[i].name;
+                        tvb.args = trunc_str(res[i].args, kToolArgsDisplayMax);
+                        tvb.policy = res[i].policy;
+                        ev.on_tool_begin(tvb);
+                    };
+                    // pass 1: Concurrent Phase tools (Policy::Allow, e.g. ls/read/rg/find)
+                    // run concurrently on the shared worker pool (max_threads); Deferred
+                    // Phase tools (Policy::Allow: write/edit) are queued for pass 2.
+                    size_t allow_count = 0;
+                    for (size_t i = 0; i < tool_calls.size(); i++)
+                    {
+                        auto &tc = tool_calls[i];
+                        res[i].name = tc["function"].value("name", "");
+                        res[i].args = tc["function"].value("arguments", "");
+                        res[i].policy = "?";
+                        res[i].status = "failed";
+                        res[i].output = "[tool failed]";
+                        auto it = tool_list_.find(res[i].name);
+                        if (it == tool_list_.end())
+                        {
+                            res[i].output = std::format("[unknown tool: {}]", res[i].name);
+                            res[i].status = "unknown";
+                            cell::sys::logger::instance().warn("tool", std::format("call_unknown name={} args={}", res[i].name, trunc_str(res[i].args, 200)));
+                            emit_begin(i);
+                        }
+                        else if (it->second->policy() == cell::tools::Policy::Allow)
+                        {
+                            // Allow tools scheduled as Phase::Deferred (write/edit)
+                            // run sequentially in pass 2: every read in the
+                            // same message must finish first (read-before-edit rule).
+                            // Concurrent Allow
+                            // tools (read-only) run on the shared worker pool now.
+                            if (it->second->schedule() == cell::tools::Phase::Deferred)
+                            {
+                                res[i].policy = "defer"; // sequential, no prompt
+                                emit_begin(i);
+                                continue;
+                            }
+                            res[i].policy = "allow";
+                            allow_count++;
+                            emit_begin(i);
+                            cell::sys::pool().submit([&res, this, it, i]
+                                                     {
+                            auto t0 = cell::sys::detail::clock::now();
+                            cell::ToolOutput o;
+                            try
+                            {
+                                o = it->second->execute(tool_rt_, res[i].args);
+                            }
+                            catch (const std::exception &e)
+                            {
+                                o = cell::ToolOutput::fail(std::format("[tool error: {}]", e.what()));
+                                res[i].status = "exception";
+                            }
+                            if (o.ok)
+                            {
+                                res[i].output = std::move(o.text);
+                                res[i].status = "ok";
+                            }
+                            else if (it->second->blocked())
+                            {
+                                res[i].blocked = true;
+                                res[i].rejected_for = it->second->rejected_for();
+                                res[i].status = "blocked";
+                                if (!o.text.empty())
+                                    res[i].output = std::move(o.text); // surface the sandbox refusal reason to the model
+                            }
+                            else if (!o.text.empty())
+                            {
+                                res[i].output = std::move(o.text);
+                            }
+                            res[i].multimodal_blocks = std::move(o.blocks);
+                            res[i].sec = cell::sys::elapsed_ms(t0) / 1000.0; });
+                        }
+                        else
+                        {
+                            res[i].policy = (it->second->policy() == cell::tools::Policy::Deny) ? "deny" : "ask";
+                            emit_begin(i);
+                        }
+                    }
+                    if (allow_count)
+                        cell::sys::pool().wait_all();
+                    // pass 2: Phase::Deferred tools (write/edit — no prompt) and
+                    // confirm-required tools (exec) run sequentially, in order
+                    for (size_t i = 0; i < tool_calls.size(); i++)
+                    {
+                        // "deny" is a policy verdict, not a queue entry: pass 1
+                        // already marked it rejected, pass 2 must not run it
+                        if (res[i].policy != "defer" && res[i].policy != "ask")
+                            continue;
+                        auto t0 = cell::sys::detail::clock::now();
+                        auto it = tool_list_.find(res[i].name);
+                        cell::ToolOutput o;
+                        try
+                        {
+                            if (it != tool_list_.end())
+                                o = it->second->execute(tool_rt_, res[i].args);
+                            else
+                                o = cell::ToolOutput::fail("[tool failed]");
+                        }
+                        catch (const std::exception &e)
+                        {
+                            o = cell::ToolOutput::fail(std::format("[tool error: {}]", e.what()));
+                            res[i].status = "exception";
+                        }
+                        if (o.ok)
+                        {
+                            res[i].output = std::move(o.text);
+                            res[i].status = "ok";
+                        }
+                        else if (it != tool_list_.end() && it->second->blocked())
+                        {
+                            res[i].blocked = true;
+                            res[i].rejected_for = it->second->rejected_for();
+                            res[i].status = "blocked";
+                            if (!o.text.empty())
+                                res[i].output = std::move(o.text); // surface the sandbox refusal reason to the model
+                        }
+                        else if (!o.text.empty())
+                        {
+                            res[i].output = std::move(o.text);
+                        }
+                        res[i].multimodal_blocks = std::move(o.blocks);
+                        res[i].sec = cell::sys::elapsed_ms(t0) / 1000.0;
+                    }
+                    // results are emitted in the original tool_call order
+                    size_t tc_seq = 0;
+                    for (size_t i = 0; i < tool_calls.size(); i++)
+                    {
+                        tc_seq++;
+                        auto &tc = tool_calls[i];
+                        log.info("tool", std::format("#{} {} policy={} status={} time={:.2f}s out_chars={} args={}",
+                                                     tc_seq, res[i].name, res[i].policy, res[i].status, res[i].sec,
+                                                     (long long)res[i].output.size(), trunc_str(res[i].args, 200)));
+                        std::string marker;
+                        std::string wrapped = harden_tool_result(res[i].name, res[i].args, res[i].output, &marker);
+                        // the frontend echo of the returned content: bounded so one
+                        // event payload stays sane; the transcript keeps the full result
+                        std::string shown = cell::text::console_safe(res[i].output);
+                        if (shown.size() > kToolOutputDisplayMax)
+                        {
+                            shown.resize(kToolOutputDisplayMax);
+                            shown += std::format("\n[output truncated: {} more chars]", (long long)(res[i].output.size() - kToolOutputDisplayMax));
+                        }
+                        if (!shown.empty() && shown.back() == '\n')
+                            shown.pop_back();
+                        if (ev.on_tool_end)
+                        {
+                            tool_view tve;
+                            tve.seq = tc_seq;
+                            tve.name = res[i].name;
+                            tve.args = trunc_str(res[i].args, kToolArgsDisplayMax);
+                            tve.policy = res[i].policy;
+                            tve.status = res[i].status;
+                            tve.display = std::move(shown);
+                            tve.marker = marker;
+                            tve.sec = res[i].sec;
+                            tve.chars = (long long)res[i].output.size();
+                            tve.multimodal = res[i].multimodal_blocks.size();
+                            ev.on_tool_end(tve);
+                        }
+                        if (p->api_style != "anthropic")
+                        {
+                            // Check for multimodal content
+                            if (!res[i].multimodal_blocks.empty())
+                            {
+                                // Build multimodal content for OpenAI APIs
+                                nlohmann::json content_array = nlohmann::json::array();
+                                content_array.push_back({{"type", "text"}, {"text", wrapped}});
+                                for (const auto &block : res[i].multimodal_blocks)
+                                {
+                                    if (block.type == cell::ContentBlock::Type::InputImage)
+                                    {
+                                        if (p->api_style == "openai-responses")
+                                        {
+                                            content_array.push_back({{"type", "input_image"},
+                                                                     {"image_url", "data:" + block.media_type + ";base64," + block.data},
+                                                                     {"detail", block.detail.empty() ? "low" : block.detail}});
+                                        }
+                                        else
+                                        {
+                                            content_array.push_back({{"type", "image_url"},
+                                                                     {"image_url", {{"url", "data:" + block.media_type + ";base64," + block.data}}}});
+                                        }
+                                    }
+                                    else if (block.type == cell::ContentBlock::Type::InputAudio)
+                                    {
+                                        std::string format = cell::box::get_audio_format(block.media_type);
+                                        if (p->api_style == "openai-responses")
+                                        {
+                                            content_array.push_back({{"type", "input_audio"},
+                                                                     {"data", block.data},
+                                                                     {"format", format}});
+                                        }
+                                        else
+                                        {
+                                            content_array.push_back({{"type", "input_audio"},
+                                                                     {"input_audio", {{"data", block.data}, {"format", format}}}});
+                                        }
+                                    }
+                                }
+                                if (p->api_style == "openai-responses")
+                                {
+                                    nlohmann::json resp_output = nlohmann::json::array();
+                                    resp_output.push_back({{"type", "input_text"}, {"text", wrapped}});
+                                    for (const auto &block : res[i].multimodal_blocks)
+                                    {
+                                        if (block.type == cell::ContentBlock::Type::InputImage)
+                                            resp_output.push_back({{"type", "input_image"}, {"image_url", "data:" + block.media_type + ";base64," + block.data}});
+                                        else if (block.type == cell::ContentBlock::Type::InputAudio)
+                                            resp_output.push_back({{"type", "input_audio"}, {"data", block.data}, {"format", cell::box::get_audio_format(block.media_type)}});
+                                    }
+                                    h_.now().msg().push_back({{"type", "function_call_output"}, {"call_id", tc.value("id", "")}, {"output", resp_output}});
+                                }
+                                else
+                                    h_.now().msg().push_back({{"role", "tool"}, {"tool_call_id", tc.value("id", "")}, {"content", content_array}});
+                            }
+                            else
+                            {
+                                // Text-only output
+                                if (p->api_style == "openai-responses")
+                                    h_.now().msg().push_back({{"type", "function_call_output"}, {"call_id", tc.value("id", "")}, {"output", nlohmann::json::array({{{"type", "input_text"}, {"text", wrapped}}})}});
+                                else
+                                    h_.now().msg().push_back({{"role", "tool"}, {"tool_call_id", tc.value("id", "")}, {"content", wrapped}});
+                            }
+                        }
+                        else
+                        {
+                            // Anthropic API
+                            if (!res[i].multimodal_blocks.empty())
+                            {
+                                nlohmann::json content_array = nlohmann::json::array();
+                                content_array.push_back({{"type", "text"}, {"text", wrapped}});
+                                for (const auto &block : res[i].multimodal_blocks)
+                                {
+                                    if (block.type == cell::ContentBlock::Type::InputImage)
+                                    {
+                                        content_array.push_back({{"type", "image"},
+                                                                 {"source", {{"type", "base64"}, {"media_type", block.media_type}, {"data", block.data}}}});
+                                    }
+                                    else if (block.type == cell::ContentBlock::Type::InputAudio)
+                                    {
+                                        content_array.push_back({{"type", "audio"},
+                                                                 {"source", {{"type", "base64"}, {"media_type", block.media_type}, {"data", block.data}}}});
+                                    }
+                                }
+                                h_.now().msg().push_back({{"role", "user"}, {"content", nlohmann::json::array({{{"type", "tool_result"}, {"tool_use_id", tc.value("id", "")}, {"content", content_array}}})}});
+                            }
+                            else
+                            {
+                                h_.now().msg().push_back({{"role", "user"}, {"content", nlohmann::json::array({{{"type", "tool_result"}, {"tool_use_id", tc.value("id", "")}, {"content", wrapped}}})}});
+                            }
+                        }
+                    }
+                    // sandbox security refusals are normal feedback; only approval
+                    // refusals end the run (user decline only, autoallow reject
+                    // returns error message and continues)
+                    bool approval_refused = false;
+                    for (size_t i = 0; i < tool_calls.size(); i++)
+                        if (res[i].blocked && res[i].rejected_for == cell::tools::rejection_reason::user)
+                        {
+                            approval_refused = true;
+                            if (ev.on_error)
+                                ev.on_error(std::format("[tool call rejected: {} - stopping this run]", res[i].name));
+                            break;
+                        }
+                    cell::stats::add(h_.now().id(), cfg_.model_label(), in_chars, out_chars, usage_in(usage), usage_out(usage), usage_total(usage), (long long)(h_.now().msg().size() - before));
+                    if (approval_refused)
+                    {
+                        done = true;
+                        natural_end = false; // user decline / autoallow deny aborts the turn
+                    }
+                    continue;
+                }
+                done = true;
+                cell::stats::add(h_.now().id(), cfg_.model_label(), in_chars, out_chars, usage_in(usage), usage_out(usage), usage_total(usage), (long long)(h_.now().msg().size() - before));
+            }
+            // the turn reached its natural end: whatever a previous turn left
+            // behind is answered now, so the interrupt state is resolved (this is
+            // also what a successful /reload clears it with)
+            if (natural_end && !h_.now().interrupt_state().empty())
+            {
+                log.info("llm", std::format("interrupt_cleared id={} why=turn completed", h_.now().id()));
+                h_.now().clear_interrupt();
+            }
+            // auto-compact after long agent runs: three or more tool calls or
+            // thinking entries since the last user message, or a context that has
+            // simply grown past a character budget — a pure chat turn produces
+            // neither tool calls nor reasoning, and previously grew without bound
+            // until it hit the provider's window (the one path that could lose
+            // history). only after turns that ended naturally — an aborted turn
+            // (request error, cancel, approval refusal) may be retried or resumed
+            // as-is, so compacting it automatically would rewrite history under it
+            constexpr long long kAutoCompactChars = 400 * 1024; // ≈100k tokens
+            bool long_run = turn_tool_calls + turn_thinking_entries >= 3;
+            long long ctx_chars = natural_end ? content_chars(h_.now().msg()) : 0;
+            bool oversized = ctx_chars >= kAutoCompactChars;
+            if (cfg_.compact_auto && natural_end && (long_run || oversized))
+            {
+                std::string result = compact(h_.now(), ev);
+                if (result.find("context compacted") != std::string::npos)
+                {
+                    log.info("ctx", std::format("auto_compact tool_calls={} thinking={} chars={} msgs={} result={}",
+                                                turn_tool_calls, turn_thinking_entries, ctx_chars, (long long)h_.now().msg().size(), result));
+                    if (ev.on_status)
+                        ev.on_status(std::format("[auto-compact] {}", result));
+                    cell::box::reset_read_log();
+                }
+            }
+            h_.now().unload();
+            log.debug("sess", std::format("persisted id={} msgs={}", h_.now().id(), h_.now().msg().size()));
+            cfg_.session_id = h_.now().id();
+            cell::config::save(cfg_);
+            tv.natural_end = natural_end;
+            tv.rounds = rounds;
+            tv.tool_calls = turn_tool_calls;
+            tv.thinking_entries = turn_thinking_entries;
+            if (ev.on_turn_end)
+                ev.on_turn_end(tv);
+            return tv;
+        }
+    } // namespace engine
+} // namespace cell
+
+// =============================================================================
 //  repl — the agent session loop. main() parses the CLI, then hands the loaded
 //  configuration over; the request machinery, the slash-command dispatcher, the
 //  agent turn (pass 1 concurrent read-only tools, pass 2 sequential write/edit
@@ -19029,8 +20415,6 @@ int repl::run()
     cell::encrypt::crypt vault;
     auto &log = cell::sys::logger::instance();
     auto t_start = cell::sys::detail::clock::now();
-    long long total_llm_requests = 0;
-    long long total_tool_calls = 0;
 
     // configure the read-only tool worker pool from config.json before first use
     cell::sys::pool_max_setting() = std::clamp(cfg.max_threads, (size_t)1, (size_t)16);
@@ -19094,337 +20478,6 @@ int repl::run()
         }
     }
 
-    // -------- phase: request machinery — client cache, key resolution, tool
-    // schemas and the unified do_chat() dispatcher for all three API styles --------
-    // per-(provider, base) client cache
-    struct client_cache
-    {
-        std::unordered_map<std::string, std::unique_ptr<cell::llm::OpenAI>> openai;
-        std::unordered_map<std::string, std::unique_ptr<cell::llm::OpenAIResponses>> openai_responses;
-        std::unordered_map<std::string, std::unique_ptr<cell::llm::Anthropic>> anthropic;
-        cell::llm::OpenAI &o(const std::string &base)
-        {
-            auto it = openai.find(base);
-            if (it != openai.end())
-            {
-                cell::sys::logger::instance().debug("llm", std::format("client_cache_hit provider=openai base={}", base));
-                return *it->second;
-            }
-            cell::sys::logger::instance().debug("llm", std::format("client_cache_miss provider=openai base={}", base));
-            auto &p = openai[base];
-            p = std::make_unique<cell::llm::OpenAI>(base);
-            return *p;
-        }
-        cell::llm::OpenAIResponses &r(const std::string &base)
-        {
-            auto it = openai_responses.find(base);
-            if (it != openai_responses.end())
-            {
-                cell::sys::logger::instance().debug("llm", std::format("client_cache_hit provider=openai-responses base={}", base));
-                return *it->second;
-            }
-            cell::sys::logger::instance().debug("llm", std::format("client_cache_miss provider=openai-responses base={}", base));
-            auto &p = openai_responses[base];
-            p = std::make_unique<cell::llm::OpenAIResponses>(base);
-            return *p;
-        }
-        cell::llm::Anthropic &a(const std::string &base)
-        {
-            auto it = anthropic.find(base);
-            if (it != anthropic.end())
-            {
-                cell::sys::logger::instance().debug("llm", std::format("client_cache_hit provider=anthropic base={}", base));
-                return *it->second;
-            }
-            cell::sys::logger::instance().debug("llm", std::format("client_cache_miss provider=anthropic base={}", base));
-            auto &p = anthropic[base];
-            p = std::make_unique<cell::llm::Anthropic>(base);
-            return *p;
-        }
-    } cache;
-
-    // Independent LLM clients for Teamwork children are created inside
-    // team_rt.make_chat (below), one per worker, so parallel children never
-    // share a curl handle and consecutive rounds reuse the same connection.
-
-    auto resolve_key = [&](const cell::config::provider_entry &p) -> cell::encrypt::secure_string
-    {
-        if (!p.key_id.empty())
-        {
-            auto k = vault.get(p.key_id);
-            if (!k.empty())
-                return k;
-        }
-        const char *env = std::getenv(p.api_style == "anthropic" ? "ANTHROPIC_API_KEY" : "OPENAI_API_KEY");
-        if (env && *env)
-            return cell::encrypt::secure_string(env);
-        return vault.get("api_key");
-    };
-
-    // tool definitions for all API styles
-    auto tools_o = build_tools(false);
-    auto tools_a = build_tools(true);
-    auto tools_r = build_tools(false, true); // Responses API format
-    auto &tool_list = tools_o.first;
-    const nlohmann::json &tool_defs_openai = tools_o.second;
-    const nlohmann::json &tool_defs_anthropic = tools_a.second;
-    const nlohmann::json &tool_defs_responses = tools_r.second;
-
-    // unified request dispatch: picks the right client + tool schema for any provider entry
-    auto do_chat = [&](const cell::config::provider_entry &p, const cell::encrypt::secure_string &key,
-                       const std::string &model, const nlohmann::json &msgs, bool stream,
-                       cell::net::StreamCallback on_tok, cell::net::StreamCallback on_reason,
-                       const nlohmann::json *override_tools, nlohmann::json &reply,
-                       nlohmann::json &tc, nlohmann::json &usage, std::string &err,
-                       bool with_tools = true, int think_level = 0,
-                       cell::net::XferCallback on_xfer = nullptr, void *xfer_data = nullptr,
-                       long *http_status = nullptr) -> bool
-    {
-        nlohmann::json no_tools = nlohmann::json::array();
-        if (p.api_style == "anthropic")
-        {
-            const nlohmann::json &tools = override_tools ? *override_tools : (with_tools ? tool_defs_anthropic : no_tools);
-            auto &client = cache.a(p.base);
-            client.set_proxy(p.proxy);
-            if (stream)
-                return client.chat_stream(key, model, msgs, tools, std::move(on_tok), std::move(on_reason), reply, tc, usage, err, think_level, on_xfer, xfer_data, http_status);
-            return client.chat(key, model, msgs, tools, reply, tc, usage, err, think_level, http_status);
-        }
-        if (p.api_style == "openai-responses")
-        {
-            const nlohmann::json &tools = override_tools ? *override_tools : (with_tools ? tool_defs_responses : no_tools);
-            auto &client = cache.r(p.base);
-            client.set_proxy(p.proxy);
-            if (stream)
-                return client.chat_stream(key, model, msgs, tools, std::move(on_tok), std::move(on_reason), reply, tc, usage, err, on_xfer, xfer_data, http_status);
-            return client.chat(key, model, msgs, tools, reply, tc, usage, err, http_status);
-        }
-        // default: openai-chat (Chat Completions)
-        const nlohmann::json &tools = override_tools ? *override_tools : (with_tools ? tool_defs_openai : no_tools);
-        auto &client = cache.o(p.base);
-        client.set_proxy(p.proxy);
-        if (stream)
-            return client.chat_stream(key, model, msgs, tools, std::move(on_tok), std::move(on_reason), reply, tc, usage, err, on_xfer, xfer_data, http_status);
-        return client.chat(key, model, msgs, tools, reply, tc, usage, err, http_status);
-    };
-
-    auto trunc = [](const std::string &s, size_t n) -> std::string
-    {
-        return s.size() <= n ? s : s.substr(0, n) + "...";
-    };
-
-    // character count of any JSON value without building a serialized copy
-    auto json_chars = [](const nlohmann::json &j, auto &&self) -> long long
-    {
-        long long n = 0;
-        if (j.is_string())
-            n += (long long)j.get_ref<const std::string &>().size();
-        else if (j.is_array())
-            for (auto &e : j)
-                n += self(e, self);
-        else if (j.is_object())
-            for (auto &[k, v] : j.items())
-                n += (long long)k.size() + self(v, self);
-        return n;
-    };
-    auto content_chars = [&](const nlohmann::json &msgs) -> long long
-    {
-        long long n = 0;
-        for (auto &m : msgs)
-        {
-            auto it = m.find("content");
-            if (it == m.end())
-                continue;
-            n += json_chars(*it, json_chars);
-        }
-        return n;
-    };
-    auto reply_text = [](const nlohmann::json &reply) -> std::string
-    {
-        auto it = reply.find("content");
-        if (it == reply.end())
-            return "";
-        if (it->is_string())
-            return it->get<std::string>();
-        if (it->is_array())
-        {
-            std::string t;
-            for (auto &b : *it)
-                if (b.value("type", "") == "text" && b.contains("text"))
-                    t += b["text"].get<std::string>();
-            return t;
-        }
-        return "";
-    };
-    auto reply_text_len = [&](const nlohmann::json &reply) -> long long
-    {
-        auto it = reply.find("content");
-        if (it == reply.end())
-            return 0;
-        if (it->is_string())
-            return (long long)it->get_ref<const std::string &>().size();
-        long long n = 0;
-        if (it->is_array())
-            for (auto &b : *it)
-                if (b.value("type", "") == "text" && b.contains("text") && b["text"].is_string())
-                    n += (long long)b["text"].get_ref<const std::string &>().size();
-        return n;
-    };
-
-    // autoallow asks the model to evaluate only this action, not the session,
-    // prior tool output, or the user's system prompt. The check is fail-closed.
-    auto autoallow_check = [&do_chat, &cfg, &resolve_key, &total_llm_requests, &reply_text](const std::string &tool_name, const std::string &action) -> std::string
-    {
-        const cell::config::provider_entry *p = cfg.current_provider_entry();
-        if (!p || cfg.current_model.empty())
-            return "internal error: no provider";
-        cell::encrypt::secure_string key = resolve_key(*p);
-        if (key.empty())
-            return "internal error: no API key";
-        const nlohmann::json messages = nlohmann::json::array({
-            {{"role", "system"}, {"content", "You are an action safety gate. Determine whether this tool action is safe and legal to execute. If ALLOW, reply with exactly one word: ALLOW. If DENY, reply with a short explanation of why this action is unsafe (1-2 sentences)."}},
-            {{"role", "user"}, {"content", std::format("Tool: {}\nArguments JSON:\n{}\n\nIs this action safe and legal to execute? ALLOW or explain why DENY.", tool_name, action)}},
-        });
-        nlohmann::json reply, tc, usage;
-        std::string err;
-        ++total_llm_requests;
-        if (!do_chat(*p, key, cfg.current_model, messages, false, nullptr, nullptr, nullptr,
-                     reply, tc, usage, err, false, cfg.think_level))
-        {
-            cell::sys::logger::instance().warn("autoallow", std::format("request_failed err={}", err.empty() ? "n/a" : err));
-            return "autoallow request failed";
-        }
-        std::string answer = cell::text::trim(reply_text(reply));
-        cell::lower_ascii(answer);
-        if (answer == "allow")
-            return "";
-        return answer;
-    };
-    // The approval / safety channels, the live-session accessors and the
-    // teamwork machinery are installed on tool_rt below (after the session is
-    // bootstrapped), never on globals.
-
-    // Teamwork needs the same provider/request machinery as the main agent, but
-    // runs child requests non-streaming. Every child builds its own LLM client
-    // once (keyed to its own provider), which is then reused across all rounds:
-    // no shared curl handle between children and no per-round client churn.
-    cell::teamwork::runtime_context team_rt;
-    team_rt.settings = &cfg;
-    team_rt.tool_list = &tool_list;
-    team_rt.tool_defs_openai = &tool_defs_openai;
-    team_rt.tool_defs_anthropic = &tool_defs_anthropic;
-    team_rt.tool_defs_responses = &tool_defs_responses;
-    team_rt.make_chat = [](const cell::config::provider_entry &p,
-                           const cell::encrypt::secure_string &key) -> cell::teamwork::worker_chat_fn
-    {
-        const std::string style = p.api_style;
-        const std::string base = p.base;
-        const std::string proxy = p.proxy;
-        cell::encrypt::secure_string secret = key; // kept in sodium memory for the worker's lifetime
-        const nlohmann::json no_tools = nlohmann::json::array();
-        if (style == "anthropic")
-        {
-            auto client = std::make_shared<cell::llm::Anthropic>(base);
-            client->set_proxy(proxy);
-            return [client, secret, no_tools](const std::string &model, int think_level,
-                                              const nlohmann::json &msgs, const nlohmann::json *tools,
-                                              nlohmann::json &reply, nlohmann::json &tc,
-                                              nlohmann::json &usage, std::string &err) -> bool
-            {
-                return client->chat(secret, model, msgs, tools ? *tools : no_tools, reply, tc, usage, err, think_level);
-            };
-        }
-        if (style == "openai-responses")
-        {
-            auto client = std::make_shared<cell::llm::OpenAIResponses>(base);
-            client->set_proxy(proxy);
-            return [client, secret, no_tools](const std::string &model, int,
-                                              const nlohmann::json &msgs, const nlohmann::json *tools,
-                                              nlohmann::json &reply, nlohmann::json &tc,
-                                              nlohmann::json &usage, std::string &err) -> bool
-            {
-                return client->chat(secret, model, msgs, tools ? *tools : no_tools, reply, tc, usage, err);
-            };
-        }
-        auto client = std::make_shared<cell::llm::OpenAI>(base);
-        client->set_proxy(proxy);
-        return [client, secret, no_tools](const std::string &model, int,
-                                          const nlohmann::json &msgs, const nlohmann::json *tools,
-                                          nlohmann::json &reply, nlohmann::json &tc,
-                                          nlohmann::json &usage, std::string &err) -> bool
-        {
-            return client->chat(secret, model, msgs, tools ? *tools : no_tools, reply, tc, usage, err);
-        };
-    };
-    team_rt.resolve_key = resolve_key;
-    auto usage_in = [](const nlohmann::json &u) -> std::optional<long long>
-    {
-        if (u.is_object())
-        {
-            if (u.contains("prompt_tokens") && u["prompt_tokens"].is_number_integer())
-                return u["prompt_tokens"].get<long long>();
-            if (u.contains("input_tokens") && u["input_tokens"].is_number_integer())
-                return u["input_tokens"].get<long long>();
-        }
-        return std::nullopt;
-    };
-    auto usage_out = [](const nlohmann::json &u) -> std::optional<long long>
-    {
-        if (u.is_object())
-        {
-            if (u.contains("completion_tokens") && u["completion_tokens"].is_number_integer())
-                return u["completion_tokens"].get<long long>();
-            if (u.contains("output_tokens") && u["output_tokens"].is_number_integer())
-                return u["output_tokens"].get<long long>();
-        }
-        return std::nullopt;
-    };
-    auto usage_total = [&](const nlohmann::json &u) -> std::optional<long long>
-    {
-        if (u.is_object())
-        {
-            if (u.contains("total_tokens") && u["total_tokens"].is_number_integer())
-                return u["total_tokens"].get<long long>();
-            auto in = usage_in(u), out = usage_out(u);
-            if (in && out)
-                return *in + *out;
-        }
-        return std::nullopt;
-    };
-    // cache hit rate = cached prompt tokens / total prompt tokens
-    // OpenAI: usage.prompt_tokens_details.cached_tokens within usage.prompt_tokens (total incl. cache)
-    // Anthropic (llama.cpp): usage.cache_read_input_tokens disjoint from usage.input_tokens, so total = cache + input
-    auto usage_cache_hit = [](const nlohmann::json &u) -> std::optional<double>
-    {
-        if (!u.is_object())
-            return std::nullopt;
-        long long cached = -1, total = -1;
-        if (u.contains("prompt_tokens_details") && u["prompt_tokens_details"].is_object())
-        {
-            cached = (long long)num_arg(u["prompt_tokens_details"], "cached_tokens", 0);
-            if (u.contains("prompt_tokens") && u["prompt_tokens"].is_number_integer())
-                total = u["prompt_tokens"].get<long long>();
-        }
-        else if (u.contains("input_tokens_details") && u["input_tokens_details"].is_object())
-        {
-            // Responses API: {input_tokens, output_tokens, input_tokens_details:{cached_tokens}}
-            cached = (long long)num_arg(u["input_tokens_details"], "cached_tokens", 0);
-            if (u.contains("input_tokens") && u["input_tokens"].is_number_integer())
-                total = u["input_tokens"].get<long long>();
-        }
-        else if (u.contains("cache_read_input_tokens") && u["cache_read_input_tokens"].is_number_integer())
-        {
-            // Anthropic: input_tokens excludes both cache reads and cache writes
-            // (cache_creation_input_tokens), so the prompt total is their sum
-            cached = u["cache_read_input_tokens"].get<long long>();
-            if (u.contains("input_tokens") && u["input_tokens"].is_number_integer())
-                total = cached + u["input_tokens"].get<long long>() + (long long)num_arg(u, "cache_creation_input_tokens", 0);
-        }
-        if (cached < 0 || total <= 0)
-            return std::nullopt;
-        return (double)cached / (double)total;
-    };
-
     // -------- phase: session bootstrap — resume, cwd follow, skills injection,
     // boot probe and the exit guard --------
     // session + skills prompt injection
@@ -19479,19 +20532,6 @@ int repl::run()
                 t.join();
         cell::net::curl_global_shutdown(); });
     auto skills_all = cell::skills::list();
-    std::string skills_prompt = cell::skills::metadata_prompt(skills_all);
-    auto ensure_prompt = [&](cell::chat::session &sess)
-    {
-        if (!sess.msg().empty())
-            return;
-        sess.msg().push_back({{"role", "system"}, {"content", cfg.system_prompt}});
-        if (!skills_prompt.empty())
-            sess.msg().push_back({{"role", "system"}, {"content", skills_prompt}});
-        log.debug("ctx", std::format("inject system_prompt={}chars{}", cfg.system_prompt.size(),
-                                     skills_prompt.empty() ? "" : std::format(", skills_metadata={}chars", skills_prompt.size())));
-        cell::sys::println("context: injected system_prompt={}chars{}", cfg.system_prompt.size(),
-                           skills_prompt.empty() ? "" : std::format(", skills_metadata={}chars", skills_prompt.size()));
-    };
     // fetch the provider's model list (5s timeout per candidate endpoint);
     // returns false on network/protocol failure, the reason is reported in err.
     // a 404 falls through to the next candidate: anthropic-compatible surfaces
@@ -19501,7 +20541,7 @@ int repl::run()
     {
         out.clear();
         err.clear();
-        cell::encrypt::secure_string key = resolve_key(p);
+        cell::encrypt::secure_string key = resolve_provider_key(p, vault);
         auto candidates = p.model_list_candidates();
         std::string buf;
         long code = 0, last_code = 0;
@@ -19593,57 +20633,21 @@ int repl::run()
     else
         log.info("boot", std::format("providers=0 active=none session={} skills={} prompt_chars={}",
                                      h.now().id(), skills_all.size(), cfg.system_prompt.size()));
-    // The tool-execution runtime: the approval / safety channels installed once,
-    // the live session (resolved fresh on every use — /new destroys the old
-    // session object and /session switches, so a cached pointer would dangle),
-    // and the teamwork request machinery. Passed by reference into every tool
-    // call: a test can build its own instead of mutating process globals.
-    cell::tools::runtime tool_rt;
-    tool_rt.autoallow_validator = autoallow_check;
-    tool_rt.approval_required = [](const std::string &tool, const std::string &operation) -> bool
+    // The engine runner owns the request machinery, the tool runtime and the
+    // teamwork wiring. It is constructed here, after the session is known, and
+    // every turn / compaction / notice delivery below goes through it — the
+    // REPL is a frontend now: it drives the runner and renders its `events`.
+    cell::engine::runner eng(cfg, vault, h);
+
+    // inject the base system prompt + skills metadata into the live session
+    // (engine-owned); the console line stays here so the REPL look is unchanged
+    auto ensure_prompt = [&]()
     {
-        return !(tool == "tw" && operation != "run");
+        auto info = eng.ensure_prompt();
+        if (info.injected)
+            cell::sys::println("context: injected system_prompt={}chars{}", info.prompt_chars,
+                               info.skills_chars == 0 ? "" : std::format(", skills_metadata={}chars", info.skills_chars));
     };
-    tool_rt.action_enricher = [&h](const std::string &tool_name, const std::string &action_json) -> std::string
-    {
-        if (tool_name != "tw")
-            return action_json;
-        try
-        {
-            auto parsed = nlohmann::json::parse(action_json);
-            if (!parsed.is_object() || parsed.value("operation", "") != "run")
-                return action_json;
-            std::string job_id = parsed.value("id", "");
-            if (job_id.empty())
-                return action_json;
-            auto store = cell::teamwork::load_store(h.now().id());
-            auto *job = cell::teamwork::find_job(store, job_id);
-            if (!job)
-                return action_json;
-            nlohmann::json enriched = parsed;
-            if (job->contains("work_type"))
-                enriched["work_type"] = (*job)["work_type"];
-            if (job->contains("list"))
-                enriched["list"] = (*job)["list"];
-            return enriched.dump();
-        }
-        catch (const std::exception &)
-        {
-            return action_json;
-        }
-    };
-    tool_rt.live_session = [&h]() -> cell::chat::session *
-    { return &h.now(); };
-    tool_rt.session_id = [&h]() -> std::string
-    { return h.now().id(); };
-    tool_rt.team_rt = [&team_rt]() -> cell::teamwork::runtime_context
-    { return team_rt; };
-    // teamwork runs share the same machinery; the live conversation is
-    // snapshotted per run on the thread that starts it
-    // (see teamwork::snapshot_foreground_context), never read from a worker
-    team_rt.live_session = [&h]() -> cell::chat::session *
-    { return &h.now(); };
-    team_rt.tools_rt = &tool_rt;
     cell::sys::println("cell: cwd={} session={} model={} sandbox={}{}{}", cell::workdir().string(), h.now().id(), cfg.model_label(),
                        cell::box::mode_name(cell::box::sandbox_mode()),
                        cfg.thinking_enabled() ? std::format(" think={}", cell::config::settings::think_level_name(cfg.think_level)) : "", cfg.tools ? "" : " tools=off");
@@ -19665,7 +20669,7 @@ int repl::run()
     if (loaded_msgs > 0)
         cell::sys::println("context: loaded {} message(s) from disk", loaded_msgs);
     cell::chat::print_recent_messages(h.now().msg());
-    ensure_prompt(h.now());
+    ensure_prompt();
     if (const cell::config::provider_entry *p = cfg.current_provider_entry(); p)
         probe_async(*p); // background: startup never waits on the network
 
@@ -19694,201 +20698,6 @@ int repl::run()
         }
     };
 
-    // -------- phase: context maintenance — overflow detection and compaction --------
-    // is_context_overflow and extract_parts live in cell::chat: the main loop
-    // and the Teamwork children share one phrase table and one extraction.
-
-    // run one summarization request via the compression model (or session model)
-    // and return the summary text; empty on failure (caller falls back).
-    auto summarize_part = [&](const std::string &instruction, const std::string &body,
-                              const std::string &label, const char *stream_header,
-                              cell::sys::color stream_color) -> std::string
-    {
-        const cell::config::provider_entry *p = nullptr;
-        std::string model;
-        if (!cfg.compact_provider.empty())
-        {
-            for (auto &pe : cfg.providers)
-                if (pe.name == cfg.compact_provider)
-                {
-                    p = &pe;
-                    break;
-                }
-            if (!p)
-            {
-                log.warn("ctx", std::format("compact provider '{}' not registered, falling back to session model", cfg.compact_provider));
-                p = cfg.current_provider_entry();
-                model = cfg.current_model;
-            }
-            else
-                model = cfg.compact_model.empty() ? cfg.current_model : cfg.compact_model;
-        }
-        else
-        {
-            p = cfg.current_provider_entry();
-            model = cfg.current_model;
-        }
-        if (!p || model.empty())
-            return "";
-        cell::encrypt::secure_string key = resolve_key(*p);
-        if (key.empty())
-            return "";
-        nlohmann::json prompt = nlohmann::json::array();
-        const std::string safe_body = cell::text::utf8_safe(body);
-        prompt.push_back({{"role", "user"},
-                          {"content", std::format("{}\n\n{}", instruction, safe_body)}});
-        nlohmann::json reply, tc, usage;
-        std::string err;
-        log.info("ctx", std::format("summarizing {} via={}:{} chars={} tools=off", label, p->name, model, body.size()));
-        cell::sys::pprintln(stream_color, "\n{}", stream_header);
-        cell::sys::print("> ");
-        auto t0 = cell::sys::detail::clock::now();
-        total_llm_requests++;
-        cell::net::StreamCallback stream_cb = [stream_color](std::span<const char> data)
-        {
-            if (cell::sys::detail::color_enabled)
-            {
-                std::string out = std::format("\x1b[{}m", (int)stream_color);
-                out.append(data.data(), data.size());
-                out += "\x1b[0m";
-                std::fwrite(out.data(), 1, out.size(), stdout);
-            }
-            else
-                std::fwrite(data.data(), 1, data.size(), stdout);
-            std::fflush(stdout);
-        };
-        if (!do_chat(*p, key, model, prompt, true, std::move(stream_cb), nullptr, nullptr, reply, tc, usage, err, false, 0))
-        {
-            cell::sys::println();
-            log.warn("ctx", std::format("summarization_failed part={} err={}", label, err.empty() ? "n/a" : err));
-            return "";
-        }
-        double sec = cell::sys::elapsed_ms(t0) / 1000.0;
-        cell::sys::println();
-        std::string summary = reply_text(reply);
-        if (summary.empty())
-            return "";
-        // prompt-injection defence: re-sanitize the summary so a re-stated
-        // malicious instruction cannot survive into the new system message
-        summary = cell::text::utf8_safe(cell::box::sanitize_output(summary));
-        log.info("ctx", std::format("summary {} chars={} time={:.2f}s tok_in={} tok_out={}",
-                                    label, summary.size(), sec,
-                                    usage_in(usage).has_value() ? std::to_string(*usage_in(usage)) : "n/a",
-                                    usage_out(usage).has_value() ? std::to_string(*usage_out(usage)) : "n/a"));
-        cell::stats::add(h.now().id(), std::format("{}:{}", p->name, model), content_chars(prompt), (long long)summary.size(), usage_in(usage), usage_out(usage), usage_total(usage), 0);
-        return summary;
-    };
-
-    // context compaction: keep every system message (the base prompt plus any
-    // injected skills — they are session state, not conversation), split the rest
-    // into conversation text and thinking text, summarize each separately, then
-    // rebuild the tail as the last user message followed by one {"role":
-    // "assistant","content": …} summary message. The summary is backfilled
-    // directly BEHIND the surviving user turn, so the transcript reads as a
-    // normal turn boundary (user → assistant) and the next user input lands
-    // behind the summary instead of piling onto an unanswered user message. The
-    // full transcript is archived to saved/msg-<UTC time>.jsonl inside the
-    // session folder before anything is rewritten; if either the archive or the
-    // conversation summary cannot be produced the context is left EXACTLY as it
-    // was: replacing real history with a placeholder would be irreversible data
-    // loss, and the whole point of compacting is to preserve the information.
-    auto compact = [&](cell::chat::session &sess) -> std::string
-    {
-        auto &msgs = sess.msg();
-        std::vector<size_t> sys_indexes;
-        nlohmann::json rest = nlohmann::json::array();
-        for (size_t i = 0; i < msgs.size(); i++)
-        {
-            if (!msgs[i].is_object())
-                continue;
-            if (msgs[i].value("role", "") == "system")
-                sys_indexes.push_back(i);
-            else
-                rest.push_back(msgs[i]);
-        }
-        if (rest.size() <= 12)
-            return std::format("context already small ({} messages to aggregate)", rest.size());
-        std::string conv_text, think_text;
-        cell::chat::extract_parts(rest, conv_text, think_text);
-        std::string conv_summary = summarize_part(
-            "Summarize the conversation content as the memory, preserving key decisions, facts, file paths and unfinished tasks. Output only the memory.",
-            conv_text, "conversation", "Context Summary", cell::sys::color::cyan);
-        if (conv_summary.empty())
-            return "compaction aborted: summarization failed, context left unchanged";
-        std::string think_summary;
-        if (!think_text.empty())
-            think_summary = summarize_part(
-                "Summarize the agent's reasoning based on the preceding thinking. Focus on the key insights, decisions, and conclusions reached. Output only the summary of thinking step by step as the trace.",
-                think_text, "reasoning", "Thinking Summary", cell::sys::color::magenta);
-        // a chat template also needs at least one real turn left: replacing the
-        // whole conversation with system messages alone is rejected ("No user
-        // query found in messages"), and a caller that compacted on a context
-        // overflow would have nothing to re-send. The most recent REAL user
-        // message therefore survives next to the summary — never a tool_result
-        // carrier (role=user in the Anthropic format): keeping one without its
-        // assistant tool_use would make every provider reject the transcript.
-        const nlohmann::json *tail_user = nullptr;
-        for (size_t i = rest.size(); i-- > 0;)
-            if (cell::chat::is_user_turn(rest[i]))
-            {
-                tail_user = &rest[i];
-                break;
-            }
-        // archive the full transcript (system messages included) before the
-        // context is rewritten — /saved list|show|rm works on these archives
-        std::filesystem::path archive = cell::chat::archive_transcript(sess.directory(), msgs);
-        if (archive.empty())
-            return "compaction aborted: transcript archive failed, context left unchanged";
-        std::string content = std::format(
-            "# Here is a summary that captures the previous conversation:\n{}", conv_summary);
-        if (!think_summary.empty())
-            content += std::format(
-                "\n# Summary of the agent's reasoning based on the preceding conversation:\n{}",
-                think_summary);
-        nlohmann::json new_msgs = nlohmann::json::array();
-        for (size_t idx : sys_indexes)
-            new_msgs.push_back(msgs[idx]);
-        // fold first, while the array holds only system messages, so the
-        // leading block stays canonical for strict chat templates
-        cell::chat::fold_system_messages(new_msgs);
-        if (tail_user)
-            new_msgs.push_back(*tail_user);
-        // the summary is the assistant's own memory of the compacted run: a
-        // standalone assistant message directly behind the surviving user turn
-        // (the transcript ends on a turn boundary; the retry after an overflow
-        // continues from the summary, like /reload continues a partial reply)
-        new_msgs.push_back({{"role", "assistant"}, {"content", content}});
-        size_t removed = rest.size() - (tail_user ? 1 : 0);
-        msgs = std::move(new_msgs);
-        return std::format("context compacted: archived to {}, aggregated {} message(s) into 1 summary, {} message(s) remain",
-                           archive.filename().string(), removed, msgs.size());
-    };
-
-    // pending notices → console + conversation. Used by /notices drain|wait and
-    // automatically before every LLM turn, so teamwork progress and cross-
-    // session messages reach the main agent without any polling round-trips.
-    auto inject_notices = [&](bool report_empty) -> size_t
-    {
-        auto got = cell::notice::drain(h.now().id());
-        if (got.empty())
-        {
-            if (report_empty)
-                cell::sys::println("no pending notices");
-            return 0;
-        }
-        for (auto &m : got)
-        {
-            cell::sys::pprintln(cell::sys::color::cyan, "{}", cell::notice::render(m));
-            h.now().msg().push_back({{"role", "system"},
-                                     {"content", std::format("A notice was delivered to this session (from={}{}). Treat it as context from the user or a supervised agent.\n{}",
-                                                             m.from, m.topic.empty() ? "" : " topic=" + m.topic, m.body)}});
-        }
-        // notices arrive mid-conversation: lift them into the leading system
-        // block so a chat template never sees a system message behind a user turn
-        cell::chat::fold_system_messages(h.now().msg());
-        log.info("notice", std::format("injected count={} session={}", got.size(), h.now().id()));
-        return got.size();
-    };
     // resolve a /notices argument against known session folders: exact id wins,
     // then a unique prefix; "" means the current session
     auto resolve_session_arg = [&](const std::string &arg) -> std::string
@@ -19926,30 +20735,6 @@ int repl::run()
     };
 
     bool interactive = cell::plat::is_tty(stdin);
-    // the only approval channel a Policy::Ask tool can use
-    {
-        const std::thread::id main_thread = std::this_thread::get_id();
-        tool_rt.approval_prompt = [&interactive, main_thread](const std::string &tool, const std::string &args, std::string &reason) -> bool
-        {
-            if (std::this_thread::get_id() != main_thread)
-            {
-                reason = "needs approval but is running on a background thread";
-                return false;
-            }
-            if (!interactive)
-            {
-                reason = "needs your approval, but stdin is not a terminal \xe2\x80\x94 rerun interactively or enable /autoallow (full-access only)";
-                return false;
-            }
-            std::cout << "allow " << tool << "(" << cell::text::display_safe(args) << ")? [y/N] " << std::flush;
-            std::string answer;
-            std::getline(std::cin, answer);
-            if (answer == "y" || answer == "Y")
-                return true;
-            reason = "rejected by user";
-            return false;
-        };
-    }
     std::string pending;
     if (!interactive)
     {
@@ -19975,6 +20760,240 @@ int repl::run()
                     cell::plat::history_add(input_history, c);
             }
 
+    // -------- terminal presentation — the REPL's side of the frontend contract
+    // One turn's stream bookkeeping for the console renderer below: the wait
+    // ticker (⏳ Ns) and the token counter (~N tok) are drawn on the final line,
+    // the reasoning stream is dim, and compaction summaries stream in their own
+    // colour — all exactly as the old inline turn loop rendered them.
+    struct term_stream_ui
+    {
+        bool got = false, timer_line = false, tok_line = false, reason_active = false;
+        long long toks = 0, last_cnt_ms = 0;
+        cell::sys::detail::clock::time_point tok0;
+        cell::sys::color summary_color = cell::sys::color::cyan;
+    } tui;
+
+    // close a pending ticker/counter line so the next output starts clean
+    auto clear_stream_line = [&]()
+    {
+        if (tui.timer_line || tui.tok_line)
+        {
+            if (cell::sys::detail::color_enabled)
+            {
+                std::string s = "\r\x1b[2K";
+                std::fwrite(s.data(), 1, s.size(), stdout);
+                std::fflush(stdout);
+            }
+            tui.timer_line = false;
+            tui.tok_line = false;
+        }
+    };
+
+    // The events the runner reports a turn through. Every callback renders the
+    // same console output the inline copy used to print; the ordering is
+    // engine-guaranteed (delta events in stream order, tool events in
+    // tool_call order). The REPL runs one turn at a time, so a single events
+    // instance serves every call site below.
+    const std::thread::id main_thread = std::this_thread::get_id();
+    cell::engine::events ev;
+    ev.on_answer_begin = [&]()
+    {
+        // a fresh round starts streaming: close the reasoning line and reset
+        // the round-scoped counters (the inline copy reset its StreamUI here)
+        if (tui.reason_active)
+        {
+            std::fwrite("\n", 1, 1, stdout);
+            std::fflush(stdout);
+            tui.reason_active = false;
+        }
+        tui.got = false;
+        tui.toks = 0;
+        tui.last_cnt_ms = 0;
+    };
+    ev.on_answer = [&](std::string_view data)
+    {
+        if (data.empty())
+            return;
+        if (!tui.got)
+        {
+            tui.got = true;
+            tui.tok0 = cell::sys::detail::clock::now();
+        }
+        bool vt = cell::sys::detail::color_enabled;
+        std::string out;
+        // end an open reasoning line before the answer text starts
+        if (vt)
+        {
+            if (tui.timer_line)
+            {
+                out += "\r\x1b[2K";
+                tui.timer_line = false;
+            }
+            if (tui.tok_line)
+            {
+                out += "\r\x1b[2K";
+                tui.tok_line = false;
+            }
+        }
+        out.append(data.data(), data.size());
+        tui.toks++;
+        if (vt && data.back() == '\n')
+        {
+            long long ms = cell::sys::elapsed_ms(tui.tok0);
+            if (ms - tui.last_cnt_ms >= 100)
+            {
+                tui.last_cnt_ms = ms;
+                out += std::format("\x1b[2m~{} tok\x1b[0m", tui.toks);
+                tui.tok_line = true;
+            }
+        }
+        std::fwrite(out.data(), 1, out.size(), stdout);
+        std::fflush(stdout);
+    };
+    ev.on_reason = [&](std::string_view data)
+    {
+        if (data.empty())
+            return;
+        if (!tui.got)
+        {
+            tui.got = true;
+            tui.tok0 = cell::sys::detail::clock::now();
+        }
+        bool vt = cell::sys::detail::color_enabled;
+        std::string out;
+        if (vt)
+        {
+            if (tui.timer_line)
+            {
+                out += "\r\x1b[2K";
+                tui.timer_line = false;
+            }
+            if (tui.tok_line)
+            {
+                out += "\r\x1b[2K";
+                tui.tok_line = false;
+            }
+            out += "\x1b[2m";
+            for (char c : data)
+            {
+                if (c == '\n')
+                    out += "\x1b[0m\n\x1b[2m";
+                else
+                    out += c;
+            }
+            out += "\x1b[0m";
+        }
+        else
+            out.append(data.data(), data.size());
+        tui.reason_active = data.back() != '\n';
+        std::fwrite(out.data(), 1, out.size(), stdout);
+        std::fflush(stdout);
+    };
+    // the TTFB ticker: engine polls on_progress every ~500 ms while the first
+    // token is still pending (the old libcurl progress callback did this)
+    ev.on_progress = [&](long long ms)
+    {
+        if (!cell::sys::detail::color_enabled)
+            return;
+        std::string s = std::format("\r\x1b[2K\x1b[2m⏳ {}s\x1b[0m", ms / 1000);
+        std::fwrite(s.data(), 1, s.size(), stdout);
+        std::fflush(stdout);
+        tui.timer_line = true;
+    };
+    // compaction summaries stream in the colour of their header
+    ev.on_summary = [&](std::string_view data)
+    {
+        if (data.empty())
+            return;
+        if (cell::sys::detail::color_enabled)
+        {
+            std::string out = std::format("\x1b[{}m", (int)tui.summary_color);
+            out.append(data.data(), data.size());
+            out += "\x1b[0m";
+            std::fwrite(out.data(), 1, out.size(), stdout);
+        }
+        else
+            std::fwrite(data.data(), 1, data.size(), stdout);
+        std::fflush(stdout);
+    };
+    ev.on_status = [&](std::string_view d)
+    {
+        clear_stream_line();
+        // the summarizer announces itself with its header; remember the colour
+        // for the deltas that follow (conversation = cyan, reasoning = magenta)
+        if (d == "Context Summary" || d == "Thinking Summary")
+        {
+            tui.summary_color = (d == "Thinking Summary") ? cell::sys::color::magenta : cell::sys::color::cyan;
+            cell::sys::pprintln(tui.summary_color, "\n{}", d);
+            cell::sys::print("> ");
+            return;
+        }
+        cell::sys::println("{}", d);
+    };
+    ev.on_error = [&](std::string_view d)
+    {
+        clear_stream_line();
+        cell::sys::error("{}", d);
+    };
+    ev.on_notice = [&](std::string_view d)
+    { cell::sys::pprintln(cell::sys::color::cyan, "{}", d); };
+    ev.on_tool_end = [&](const cell::engine::tool_view &tv)
+    {
+        clear_stream_line();
+        // console echo of the returned content: cyan, distinct from chat
+        // (plain) and think (dim gray). 16 KiB is all one tool line may dump
+        // into the terminal (engine already capped the payload at 64 KiB);
+        // the transcript keeps the full result.
+        std::string shown = tv.display;
+        constexpr size_t kConsoleEchoMax = 16 * 1024;
+        if (shown.size() > kConsoleEchoMax)
+        {
+            shown.resize(kConsoleEchoMax);
+            shown += std::format("\n[console echo truncated: {} more chars]", tv.chars - (long long)kConsoleEchoMax);
+        }
+        cell::sys::pprintln(cell::sys::color::cyan, "tool #{}: {} ({:.2f}s, {} chars{})", tv.seq, tv.name,
+                            tv.sec, tv.chars,
+                            tv.marker.empty() ? "" : std::format(" | {}", cell::text::display_safe(tv.marker)));
+        if (!shown.empty())
+        {
+            if (cell::sys::detail::color_enabled)
+            {
+                std::string c = std::format("\x1b[36m{}\x1b[0m\n", shown);
+                std::fwrite(c.data(), 1, c.size(), stdout);
+                std::fflush(stdout);
+            }
+            else
+                cell::sys::println("{}", shown);
+        }
+    };
+    // the only approval channel a Policy::Ask tool can use. The thread-affinity
+    // policy belongs to the frontend: approvals from worker threads are denied
+    // because this prompt reads stdin.
+    ev.on_approval = [&interactive, main_thread](const std::string &tool, const std::string &args, std::string &reason) -> bool
+    {
+        if (std::this_thread::get_id() != main_thread)
+        {
+            reason = "needs approval but is running on a background thread";
+            return false;
+        }
+        if (!interactive)
+        {
+            reason = "needs your approval, but stdin is not a terminal \xe2\x80\x94 rerun interactively or enable /autoallow (full-access only)";
+            return false;
+        }
+        std::cout << "allow " << tool << "(" << cell::text::display_safe(args) << ")? [y/N] " << std::flush;
+        std::string answer;
+        std::getline(std::cin, answer);
+        if (answer == "y" || answer == "Y")
+            return true;
+        reason = "rejected by user";
+        return false;
+    };
+    // Esc during a transfer cancels the round (the old peek_key poll)
+    ev.cancelled = []() -> bool
+    { return cell::plat::peek_key() == 27; };
+    ev.cancel_reason = "interrupted by the user (Esc) during streaming";
+
     // -------- phase: slash-command dispatcher (input starting with '/' is
     // handled locally and never sent to the model) --------
     // agent loop
@@ -19994,637 +21013,23 @@ int repl::run()
                                      cell::async_io::flush(); // persist queued writes before terminating
                                  });
         bool running = true;
-        // One agent turn: fold pending notices in, add the user message (a
-        // /reload resumes the interrupted turn without one), then run the
-        // LLM/tool rounds to completion. The old llm_start / llm_round goto
-        // labels are gone: the command handlers and the main loop call this.
-        auto run_turn = [&](bool resume_turn, const std::string &input)
+        // One agent turn, driven through the engine runner. The terminal
+        // presentation lives in the `ev` callbacks above; drive_turn only resets
+        // the per-turn display state, shows the prompt and forwards the call.
+        auto drive_turn = [&](bool resume_turn, const std::string &input)
         {
+            tui = term_stream_ui{};
+            // teamwork progress / cross-session notices are surfaced before the
+            // prompt, exactly like the old inline copy did (run_turn drains the
+            // queue again internally; the second drain is a no-op)
             if (!resume_turn)
-            {
-                // teamwork progress / cross-session notices join the turn
-                // silently — the agent sees them without ever having to poll
-                inject_notices(false);
-                h.now().msg().push_back({{"role", "user"}, {"content", input}});
-                log.info("user", std::format("chars={} text={}", input.size(), input));
-                // a new user message supersedes an interrupted turn: it is no
-                // longer the last thing in the transcript — nothing left to resume
-                if (!h.now().interrupt_state().empty())
-                {
-                    log.info("llm", std::format("interrupt_cleared id={} why=new user input", h.now().id()));
-                    h.now().clear_interrupt();
-                }
-            }
+                eng.inject_notices(false, ev);
             cell::sys::print("reply> ");
-
-            bool done = false;
-            bool natural_end = true; // false when the turn aborted early (error, cancel, refusal)
-            int rounds = 0;
-            long long turn_tool_calls = 0;
-            long long turn_thinking_entries = 0;
-            // Safety valve: a model that keeps calling tools would otherwise loop
-            // (and bill) without bound. Teamwork children are capped at 8 rounds;
-            // the main loop legitimately needs far more, so this sits well above it.
-            constexpr int kMaxRoundsPerTurn = 200;
-            while (!done)
-            {
-                if (++rounds > kMaxRoundsPerTurn)
-                {
-                    log.warn("llm", std::format("turn aborted at the {} round limit", kMaxRoundsPerTurn));
-                    cell::sys::error("[aborted] this turn hit the {} round limit - the model kept requesting tools", kMaxRoundsPerTurn);
-                    natural_end = false;
-                    break;
-                }
-                const cell::config::provider_entry *p = cfg.current_provider_entry();
-                if (!p || cfg.current_model.empty())
-                {
-                    cell::sys::error("no model configured - add a provider with /provide add openai:URL, then pick a model with /models and /model NAME");
-                    done = true;
-                    natural_end = false;
-                    break;
-                }
-                cell::encrypt::secure_string key = resolve_key(*p);
-                if (key.empty())
-                {
-                    cell::sys::error("no api key for {}: set the {} env var, or use /provide add {}:URL key:KEY",
-                                     p->name, p->style == "anthropic" ? "ANTHROPIC_API_KEY" : "OPENAI_API_KEY", p->style);
-                    done = true;
-                    natural_end = false;
-                    break;
-                }
-                size_t before = h.now().msg().size();
-                long long in_chars = content_chars(h.now().msg());
-                nlohmann::json reply, tool_calls, usage;
-                struct StreamUI
-                {
-                    bool got = false, timer_line = false, tok_line = false, cancelled = false;
-                    bool reason_active = false; // reasoning output is still open on the current line
-                    long long toks = 0, last_timer_ms = 0, last_cnt_ms = 0;
-                    cell::sys::detail::clock::time_point t0;
-                    cell::sys::detail::clock::time_point tok0;
-                };
-                StreamUI ui;
-                auto t0 = cell::sys::detail::clock::now();
-                ui.t0 = t0;
-                // single-threaded TTFB timer + Esc-cancel + Ctrl+C abort: libcurl invokes this periodically while blocked
-                auto xfer_cb = +[](void *p, curl_off_t, curl_off_t, curl_off_t, curl_off_t) -> int
-                {
-                    auto *u = (StreamUI *)p;
-                    if (cell::plat::peek_key() == 27)
-                        u->cancelled = true;
-                    if (!u->got && cell::sys::detail::color_enabled)
-                    {
-                        long long ms = cell::sys::elapsed_ms(u->t0);
-                        if (ms - u->last_timer_ms >= 500)
-                        {
-                            u->last_timer_ms = ms;
-                            std::string s = std::format("\r\x1b[2K\x1b[2m⏳ {}s\x1b[0m", ms / 1000);
-                            std::fwrite(s.data(), 1, s.size(), stdout);
-                            std::fflush(stdout);
-                            u->timer_line = true;
-                        }
-                    }
-                    return u->cancelled ? 1 : 0;
-                };
-                // retry loop for LLM requests: up to 5 attempts with 5s delay between retries (attempt resets on success)
-                constexpr int kMaxRetries = 5;
-                constexpr double kRetryDelaySec = 5.0;
-                bool ok = false;
-                std::string err;
-                int attempt = 0;
-                long http_status = 0;
-                bool compacted_this_round = false;
-                while (attempt < kMaxRetries)
-                {
-                    if (attempt > 0)
-                    {
-                        log.info("llm", std::format("retry attempt={}/{} delay={:.0f}s model={} round={}", attempt + 1, kMaxRetries, kRetryDelaySec, cfg.model_label(), rounds));
-                        cell::sys::println("\n[retrying in {:.0f}s... attempt {}/{}]", kRetryDelaySec, attempt + 1, kMaxRetries);
-                        std::this_thread::sleep_for(std::chrono::milliseconds((int)(kRetryDelaySec * 1000)));
-                        // reset UI state for retry
-                        ui = StreamUI{};
-                        ui.t0 = cell::sys::detail::clock::now();
-                        reply = nlohmann::json{};
-                        tool_calls = nlohmann::json{};
-                        usage = nlohmann::json{};
-                        err.clear();
-                    }
-                    cell::net::StreamCallback tok_cb = [&](std::span<const char> data)
-                    {
-                        if (data.empty())
-                            return;
-                        if (!ui.got)
-                        {
-                            ui.got = true;
-                            ui.tok0 = cell::sys::detail::clock::now();
-                        }
-                        ui.toks++;
-                        bool vt = cell::sys::detail::color_enabled;
-                        std::string out;
-                        // end an open reasoning line before the answer text starts
-                        if (ui.reason_active)
-                        {
-                            out += "\n";
-                            ui.reason_active = false;
-                        }
-                        if (vt)
-                        {
-                            if (ui.timer_line)
-                            {
-                                out += "\r\x1b[2K";
-                                ui.timer_line = false;
-                            }
-                            if (ui.tok_line)
-                            {
-                                out += "\r\x1b[2K";
-                                ui.tok_line = false;
-                            }
-                        }
-                        out.append(data.data(), data.size());
-                        if (vt && data.back() == '\n')
-                        {
-                            long long ms = cell::sys::elapsed_ms(ui.tok0);
-                            if (ms - ui.last_cnt_ms >= 100)
-                            {
-                                ui.last_cnt_ms = ms;
-                                out += std::format("\x1b[2m~{} tok\x1b[0m", ui.toks);
-                                ui.tok_line = true;
-                            }
-                        }
-                        std::fwrite(out.data(), 1, out.size(), stdout);
-                        std::fflush(stdout);
-                    };
-                    // chain-of-thought output: streamed dim/gray ahead of the answer
-                    cell::net::StreamCallback reason_cb = [&](std::span<const char> data)
-                    {
-                        if (data.empty())
-                            return;
-                        if (!ui.got)
-                        {
-                            ui.got = true;
-                            ui.tok0 = cell::sys::detail::clock::now();
-                        }
-                        bool vt = cell::sys::detail::color_enabled;
-                        std::string out;
-                        if (vt)
-                        {
-                            if (ui.timer_line)
-                            {
-                                out += "\r\x1b[2K";
-                                ui.timer_line = false;
-                            }
-                            if (ui.tok_line)
-                            {
-                                out += "\r\x1b[2K";
-                                ui.tok_line = false;
-                            }
-                            out += "\x1b[2m";
-                            for (char c : data)
-                            {
-                                if (c == '\n')
-                                    out += "\x1b[0m\n\x1b[2m";
-                                else
-                                    out += c;
-                            }
-                            out += "\x1b[0m";
-                        }
-                        else
-                            out.append(data.data(), data.size());
-                        ui.reason_active = data.back() != '\n';
-                        std::fwrite(out.data(), 1, out.size(), stdout);
-                        std::fflush(stdout);
-                    };
-                    total_llm_requests++;
-                    // last line of defence: whatever injected a system message
-                    // (a notice, a skill, an interrupt, an old transcript read
-                    // back from disk) must not leave it behind the conversation
-                    cell::chat::fold_system_messages(h.now().msg());
-                    http_status = 0;
-                    ok = do_chat(*p, key, cfg.current_model, h.now().msg(), true, std::move(tok_cb), std::move(reason_cb), nullptr, reply, tool_calls, usage, err, cfg.tools, cfg.think_level, xfer_cb, &ui, &http_status);
-                    if (ui.timer_line || ui.tok_line)
-                    {
-                        if (cell::sys::detail::color_enabled)
-                        {
-                            std::string s = "\r\x1b[2K";
-                            std::fwrite(s.data(), 1, s.size(), stdout);
-                            std::fflush(stdout);
-                        }
-                        ui.timer_line = false;
-                        ui.tok_line = false;
-                    }
-                    // context overflow: compress and retry immediately instead of
-                    // burning retry attempts on an error that compaction can fix
-                    if (!ok && !compacted_this_round && cell::chat::is_context_overflow(err) &&
-                        compact(h.now()).find("context compacted") != std::string::npos)
-                    {
-                        log.info("ctx", std::format("auto_compact_on_overflow ctx_msgs={} round={}", (long long)h.now().msg().size(), rounds));
-                        cell::sys::println("[auto-compact on context overflow]");
-                        cell::box::reset_read_log();
-                        h.now().unload();
-                        cell::async_io::flush();
-                        ui = StreamUI{};
-                        ui.t0 = cell::sys::detail::clock::now();
-                        reply = nlohmann::json{};
-                        tool_calls = nlohmann::json{};
-                        usage = nlohmann::json{};
-                        err.clear();
-                        compacted_this_round = true;
-                        // the transcript just shrank: re-baseline the per-turn
-                        // stats, otherwise the delta below underflows size_t
-                        before = h.now().msg().size();
-                        in_chars = content_chars(h.now().msg());
-                        // the compacted context may now fit: give it one more try
-                        // without counting this as a normal failed attempt
-                        continue; // retry the same round against the compacted context
-                    }
-                    if (ui.cancelled)
-                    {
-                        log.warn("llm", std::format("cancelled model={} round={} partial_chars={}", cfg.model_label(), rounds, reply_text_len(reply)));
-                        cell::sys::println();
-                        cell::sys::error("[cancelled]");
-                        // Ctrl+C prints nothing and exits through the signal hook;
-                        // this path (Esc) keeps the interrupted turn on disk
-                        cell::chat::record_interrupt(h.now(), reply, "interrupted by the user (Esc) during streaming");
-                        cell::sys::println("[interrupted] partial output kept, pending tool calls cancelled - /reload resumes the turn");
-                        done = true;
-                        natural_end = false;
-                        break;
-                    }
-                    if (ok)
-                    {
-                        // success: reset attempt count and break out of retry loop
-                        attempt = 0;
-                        double final_sec = cell::sys::elapsed_ms(t0) / 1000.0;
-                        double final_ttf = !ui.got ? -1.0 : cell::sys::diff_ms(t0, ui.tok0) / 1000.0;
-                        log.info("llm", std::format("round={} model={} stream=true ctx_msgs={} tok_in={} tok_out={} cache={} time={:.2f}s ttf={} tools={} attempts={}",
-                                                    rounds, cfg.model_label(), (long long)h.now().msg().size(),
-                                                    usage_in(usage).has_value() ? std::to_string(*usage_in(usage)) : "n/a",
-                                                    usage_out(usage).has_value() ? std::to_string(*usage_out(usage)) : "n/a",
-                                                    usage_cache_hit(usage).has_value() ? std::format("{:.1f}%", *usage_cache_hit(usage) * 100.0) : "n/a",
-                                                    final_sec, final_ttf < 0 ? "n/a" : std::format("{:.2f}s", final_ttf),
-                                                    tool_calls.size(), attempt + 1));
-                        break;
-                    }
-                    // request failed: retry only transient failures. A 4xx other
-                    // than 408/409/429 is deterministic (bad request, model or
-                    // base, auth, validation) — retrying it only burns 5s per
-                    // attempt; transport aborts report 0 here and stay retryable
-                    bool retryable = !(http_status >= 400 && http_status < 500 &&
-                                       http_status != 408 && http_status != 409 && http_status != 429);
-                    if (retryable && attempt < kMaxRetries - 1)
-                    {
-                        log.warn("llm", std::format("request_failed model={} round={} attempt={}/{} err={} -> retrying", cfg.model_label(), rounds, attempt + 1, kMaxRetries, err.empty() ? "n/a" : err));
-                        attempt++;
-                    }
-                    else
-                    {
-                        // final attempt failed or a non-retryable client error: the
-                        // reply assembled so far is kept (do_chat assembles it even
-                        // after an aborted transfer) and the turn is recorded as
-                        // interrupted, so the user can /reload instead of retyping
-                        double final_sec = cell::sys::elapsed_ms(t0) / 1000.0;
-                        log.error("llm", std::format("request_failed model={} round={} ctx_msgs={} time={:.2f}s err={} attempts={}", cfg.model_label(), rounds, (long long)h.now().msg().size(), final_sec, err.empty() ? "n/a" : err, attempt + 1));
-                        cell::sys::println();
-                        cell::sys::error("[llm error after {} attempt(s)] {}", attempt + 1, err.empty() ? "request failed" : err);
-                        cell::chat::record_interrupt(h.now(), reply,
-                                                     std::format("LLM client error after {} attempt(s): {}", attempt + 1,
-                                                                 trunc(err.empty() ? "request failed" : err, 300)));
-                        cell::sys::println("[interrupted] partial output kept, pending tool calls cancelled - /reload resumes the turn");
-                        done = true;
-                        natural_end = false;
-                        break;
-                    }
-                }
-                if (done || ui.cancelled)
-                    break;
-                cell::sys::println();
-                long long out_chars = reply_text_len(reply);
-                h.now().msg().push_back(reply);
-                // count reasoning/thinking entries for the auto-compact threshold
-                if (reply.contains("content") && reply["content"].is_array())
-                    for (auto &b : reply["content"])
-                        if (b.is_object() && (b.value("type", "") == "reasoning" || b.value("type", "") == "thinking"))
-                            turn_thinking_entries++;
-                if (!tool_calls.empty())
-                {
-                    struct tresult
-                    {
-                        std::string name, args, policy, status, output;
-                        double sec = 0;
-                        bool blocked = false;
-                        cell::tools::rejection_reason rejected_for = cell::tools::rejection_reason::none;
-                        std::vector<cell::ContentBlock> multimodal_blocks;
-                    };
-                    std::vector<tresult> res(tool_calls.size());
-                    total_tool_calls += tool_calls.size();
-                    turn_tool_calls += (long long)tool_calls.size();
-                    // pass 1: Concurrent Phase tools (Policy::Allow, e.g. ls/read/rg/find)
-                    // run concurrently on the shared worker pool (max_threads); Deferred
-                    // Phase tools (Policy::Allow: write/edit) are queued for pass 2.
-                    size_t allow_count = 0;
-                    for (size_t i = 0; i < tool_calls.size(); i++)
-                    {
-                        auto &tc = tool_calls[i];
-                        res[i].name = tc["function"].value("name", "");
-                        res[i].args = tc["function"].value("arguments", "");
-                        res[i].policy = "?";
-                        res[i].status = "failed";
-                        res[i].output = "[tool failed]";
-                        auto it = tool_list.find(res[i].name);
-                        if (it == tool_list.end())
-                        {
-                            res[i].output = std::format("[unknown tool: {}]", res[i].name);
-                            res[i].status = "unknown";
-                            cell::sys::logger::instance().warn("tool", std::format("call_unknown name={} args={}", res[i].name, trunc(res[i].args, 200)));
-                        }
-                        else if (it->second->policy() == cell::tools::Policy::Allow)
-                        {
-                            // Allow tools scheduled as Phase::Deferred (write/edit)
-                            // run sequentially in pass 2: every read in the
-                            // same message must finish first (read-before-edit rule).
-                            // Concurrent Allow
-                            // tools (read-only) run on the shared worker pool now.
-                            if (it->second->schedule() == cell::tools::Phase::Deferred)
-                            {
-                                res[i].policy = "defer"; // sequential, no prompt
-                                continue;
-                            }
-                            res[i].policy = "allow";
-                            allow_count++;
-                            cell::sys::pool().submit([&res, &tool_rt, it, i]
-                                                     {
-                                auto t0 = cell::sys::detail::clock::now();
-                                cell::ToolOutput o;
-                                try
-                                {
-                                    o = it->second->execute(tool_rt, res[i].args);
-                                }
-                                catch (const std::exception &e)
-                                {
-                                    o = cell::ToolOutput::fail(std::format("[tool error: {}]", e.what()));
-                                    res[i].status = "exception";
-                                }
-                                if (o.ok)
-                                {
-                                    res[i].output = std::move(o.text);
-                                    res[i].status = "ok";
-                                }
-                                else if (it->second->blocked())
-                                {
-                                    res[i].blocked = true;
-                                    res[i].rejected_for = it->second->rejected_for();
-                                    res[i].status = "blocked";
-                                    if (!o.text.empty())
-                                        res[i].output = std::move(o.text); // surface the sandbox refusal reason to the model
-                                }
-                                else if (!o.text.empty())
-                                {
-                                    res[i].output = std::move(o.text);
-                                }
-                                res[i].multimodal_blocks = std::move(o.blocks);
-                                res[i].sec = cell::sys::elapsed_ms(t0) / 1000.0; });
-                        }
-                        else
-                        {
-                            res[i].policy = (it->second->policy() == cell::tools::Policy::Deny) ? "deny" : "ask";
-                        }
-                    }
-                    if (allow_count)
-                        cell::sys::pool().wait_all();
-                    // pass 2: Phase::Deferred tools (write/edit — no prompt) and
-                    // confirm-required tools (exec) run sequentially, in order
-                    for (size_t i = 0; i < tool_calls.size(); i++)
-                    {
-                        // "deny" is a policy verdict, not a queue entry: pass 1
-                        // already marked it rejected, pass 2 must not run it
-                        if (res[i].policy != "defer" && res[i].policy != "ask")
-                            continue;
-                        auto t0 = cell::sys::detail::clock::now();
-                        auto it = tool_list.find(res[i].name);
-                        cell::ToolOutput o;
-                        try
-                        {
-                            if (it != tool_list.end())
-                                o = it->second->execute(tool_rt, res[i].args);
-                            else
-                                o = cell::ToolOutput::fail("[tool failed]");
-                        }
-                        catch (const std::exception &e)
-                        {
-                            o = cell::ToolOutput::fail(std::format("[tool error: {}]", e.what()));
-                            res[i].status = "exception";
-                        }
-                        if (o.ok)
-                        {
-                            res[i].output = std::move(o.text);
-                            res[i].status = "ok";
-                        }
-                        else if (it != tool_list.end() && it->second->blocked())
-                        {
-                            res[i].blocked = true;
-                            res[i].rejected_for = it->second->rejected_for();
-                            res[i].status = "blocked";
-                            if (!o.text.empty())
-                                res[i].output = std::move(o.text); // surface the sandbox refusal reason to the model
-                        }
-                        else if (!o.text.empty())
-                        {
-                            res[i].output = std::move(o.text);
-                        }
-                        res[i].multimodal_blocks = std::move(o.blocks);
-                        res[i].sec = cell::sys::elapsed_ms(t0) / 1000.0;
-                    }
-                    // results are emitted in the original tool_call order
-                    size_t tc_seq = 0;
-                    for (size_t i = 0; i < tool_calls.size(); i++)
-                    {
-                        tc_seq++;
-                        auto &tc = tool_calls[i];
-                        log.info("tool", std::format("#{} {} policy={} status={} time={:.2f}s out_chars={} args={}",
-                                                     tc_seq, res[i].name, res[i].policy, res[i].status, res[i].sec,
-                                                     (long long)res[i].output.size(), trunc(res[i].args, 200)));
-                        std::string marker;
-                        std::string wrapped = harden_tool_result(res[i].name, res[i].args, res[i].output, &marker);
-                        // console echo of the returned content: cyan, distinct
-                        // from chat (plain) and think (dim gray). terminal only —
-                        // never written to the log file so it cannot inflate it
-                        std::string shown = cell::text::console_safe(res[i].output);
-                        constexpr size_t kConsoleEchoMax = 16 * 1024;
-                        if (shown.size() > kConsoleEchoMax)
-                        {
-                            shown.resize(kConsoleEchoMax);
-                            shown += std::format("\n[console echo truncated: {} more chars]", (long long)(res[i].output.size() - kConsoleEchoMax));
-                        }
-                        if (!shown.empty() && shown.back() == '\n')
-                            shown.pop_back();
-                        cell::sys::pprintln(cell::sys::color::cyan, "tool #{}: {} ({:.2f}s, {} chars{})", tc_seq, res[i].name,
-                                            res[i].sec, (long long)res[i].output.size(),
-                                            marker.empty() ? "" : std::format(" | {}", cell::text::display_safe(marker)));
-                        if (!shown.empty())
-                        {
-                            if (cell::sys::detail::color_enabled)
-                            {
-                                std::string c = std::format("\x1b[36m{}\x1b[0m\n", shown);
-                                std::fwrite(c.data(), 1, c.size(), stdout);
-                                std::fflush(stdout);
-                            }
-                            else
-                                cell::sys::println("{}", shown);
-                        }
-                        if (p->api_style != "anthropic")
-                        {
-                            // Check for multimodal content
-                            if (!res[i].multimodal_blocks.empty())
-                            {
-                                // Build multimodal content for OpenAI APIs
-                                nlohmann::json content_array = nlohmann::json::array();
-                                content_array.push_back({{"type", "text"}, {"text", wrapped}});
-                                for (const auto &block : res[i].multimodal_blocks)
-                                {
-                                    if (block.type == cell::ContentBlock::Type::InputImage)
-                                    {
-                                        if (p->api_style == "openai-responses")
-                                        {
-                                            content_array.push_back({{"type", "input_image"},
-                                                                     {"image_url", "data:" + block.media_type + ";base64," + block.data},
-                                                                     {"detail", block.detail.empty() ? "low" : block.detail}});
-                                        }
-                                        else
-                                        {
-                                            content_array.push_back({{"type", "image_url"},
-                                                                     {"image_url", {{"url", "data:" + block.media_type + ";base64," + block.data}}}});
-                                        }
-                                    }
-                                    else if (block.type == cell::ContentBlock::Type::InputAudio)
-                                    {
-                                        std::string format = cell::box::get_audio_format(block.media_type);
-                                        if (p->api_style == "openai-responses")
-                                        {
-                                            content_array.push_back({{"type", "input_audio"},
-                                                                     {"data", block.data},
-                                                                     {"format", format}});
-                                        }
-                                        else
-                                        {
-                                            content_array.push_back({{"type", "input_audio"},
-                                                                     {"input_audio", {{"data", block.data}, {"format", format}}}});
-                                        }
-                                    }
-                                }
-                                if (p->api_style == "openai-responses")
-                                {
-                                    nlohmann::json resp_output = nlohmann::json::array();
-                                    resp_output.push_back({{"type", "input_text"}, {"text", wrapped}});
-                                    for (const auto &block : res[i].multimodal_blocks)
-                                    {
-                                        if (block.type == cell::ContentBlock::Type::InputImage)
-                                            resp_output.push_back({{"type", "input_image"}, {"image_url", "data:" + block.media_type + ";base64," + block.data}});
-                                        else if (block.type == cell::ContentBlock::Type::InputAudio)
-                                            resp_output.push_back({{"type", "input_audio"}, {"data", block.data}, {"format", cell::box::get_audio_format(block.media_type)}});
-                                    }
-                                    h.now().msg().push_back({{"type", "function_call_output"}, {"call_id", tc.value("id", "")}, {"output", resp_output}});
-                                }
-                                else
-                                    h.now().msg().push_back({{"role", "tool"}, {"tool_call_id", tc.value("id", "")}, {"content", content_array}});
-                            }
-                            else
-                            {
-                                // Text-only output
-                                if (p->api_style == "openai-responses")
-                                    h.now().msg().push_back({{"type", "function_call_output"}, {"call_id", tc.value("id", "")}, {"output", nlohmann::json::array({{{"type", "input_text"}, {"text", wrapped}}})}});
-                                else
-                                    h.now().msg().push_back({{"role", "tool"}, {"tool_call_id", tc.value("id", "")}, {"content", wrapped}});
-                            }
-                        }
-                        else
-                        {
-                            // Anthropic API
-                            if (!res[i].multimodal_blocks.empty())
-                            {
-                                nlohmann::json content_array = nlohmann::json::array();
-                                content_array.push_back({{"type", "text"}, {"text", wrapped}});
-                                for (const auto &block : res[i].multimodal_blocks)
-                                {
-                                    if (block.type == cell::ContentBlock::Type::InputImage)
-                                    {
-                                        content_array.push_back({{"type", "image"},
-                                                                 {"source", {{"type", "base64"}, {"media_type", block.media_type}, {"data", block.data}}}});
-                                    }
-                                    else if (block.type == cell::ContentBlock::Type::InputAudio)
-                                    {
-                                        content_array.push_back({{"type", "audio"},
-                                                                 {"source", {{"type", "base64"}, {"media_type", block.media_type}, {"data", block.data}}}});
-                                    }
-                                }
-                                h.now().msg().push_back({{"role", "user"}, {"content", nlohmann::json::array({{{"type", "tool_result"}, {"tool_use_id", tc.value("id", "")}, {"content", content_array}}})}});
-                            }
-                            else
-                            {
-                                h.now().msg().push_back({{"role", "user"}, {"content", nlohmann::json::array({{{"type", "tool_result"}, {"tool_use_id", tc.value("id", "")}, {"content", wrapped}}})}});
-                            }
-                        }
-                    }
-                    // sandbox security refusals are normal feedback; only approval
-                    // refusals end the run (user decline only, autoallow reject
-                    // returns error message and continues)
-                    bool approval_refused = false;
-                    for (size_t i = 0; i < tool_calls.size(); i++)
-                        if (res[i].blocked && res[i].rejected_for == cell::tools::rejection_reason::user)
-                        {
-                            approval_refused = true;
-                            cell::sys::error("[tool call rejected: {} - stopping this run]", res[i].name);
-                            break;
-                        }
-                    cell::stats::add(h.now().id(), cfg.model_label(), in_chars, out_chars, usage_in(usage), usage_out(usage), usage_total(usage), (long long)(h.now().msg().size() - before));
-                    if (approval_refused)
-                    {
-                        done = true;
-                        natural_end = false; // user decline / autoallow deny aborts the turn
-                    }
-                    continue;
-                }
-                done = true;
-                cell::stats::add(h.now().id(), cfg.model_label(), in_chars, out_chars, usage_in(usage), usage_out(usage), usage_total(usage), (long long)(h.now().msg().size() - before));
-            }
-            // the turn reached its natural end: whatever a previous turn left
-            // behind is answered now, so the interrupt state is resolved (this is
-            // also what a successful /reload clears it with)
-            if (natural_end && !h.now().interrupt_state().empty())
-            {
-                log.info("llm", std::format("interrupt_cleared id={} why=turn completed", h.now().id()));
-                h.now().clear_interrupt();
-            }
-            // auto-compact after long agent runs: three or more tool calls or
-            // thinking entries since the last user message, or a context that has
-            // simply grown past a character budget — a pure chat turn produces
-            // neither tool calls nor reasoning, and previously grew without bound
-            // until it hit the provider's window (the one path that could lose
-            // history). only after turns that ended naturally — an aborted turn
-            // (request error, cancel, approval refusal) may be retried or resumed
-            // as-is, so compacting it automatically would rewrite history under it
-            constexpr long long kAutoCompactChars = 400 * 1024; // ≈100k tokens
-            bool long_run = turn_tool_calls + turn_thinking_entries >= 3;
-            long long ctx_chars = natural_end ? content_chars(h.now().msg()) : 0;
-            bool oversized = ctx_chars >= kAutoCompactChars;
-            if (cfg.compact_auto && natural_end && (long_run || oversized))
-            {
-                std::string result = compact(h.now());
-                if (result.find("context compacted") != std::string::npos)
-                {
-                    log.info("ctx", std::format("auto_compact tool_calls={} thinking={} chars={} msgs={} result={}",
-                                                turn_tool_calls, turn_thinking_entries, ctx_chars, (long long)h.now().msg().size(), result));
-                    cell::sys::println("[auto-compact] {}", result);
-                    cell::box::reset_read_log();
-                }
-            }
-            h.now().unload();
-            log.debug("sess", std::format("persisted id={} msgs={}", h.now().id(), h.now().msg().size()));
-            cfg.session_id = h.now().id();
-            cell::config::save(cfg);
+            eng.run_turn(input, resume_turn, ev);
+            clear_stream_line(); // a failed transfer may leave the ticker open
             if (!interactive)
                 running = false;
         };
-
         // ---- slash-command table ------------------------------------------------
         // Keyed by the leading token. A handler returns how the REPL continues:
         // `handled` (consumed — back to the prompt) or `exit` (leave the loop).
@@ -20659,7 +21064,7 @@ int repl::run()
                  h.now().unload();
                  cell::async_io::flush(); // the old session must survive a crash
                  h.forget_current();
-                 ensure_prompt(h.now());
+                 ensure_prompt();
                  log.info("sess", std::format("new id={} previous={} kept=true", h.now().id(), old_id));
                  cell::sys::println("new session: {} cwd={}", h.now().id(), cell::workdir().string());
                  if (const cell::config::provider_entry *p = cfg.current_provider_entry(); p)
@@ -20707,7 +21112,7 @@ int repl::run()
                      }
                      cell::teamwork::save_store(h.now().id(), nlohmann::json::object());
                  }
-                 ensure_prompt(h.now());
+                 ensure_prompt();
                  h.now().unload();
                  cell::async_io::flush();
                  log.info("sess", std::format("cleared id={} msgs_before={}", h.now().id(), before));
@@ -20735,7 +21140,7 @@ int repl::run()
                  // would duplicate the turn
                  input = std::move(ins_text);
                  log.info("ins", std::format("interject chars={}", input.size()));
-                 run_turn(false, input);
+                 drive_turn(false, input);
                  return cmd_flow::handled;
              }},
             {"/reload", [&](const std::vector<std::string> &, std::string &input) -> cmd_flow
@@ -20752,7 +21157,7 @@ int repl::run()
                  }
                  log.info("cmd", std::format("reload id={} reason={}", h.now().id(), reason));
                  cell::sys::println("[reload] resuming interrupted turn ({})", reason);
-                 run_turn(true, input);
+                 drive_turn(true, input);
                  return cmd_flow::handled;
              }},
             {"/provides", [&](const std::vector<std::string> &, std::string &) -> cmd_flow
@@ -21393,7 +21798,7 @@ int repl::run()
                      if (target == h.now().id())
                      {
                          h.forget_current();
-                         ensure_prompt(h.now());
+                         ensure_prompt();
                          cell::sys::println("session deleted: {} (usage stats removed); new session: {} cwd={}", target, h.now().id(), cell::workdir().string());
                      }
                      else
@@ -21423,7 +21828,7 @@ int repl::run()
                          cell::sys::println("cwd -> {}", cell::workdir().string());
                  }
                  h.use(target);
-                 ensure_prompt(h.now());
+                 ensure_prompt();
                  log.info("sess", std::format("switched to={} msgs={} previous={}", target, h.now().msg().size(), cfg.session_id.empty() ? "-" : cfg.session_id));
                  cell::sys::println("switched to session {} cwd={} ({} message(s))", h.now().id(), cell::workdir().string(), h.now().msg().size());
                  cell::chat::print_recent_messages(h.now().msg());
@@ -21646,7 +22051,7 @@ int repl::run()
                      }
                      return cmd_flow::handled;
                  }
-                 cell::sys::println("{}", compact(h.now()));
+                 cell::sys::println("{}", eng.compact_now(ev));
                  cell::box::reset_read_log(); // compaction drops read tool results from context
                  h.now().unload();
                  cell::async_io::flush();
@@ -21754,7 +22159,7 @@ int repl::run()
                      // a human is watching: re-scan more often than the 0.7 s
                      // default so a cross-process notice feels immediate
                      bool hit = cell::notice::wait_for(cur_sid, timeout, from_f, topic_f, got, 200);
-                     size_t n = inject_notices(false);
+                     size_t n = eng.inject_notices(false, ev);
                      if (hit || n > 0)
                          cell::sys::println("delivered {} notice(s) into the conversation", n);
                      else
@@ -21811,7 +22216,7 @@ int repl::run()
                  }
                  if (sub == "drain")
                  {
-                     size_t n = inject_notices(true);
+                     size_t n = eng.inject_notices(true, ev);
                      if (n > 0)
                          cell::sys::println("delivered {} notice(s) into the conversation", n);
                      return cmd_flow::handled;
@@ -21883,7 +22288,7 @@ int repl::run()
                  if (arg0() == "run" && toks.size() >= 3)
                  {
                      std::string out;
-                     if (cell::teamwork::run_job(team_rt, toks[2], out))
+                     if (cell::teamwork::run_job(eng.team_rt(), toks[2], out))
                          cell::sys::println("{}", out);
                      else
                          cell::sys::error("{}", out);
@@ -21892,7 +22297,7 @@ int repl::run()
                  if (arg0() == "run_bg" && toks.size() >= 3)
                  {
                      std::string out;
-                     if (cell::teamwork::run_job_bg(team_rt, toks[2], out))
+                     if (cell::teamwork::run_job_bg(eng.team_rt(), toks[2], out))
                          cell::sys::println("{}", out);
                      else
                          cell::sys::error("{}", out);
@@ -21902,7 +22307,7 @@ int repl::run()
                  {
                      // continue a gated/stopped workflow job from its saved stage
                      std::string out;
-                     if (cell::teamwork::run_job(team_rt, toks[2], out))
+                     if (cell::teamwork::run_job(eng.team_rt(), toks[2], out))
                          cell::sys::println("{}", out);
                      else
                          cell::sys::error("{}", out);
@@ -22173,7 +22578,7 @@ int repl::run()
                 continue;
             }
 
-            run_turn(false, input);
+            drive_turn(false, input);
         }
     }
     catch (const cell::sys::exception &e)
@@ -22190,6 +22595,6 @@ int repl::run()
     }
 
     log.info("exit", std::format("uptime={:.2f}s llm_requests={} tool_calls={}",
-                                 cell::sys::elapsed_ms(t_start) / 1000.0, total_llm_requests, total_tool_calls));
+                                 cell::sys::elapsed_ms(t_start) / 1000.0, eng.llm_requests(), eng.tool_calls()));
     return 0;
 }
