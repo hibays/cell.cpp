@@ -1,14 +1,83 @@
-etc
-.vscode
-*.exe
-*cell
-bin
-.workbuddy
-build/
-agent-gui-api-assessment.html
+# =============================================================================
+#  cell.cpp — ignore rules
+#
+#  Tracked on purpose:  cell.cpp · cellui.cpp · include/ · cmake/ · docs/
+#                       frontend/src · frontend/*.json · scripts/ · tests/
+#                       third_party/webui (vendored, needed for a single-file build)
+#  Ignored:             every build output, package manager cache and local tool
+#                       scratch space.
+# =============================================================================
 
-# frontend (bun / vite)
+# ---- build outputs (CMake, bare g++, bare clang++) ---------------------------
+build/
+out/
+cmake-build-*/
+CMakeUserPresets.json
+CMakeCache.txt
+CMakeFiles/
+compile_commands.json
+.cache/
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.so.*
+*.dylib
+*.dll
+*.exe
+*.pdb
+*.ilk
+*.idb
+*.exp
+*.iobj
+*.ipdb
+*.gcno
+*.gcda
+*.gcov
+
+# ---- install / packaging -----------------------------------------------------
+install/
+dist-staging/
+cell-config.cmake
+cell-config-version.cmake
+cell-config*.cmake
+
+# ---- local editor / IDE scratch ---------------------------------------------
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+ehthumbs.db
+
+# ---- front-end (bun / vite) --------------------------------------------------
+node_modules/
 frontend/node_modules/
 frontend/dist/
 frontend/.vite/
+frontend/.tanstack/
+bun.lockb.bak
 *.tsbuildinfo
+*.tsbuildinfo.*
+.eslintcache
+.stylelintcache
+
+# ---- project-local runtime state --------------------------------------------
+# .cell/ is created by the agent at runtime (sessions, tokens, server.json)
+.cell/
+*.cell-session
+logs/
+*.log
+
+# ---- local scratch / ad-hoc dirs ---------------------------------------------
+etc/
+bin/
+tmp/
+tools-local/
+*.local
+
+# ---- large one-off analysis artefacts (not part of the design docs) ----------
+agent-gui-api-assessment.html

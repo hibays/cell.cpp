@@ -37,6 +37,7 @@ option(CELL_BUILD_SHARED         "Build cell as a shared library (DLL / .so / .d
 option(CELL_BUILD_STATIC         "Build cell as a static library"                            OFF)
 option(CELL_BUILD_WEBUI          "Build cellui (WebUI desktop shell, single binary)"         ON)
 option(CELL_EMBED_WEBUI          "Embed the built front-end (frontend/dist) into cellui"     ON)
+option(CELL_WEBUI_LOG            "Verbose WebUI core logging (stderr) — debugging aid"       OFF)
 option(CELL_BUILD_TESTS          "Register ctest tests (self-test + embedding smoke test)"   ON)
 option(CELL_INSTALL              "Generate install rules and a CMake package (find_package)" ON)
 option(CELL_FETCH_DEPS           "Allow fetching header-only deps when not installed"        ON)
@@ -97,7 +98,7 @@ if(CELL_TOOLCHAIN_CHECKS)
             "Visual Studio 2022 17.10+ (recommended: 17.12+). The feature probe below is authoritative.")
     elseif(GNU AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS 14)
         message(WARNING
-            "GCC ${CMAKE_CXX_COMPILER_VERSION} detected; cell.cpp needs <generator>/<format>/"
+            "GCC ${CMAKE_CXX_COMPILER_VERSION} detected; cell.cpp needs <format>/"
             "<expected> from GCC 14+ (recommended: 15+). The feature probe below is authoritative.")
     elseif(Clang AND NOT AppleClang AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS 17)
         message(WARNING
@@ -106,7 +107,7 @@ if(CELL_TOOLCHAIN_CHECKS)
     elseif(AppleClang AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS 16)
         message(WARNING
             "AppleClang ${CMAKE_CXX_COMPILER_VERSION} detected; cell.cpp needs Xcode 16.3+ "
-            "(libc++ with <generator>). The feature probe below is authoritative.")
+            "(libc++ with <format>/<expected>). The feature probe below is authoritative.")
     endif()
 
     include(CheckCXXSourceCompiles)
@@ -115,12 +116,10 @@ if(CELL_TOOLCHAIN_CHECKS)
     check_cxx_source_compiles([[
         #include <format>
         #include <expected>
-        #include <generator>
         #include <span>
         #include <concepts>
         #include <functional>
         #include <string>
-        std::generator<int> cell_probe_generator() { co_yield 1; }
         int main()
         {
             std::move_only_function<void(std::span<const char>)> fn = [](std::span<const char>) {};
@@ -140,12 +139,10 @@ if(CELL_TOOLCHAIN_CHECKS)
         check_cxx_source_compiles([[
             #include <format>
             #include <expected>
-            #include <generator>
             #include <span>
             #include <concepts>
             #include <functional>
             #include <string>
-            std::generator<int> cell_probe_generator() { co_yield 1; }
             int main()
             {
                 std::move_only_function<void(std::span<const char>)> fn = [](std::span<const char>) {};
@@ -167,7 +164,8 @@ if(CELL_TOOLCHAIN_CHECKS)
     if(NOT CELL_STDLIB_HAS_REQUIRED_FEATURES)
         message(FATAL_ERROR
             "The toolchain cannot compile the C++${CELL_CXX_STANDARD} standard library features cell.cpp requires "
-            "(<format>, <expected>, <generator>, <span>, <concepts>, std::move_only_function).\n"
+            "(<format>, <expected>, <span>, <concepts>, std::move_only_function).\n"
+            "  (<generator> is optional: cell.cpp ships a portable fallback for libc++.)\n"
             "  Compiler: ${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION}\n"
             "  Flag tried: ${CELL_CXX_FLAG}\n"
             "Minimum known-good toolchains:\n"
@@ -428,6 +426,10 @@ if(CELL_BUILD_WEBUI)
     add_library(webui STATIC
         ${WEBUI_DIR}/src/webui.c
         ${WEBUI_DIR}/src/civetweb/civetweb.c)
+    # Static-link the WebView2 loader when we can. On GNU toolchains the MSVC
+    # objects need LLD (bfd cannot read them) plus a handful of MSVC runtime
+    # symbols, both handled here.
+    set(CELL_WEBVIEW_STATIC OFF)
     if(WIN32)
         target_sources(webui PRIVATE ${WEBUI_DIR}/src/webview/win32_wv2.cpp)
     elseif(APPLE)
@@ -445,11 +447,37 @@ if(CELL_BUILD_WEBUI)
         ${WEBUI_DIR}/bridge)
     # compile-time behaviour of the vendored sources — never leak into consumers
     target_compile_definitions(webui PRIVATE NO_CACHING NO_CGI USE_WEBSOCKET NO_SSL)
+    if(CELL_WEBUI_LOG)
+        target_compile_definitions(webui PRIVATE WEBUI_LOG)
+    endif()
     if(WIN32)
         target_link_libraries(webui PUBLIC ws2_32 user32 shell32 ole32 uuid oleaut32 comdlg32 advapi32)
         # static WebView2 loader (the runtime itself is provided by the OS)
         if(EXISTS ${WEBUI_DIR}/lib/WebView2LoaderStatic.lib)
-            target_link_libraries(webui PRIVATE ${WEBUI_DIR}/lib/WebView2LoaderStatic.lib)
+            if(MSVC)
+                target_link_libraries(webui PRIVATE ${WEBUI_DIR}/lib/WebView2LoaderStatic.lib)
+                # Without this the backend tries LoadLibrary("WebView2Loader.dll")
+                # and silently gives up, so webui_show() would always fail.
+                target_compile_definitions(webui PUBLIC WEBUI_WEBVIEW_STATIC=1)
+                set(CELL_WEBVIEW_STATIC ON)
+            else()
+                # GNU ld (bfd) aborts on the MSVC COFF members; LLD reads them
+                # fine once the MSVC runtime symbols are provided.
+                include(CheckCXXSourceCompiles)
+                set(CMAKE_REQUIRED_FLAGS "-fuse-ld=lld")
+                check_cxx_source_compiles("int main(){return 0;}" CELL_HAVE_LLD)
+                unset(CMAKE_REQUIRED_FLAGS)
+                if(CELL_HAVE_LLD)
+                    target_sources(webui PRIVATE ${WEBUI_DIR}/src/webview/wv2_msvc_compat.cpp)
+                    target_link_libraries(webui PRIVATE ${WEBUI_DIR}/lib/WebView2LoaderStatic.lib)
+                    target_compile_definitions(webui PUBLIC WEBUI_WEBVIEW_STATIC=1)
+                    set(CELL_WEBVIEW_STATIC ON)
+                else()
+                    message(WARNING
+                        "LLD not available — cannot static-link the WebView2 loader. "
+                        "cellui will look for WebView2Loader.dll at runtime (install mingw-w64-ucrt-x86_64-lld).")
+                endif()
+            endif()
         else()
             message(WARNING "WebView2LoaderStatic.lib not found in ${WEBUI_DIR}/lib — the shell will need WebView2Loader.dll at runtime")
         endif()
@@ -466,6 +494,10 @@ if(CELL_BUILD_WEBUI)
     # and owns main(). Dependencies come from cell_configure_target (so the
     # static-dependency switch applies here exactly as it does to the CLI).
     target_link_libraries(cellui PRIVATE webui)
+    # the MSVC-built WebView2 loader objects can only be merged by LLD
+    if(CELL_WEBVIEW_STATIC AND NOT MSVC)
+        target_link_options(cellui PRIVATE -fuse-ld=lld)
+    endif()
     cell_configure_target(cellui)
 
     # embed the built front-end (frontend/dist/index.html -> cellui_web.h)
@@ -480,6 +512,9 @@ if(CELL_BUILD_WEBUI)
                 VERBATIM)
             add_custom_target(cellui_web DEPENDS ${CMAKE_BINARY_DIR}/cellui_web.h)
             add_dependencies(cellui cellui_web)
+            # the generated header defines the payload; this flag is what makes
+            # cellui.cpp include it (it cannot self-define before including)
+            target_compile_definitions(cellui PRIVATE CELLUI_HAVE_EMBEDDED_WEB=1)
         else()
             message(STATUS "cellui: front-end not built (or no node/bun) — the binary falls back to a built-in placeholder page")
         endif()

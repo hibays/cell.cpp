@@ -9,7 +9,7 @@
 #    windows-msys2    Windows Server 2022 · GCC     MSYS2 UCRT64, pacman dependencies
 #    windows-desktop  Windows Server 2022 · GCC     front-end (bun) + cellui shell,
 #                                                   portable-single-file check
-#    macos            macOS 15 · AppleClang         needs Xcode 16.3+ (libc++ <generator>)
+#    macos            macOS 15 · AppleClang         portable <generator> fallback
 #
 #  Every C++ job runs the same three steps: configure -> build -> ctest. The
 #  tests are the binary's built-in self-test suite plus the embedding smoke test
@@ -138,6 +138,7 @@ jobs:
             mingw-w64-ucrt-x86_64-cmake
             mingw-w64-ucrt-x86_64-ninja
             mingw-w64-ucrt-x86_64-pkgconf
+            mingw-w64-ucrt-x86_64-lld
             mingw-w64-ucrt-x86_64-curl
             mingw-w64-ucrt-x86_64-libsodium
             mingw-w64-ucrt-x86_64-nlohmann-json
@@ -177,6 +178,7 @@ jobs:
             mingw-w64-ucrt-x86_64-cmake
             mingw-w64-ucrt-x86_64-ninja
             mingw-w64-ucrt-x86_64-pkgconf
+            mingw-w64-ucrt-x86_64-lld
             mingw-w64-ucrt-x86_64-curl
             mingw-w64-ucrt-x86_64-libsodium
             mingw-w64-ucrt-x86_64-nlohmann-json
@@ -232,11 +234,9 @@ jobs:
   # ---------------------------------------------------------------------------
   macos:
     name: macOS · AppleClang
-    # The cell.cpp C++26 surface (<generator> in libc++) is not available in the
-    # AppleClang shipping with the current macos-15 runner image, so this job is
-    # informational: it configures, and fails with the exact toolchain message
-    # from the configure-time probe until a newer Xcode lands on the image.
-    continue-on-error: true
+    # libc++ still lacks std::generator, so cell.cpp transparently falls back to
+    # its own coroutine generator (see cell.cpp) and the whole CLI builds and
+    # tests on the stock runner toolchain.
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4

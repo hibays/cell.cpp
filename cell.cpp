@@ -33,7 +33,117 @@
 #include <optional>
 #include <concepts>
 #include <csignal>
+// <generator> — std::generator is still missing from libc++ (AppleClang), so a
+// small portable stand-in keeps the single file buildable everywhere. On
+// toolchains that do ship it (GCC 14+, Clang 19+/libstdc++, MSVC 19.40+) the
+// standard implementation is used, which is what the minimum-toolchain table
+// in docs/BUILDING.md describes.
+#if !defined(CELL_FORCE_FALLBACK_GENERATOR) && \
+    defined(__cpp_lib_generator) && __cpp_lib_generator >= 202207L
 #include <generator>
+namespace cell
+{
+    template <class T>
+    using generator = std::generator<T>;
+}
+#else
+#include <coroutine>
+#include <iterator>
+#include <utility>
+namespace cell
+{
+    // Minimal synchronous coroutine generator: enough for `co_yield` ranges,
+    // range-for, and early `break` (the coroutine is destroyed with the
+    // generator). Move-only, like std::generator.
+    template <class T>
+    class generator final
+    {
+      public:
+        struct promise_type
+        {
+            std::optional<T> value{};
+            std::exception_ptr exception{};
+
+            generator get_return_object() noexcept
+            {
+                return generator{std::coroutine_handle<promise_type>::from_promise(*this)};
+            }
+            std::suspend_always initial_suspend() noexcept { return {}; }
+            std::suspend_always final_suspend() noexcept { return {}; }
+            std::suspend_always yield_value(T v) noexcept
+            {
+                value.emplace(std::move(v));
+                return {};
+            }
+            void return_void() noexcept {}
+            void unhandled_exception() noexcept { exception = std::current_exception(); }
+        };
+
+        class iterator final
+        {
+          public:
+            using value_type = T;
+            using difference_type = std::ptrdiff_t;
+
+            explicit iterator(std::coroutine_handle<promise_type> h) noexcept : h_(h) {}
+
+            const T &operator*() const noexcept { return *h_.promise().value; }
+
+            iterator &operator++()
+            {
+                h_.resume();
+                if (h_.done() && h_.promise().exception)
+                    std::rethrow_exception(h_.promise().exception);
+                return *this;
+            }
+            void operator++(int) { ++*this; }
+
+            bool operator==(std::default_sentinel_t) const noexcept { return !h_ || h_.done(); }
+
+          private:
+            std::coroutine_handle<promise_type> h_;
+        };
+
+        generator() noexcept = default;
+        explicit generator(std::coroutine_handle<promise_type> h) noexcept : h_(h) {}
+        generator(generator &&other) noexcept : h_(std::exchange(other.h_, {})) {}
+        generator &operator=(generator &&other) noexcept
+        {
+            if (this != &other)
+            {
+                if (h_)
+                    h_.destroy();
+                h_ = std::exchange(other.h_, {});
+            }
+            return *this;
+        }
+        generator(const generator &) = delete;
+        generator &operator=(const generator &) = delete;
+        ~generator()
+        {
+            if (h_)
+                h_.destroy();
+        }
+
+        iterator begin()
+        {
+            if (h_ && !started_)
+            {
+                started_ = true;
+                h_.resume();
+                if (h_.done() && h_.promise().exception)
+                    std::rethrow_exception(h_.promise().exception);
+            }
+            return iterator{h_};
+        }
+        std::default_sentinel_t end() const noexcept { return {}; }
+
+      private:
+        std::coroutine_handle<promise_type> h_{};
+        bool started_ = false;
+    };
+}
+#endif
 #include <expected>
 #include <source_location>
 #include <exception>
@@ -1992,7 +2102,7 @@ namespace cell
     namespace text
     {
         // Zero-copy line generator: yields string_views, strips trailing '\r'.
-        static std::generator<std::string_view> lines(std::string_view text)
+        static cell::generator<std::string_view> lines(std::string_view text)
         {
             size_t start = 0;
             while (start < text.size())
@@ -3774,7 +3884,7 @@ namespace cell
         // the parameter lives in the coroutine frame; a reference parameter would
         // dangle as soon as the caller's temporary dies at the end of the range
         // initializer (caught by the ASan CI job).
-        static std::generator<std::tuple<std::filesystem::path, std::string, bool>> walk_entries(std::filesystem::path root_path)
+        static cell::generator<std::tuple<std::filesystem::path, std::string, bool>> walk_entries(std::filesystem::path root_path)
         {
             struct frame
             {
@@ -7231,7 +7341,7 @@ namespace cell
             return std::string::npos;
         }
         // lazy coroutine SSE parser: yields parsed JSON events without copying line bytes
-        static std::generator<nlohmann::json> sse_events(const std::string &buf, size_t &consumed)
+        static cell::generator<nlohmann::json> sse_events(const std::string &buf, size_t &consumed)
         {
             std::string_view payload;
             size_t pos = consumed;

@@ -336,6 +336,7 @@ namespace cellui
         int port = 0; // 0 = let the OS pick; the real port lands in server.json
         std::string host = "127.0.0.1";
         unsigned width = 1280, height = 860;
+        bool force_browser = false;
 
         // cellui accepts a small flag set of its own; everything else is passed
         // through to the agent CLI.
@@ -370,9 +371,11 @@ namespace cellui
                     height = (unsigned)std::atoi(w.substr(x + 1).c_str());
                 }
             }
+            else if (a == "--browser")
+                force_browser = true;
             else if (a == "--help" || a == "-h")
             {
-                std::printf("usage: cellui [--size WxH] [--port N] [--host ADDR] [--no-serve]\n");
+                std::printf("usage: cellui [--size WxH] [--port N] [--host ADDR] [--no-serve] [--browser]\n");
                 return 0;
             }
             else
@@ -409,10 +412,9 @@ namespace cellui
         size_t w = webui_new_window();
         webui_set_runtime(w, None); // no Deno/Node/Bun needed
         webui_set_size(w, width, height);
-        webui_set_hide(w, true); // shown once the page is ready
-        webui_set_port(w, 8790); // fixed local port for the window itself
-        webui_set_config(show_wait_connection, false);
-        webui_set_config(ui_event_blocking, false);
+        // NOTE: do NOT call webui_set_hide() — it starts the window in hidden
+        // mode and the WebView would never become visible.
+        // no fixed port: if the port is busy, webui would fail to show the window
 
         webui_bind(w, "cell_hello", bind_hello);
         webui_bind(w, "cell_bootstrap", bind_bootstrap);
@@ -425,10 +427,28 @@ namespace cellui
         webui_bind(w, "cell_notify", bind_notify);
 
 #ifdef CELLUI_HAVE_EMBEDDED_WEB
-        webui_show(w, cellui_web_html);
+        const std::string html = std::string{cellui_web_html};
 #else
-        webui_show(w, kFallbackHtml);
+        const std::string html = std::string{kFallbackHtml};
 #endif
+
+        // WebView2 first — cellui is a *native window* shell, a browser tab is
+        // only the last-resort fallback (webui would otherwise happily pick
+        // Edge/Chrome in app mode and never touch the WebView).
+        if (force_browser || !webui_show_wv(w, html.c_str()))
+        {
+            std::fprintf(stderr,
+                         "cellui: WebView2 window failed to open (is the WebView2 runtime installed?).\n"
+                         "        Trying the default browser instead…\n");
+            if (!webui_show_browser(w, html.c_str(), AnyBrowser))
+            {
+                std::fprintf(stderr,
+                             "cellui: failed to open a window. Start 'cell --serve' from the same "
+                             "directory and open the printed URL.\n");
+                return 2;
+            }
+        }
+
         webui_wait(); // blocks until the window closes
 
         if (serve)
@@ -446,7 +466,7 @@ namespace cellui
                     cmd = std::format("curl -s -o /dev/null -X POST -H 'Authorization: Bearer {}' '{}'", token, url);
 #endif
                     const int rc = std::system(cmd.c_str()); // best effort shell integration
-        (void)rc;
+                    (void)rc;
                 } })
                 .detach();
             std::this_thread::sleep_for(std::chrono::milliseconds(500));
