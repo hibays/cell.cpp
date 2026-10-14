@@ -178,4 +178,36 @@ kbd {
   font-size: 12px;
   font-family: var(--mono);
 }
+
+/* ---- responsive: the hero scales down instead of clipping -------------- */
+@media (max-width: 900px) {
+  .title {
+    font-size: clamp(2rem, 7vw, 3.2rem);
+  }
+  .content {
+    left: 8vw;
+    right: 8vw;
+  }
+}
+@media (max-width: 640px) {
+  .content {
+    left: 6vw;
+    right: 6vw;
+  }
+  .title {
+    font-size: clamp(1.7rem, 9vw, 2.4rem);
+  }
+  .sub {
+    font-size: 13.5px;
+  }
+  .cta {
+    width: 100%;
+    text-align: center;
+  }
+  .foot {
+    position: static;
+    padding: 18px 6vw;
+  }
+}
+
 </style>

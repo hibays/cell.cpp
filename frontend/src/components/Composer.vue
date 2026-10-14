@@ -100,4 +100,22 @@ function onKeydown(e: KeyboardEvent): void {
   color: #fca5a5;
   border: 1px solid rgba(239, 68, 68, 0.35);
 }
+
+/* ---- responsive: the bar wraps instead of overflowing on phones ------- */
+@media (max-width: 640px) {
+  .composer {
+    padding: 8px 10px;
+  }
+  .bar {
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+  .btn {
+    padding: 6px 14px;
+  }
+  .input {
+    font-size: 16px; /* stops iOS/Android zoom-on-focus */
+  }
+}
+
 </style>

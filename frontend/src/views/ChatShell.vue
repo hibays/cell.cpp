@@ -412,4 +412,57 @@ onMounted(async () => {
   color: #fca5a5;
   border-color: rgba(239, 68, 68, 0.35);
 }
+
+/* ---- responsive -------------------------------------------------------
+   The sidebar becomes an overlay drawer below 900px so the conversation
+   keeps the full width; typography and paddings tighten below 640px. */
+@media (max-width: 900px) {
+  .sidebar {
+    position: fixed;
+    z-index: 60;
+    top: 0;
+    bottom: 0;
+    left: 0;
+    width: min(78vw, 300px);
+    flex: 0 0 auto;
+    box-shadow: var(--shadow);
+  }
+  .sidebar.closed {
+    margin-left: 0;
+    transform: translateX(-104%);
+  }
+  .topbar {
+    padding: 10px 12px;
+  }
+  .topbar .chip {
+    display: none;
+  }
+  .column {
+    padding: 14px 12px 10px;
+  }
+}
+
+@media (max-width: 640px) {
+  .topbar .title {
+    font-size: 13px;
+  }
+  .tool {
+    padding: 3px 9px;
+  }
+  .chips {
+    flex-wrap: wrap;
+  }
+  .welcome h2 {
+    font-size: 1.05rem;
+  }
+  .modal-card {
+    width: 96vw;
+    max-height: 90vh;
+    padding: 14px 14px 18px;
+  }
+  .composer-wrap {
+    padding: 0 8px 10px;
+  }
+}
+
 </style>

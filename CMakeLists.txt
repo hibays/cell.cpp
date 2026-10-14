@@ -113,62 +113,82 @@ if(CELL_TOOLCHAIN_CHECKS)
     include(CheckCXXSourceCompiles)
     set(_cell_saved_required_flags "${CMAKE_REQUIRED_FLAGS}")
     set(CMAKE_REQUIRED_FLAGS "${CMAKE_REQUIRED_FLAGS} ${CELL_CXX_FLAG}")
-    check_cxx_source_compiles([[
-        #include <format>
-        #include <expected>
-        #include <span>
-        #include <concepts>
-        #include <functional>
-        #include <string>
-        int main()
-        {
-            std::move_only_function<void(std::span<const char>)> fn = [](std::span<const char>) {};
-            std::expected<int, std::string> value = 1;
-            auto text = std::format("{}", value.value());
-            (void)text;
-            (void)fn;
-            return 0;
-        }
-    ]] CELL_STDLIB_HAS_REQUIRED_FEATURES)
 
-    # Known toolchain quirk, handled automatically: libstdc++ gates
-    # std::generator on __cpp_sized_deallocation, which GCC defines by default
-    # but Clang does not. Ask for it explicitly and re-probe.
-    if(NOT CELL_STDLIB_HAS_REQUIRED_FEATURES AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
-        set(CMAKE_REQUIRED_FLAGS "${CMAKE_REQUIRED_FLAGS} -fsized-deallocation")
-        check_cxx_source_compiles([[
-            #include <format>
-            #include <expected>
-            #include <span>
-            #include <concepts>
-            #include <functional>
-            #include <string>
-            int main()
-            {
-                std::move_only_function<void(std::span<const char>)> fn = [](std::span<const char>) {};
-                std::expected<int, std::string> value = 1;
-                auto text = std::format("{}", value.value());
-                (void)text;
-                (void)fn;
-                return 0;
-            }
-        ]] CELL_STDLIB_HAS_REQUIRED_FEATURES_CLANG_FLAG)
-        if(CELL_STDLIB_HAS_REQUIRED_FEATURES_CLANG_FLAG)
-            set(CELL_STDLIB_HAS_REQUIRED_FEATURES TRUE)
-            string(APPEND CMAKE_CXX_FLAGS " -fsized-deallocation")
-            message(STATUS "Clang needs -fsized-deallocation for libstdc++ <generator>; adding it")
+    # One probe per feature, so a failure names the exact header a toolchain is
+    # missing instead of a combined "something in there" error.
+    set(_cell_probe_format "
+#include <format>
+#include <string>
+int main() { auto s = std::format(\"{}\", 1); (void)s; return 0; }")
+    set(_cell_probe_expected "
+#include <expected>
+#include <string>
+int main() { std::expected<int, std::string> e = 1; return e.has_value() ? 0 : 1; }")
+    set(_cell_probe_span_concepts "
+#include <span>
+#include <concepts>
+#include <vector>
+int main() { std::vector<int> v{1, 2, 3}; std::span<const int> s{v}; return s.size() == 3 ? 0 : 1; }")
+    set(_cell_probe_move_only_function "
+#include <functional>
+#include <span>
+int main() {
+    std::move_only_function<void(std::span<const char>)> fn = [](std::span<const char>) {};
+    (void)fn;
+    return 0;
+    }")
+
+    set(_cell_probes format expected span_concepts move_only_function)
+    set(CELL_MISSING_FEATURES "")
+    set(CELL_NEEDS_SIZED_DEALLOC OFF)
+    foreach(_cell_p IN LISTS _cell_probes)
+        string(TOUPPER "${_cell_p}" _cell_pu)
+        set(_cell_var CELL_HAVE_${_cell_pu})
+        check_cxx_source_compiles("${_cell_probe_${_cell_p}}" ${_cell_var})
+        # libstdc++ gates parts of the library on __cpp_sized_deallocation, which
+        # GCC defines by default but Clang does not — retry with the flag and keep it.
+        if(NOT ${_cell_var} AND CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND NOT CELL_NEEDS_SIZED_DEALLOC)
+            string(APPEND CMAKE_REQUIRED_FLAGS " -fsized-deallocation")
+            check_cxx_source_compiles("${_cell_probe_${_cell_p}}" ${_cell_var}_SD)
+            if(${_cell_var}_SD)
+                set(${_cell_var} TRUE)
+                set(CELL_NEEDS_SIZED_DEALLOC ON)
+                string(APPEND CMAKE_CXX_FLAGS " -fsized-deallocation")
+                message(STATUS "Clang needs -fsized-deallocation for this libstdc++ feature; adding it")
+            endif()
+            set(CMAKE_REQUIRED_FLAGS "${_cell_saved_required_flags} ${CELL_CXX_FLAG}")
         endif()
-    endif()
+        if(NOT ${_cell_var})
+            list(APPEND CELL_MISSING_FEATURES "${_cell_p}")
+        endif()
+    endforeach()
     set(CMAKE_REQUIRED_FLAGS "${_cell_saved_required_flags}")
 
-    if(NOT CELL_STDLIB_HAS_REQUIRED_FEATURES)
+    if(CELL_MISSING_FEATURES)
+        # Re-run the first missing feature through try_compile so the real
+        # compiler diagnostics end up in the configure log.
+        list(GET CELL_MISSING_FEATURES 0 _cell_first)
+        string(TOUPPER "${_cell_first}" _cell_firstu)
+        try_compile(_cell_diag "${CMAKE_BINARY_DIR}/CMakeFiles/cell-toolprobe-${_cell_first}"
+            SOURCES "${CMAKE_BINARY_DIR}/CMakeFiles/cell-toolprobe-${_cell_first}/probe.cpp"
+            COMPILE_DEFINITIONS "${CELL_CXX_FLAG}"
+            OUTPUT_VARIABLE _cell_diag_out)
+        file(WRITE "${CMAKE_BINARY_DIR}/CMakeFiles/cell-toolprobe-${_cell_first}/probe.cpp"
+            "${_cell_probe_${_cell_first}}")
+        try_compile(_cell_diag "${CMAKE_BINARY_DIR}/CMakeFiles/cell-toolprobe-${_cell_first}"
+            SOURCES "${CMAKE_BINARY_DIR}/CMakeFiles/cell-toolprobe-${_cell_first}/probe.cpp"
+            COMPILE_DEFINITIONS "${CELL_CXX_FLAG}"
+            OUTPUT_VARIABLE _cell_diag_out)
+        message(STATUS "toolchain probe — missing: ${CELL_MISSING_FEATURES}")
+        string(REGEX REPLACE "\n" "\n  " _cell_diag_indented "${_cell_diag_out}")
+        message(STATUS "compiler output for '${_cell_first}':\n  ${_cell_diag_indented}")
         message(FATAL_ERROR
-            "The toolchain cannot compile the C++${CELL_CXX_STANDARD} standard library features cell.cpp requires "
-            "(<format>, <expected>, <span>, <concepts>, std::move_only_function).\n"
+            "The toolchain cannot compile the C++${CELL_CXX_STANDARD} standard library features "
+            "cell.cpp requires (missing: ${CELL_MISSING_FEATURES}).\n"
             "  (<generator> is optional: cell.cpp ships a portable fallback for libc++.)\n"
             "  Compiler: ${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION}\n"
             "  Flag tried: ${CELL_CXX_FLAG}\n"
-            "Minimum known-good toolchains:\n"
+            "Minimum known-good toolchains://n"
             "  * GCC 14+ (recommended 15+)          e.g. MSYS2 UCRT64, Ubuntu gcc-14\n"
             "  * Clang 17+ with libstdc++ 14+       add -fsized-deallocation (libc++: 19+ for std::generator)\n"
             "  * MSVC 19.40+ (VS 2022 17.10+)       /std:c++latest\n"
