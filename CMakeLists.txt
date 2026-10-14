@@ -558,6 +558,12 @@ if(CELL_BUILD_WEBUI)
                 OUTPUT ${CMAKE_BINARY_DIR}/cellui_web.h
                 COMMAND ${CELL_WEB_BUILDER} ${CMAKE_CURRENT_SOURCE_DIR}/webui/scripts/embed_webui.mjs ${CMAKE_BINARY_DIR}
                 WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+                # Without these, ninja reports "no work to do" after the
+                # front-end is rebuilt and the stale payload stays baked in —
+                # the binary then ships an old UI with no visible failure.
+                DEPENDS
+                    ${CMAKE_CURRENT_SOURCE_DIR}/webui/frontend/dist/index.html
+                    ${CMAKE_CURRENT_SOURCE_DIR}/webui/scripts/embed_webui.mjs
                 COMMENT "embedding the built front-end into the cellui binary"
                 VERBATIM)
             add_custom_target(cellui_web DEPENDS ${CMAKE_BINARY_DIR}/cellui_web.h)
