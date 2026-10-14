@@ -1,0 +1,171 @@
+#!/usr/bin/env python3
+"""End-to-end test: kernel serve + a mock LLM provider, no network.
+
+Proves the workflow the front-end drives:
+  serve -> health -> session -> turn (streamed from the mock) -> transcript
+
+Isolation: CELL_ROOT points at a temp dir, so nothing touches the user's
+sessions/vault/server.json. Run directly or via ctest (cell.e2e_serve).
+
+    CELL_BIN=/path/to/cell python3 tests/e2e_serve.py
+"""
+import json
+import os
+import socket
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+BIN = Path(os.environ.get("CELL_BIN", ""))
+
+
+def free_port() -> int:
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    p = s.getsockname()[1]
+    s.close()
+    return p
+
+
+class MockLLM(BaseHTTPRequestHandler):
+    """Minimal OpenAI-compatible /v1/chat/completions (non-stream JSON)."""
+
+    def log_message(self, *a):  # silence
+        pass
+
+    def do_POST(self):
+        n = int(self.headers.get("Content-Length", 0))
+        body = json.loads(self.rfile.read(n) or b"{}")
+        last = ""
+        for m in body.get("messages", []):
+            if m.get("role") == "user":
+                last = m.get("content", "")
+        text = f"mock reply to: {last[:80]}"
+        # the kernel always requests stream=true — answer in OpenAI SSE chunks
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.end_headers()
+        first = json.dumps(
+            {"choices": [{"delta": {"role": "assistant", "content": text}}]}
+        )
+        self.wfile.write(f"data: {first}\n\n".encode())
+        self.wfile.write(b"data: [DONE]\n\n")
+
+
+def api(base: str, token: str, method: str, path: str, body: dict | None = None):
+    req = urllib.request.Request(
+        base + path,
+        data=json.dumps(body).encode() if body is not None else None,
+        method=method,
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=30) as r:
+        return json.loads(r.read() or b"{}")
+
+
+def wait_healthy(base: str, token: str, proc: subprocess.Popen, timeout: float = 30.0):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if proc.poll() is not None:
+            raise RuntimeError(f"cell --serve exited early rc={proc.returncode}")
+        try:
+            req = urllib.request.Request(base + "/v1/health")
+            with urllib.request.urlopen(req, timeout=2) as r:
+                return json.loads(r.read())
+        except Exception:
+            time.sleep(0.2)
+    raise RuntimeError("serve never became healthy")
+
+
+def main() -> int:
+    if not BIN.is_file():
+        print(f"skip: CELL_BIN not set or missing ({BIN})")
+        return 0
+    root = Path(tempfile.mkdtemp(prefix="cell-e2e-"))
+    llm_port = free_port()
+    llm = ThreadingHTTPServer(("127.0.0.1", llm_port), MockLLM)
+    threading.Thread(target=llm.serve_forever, daemon=True).start()
+
+    # the vault is the real key store; the env var is the documented fallback
+    env = dict(os.environ, CELL_ROOT=str(root), OPENAI_API_KEY="sk-test")
+    cfg_dir = root / "config"
+    cfg_dir.mkdir(parents=True, exist_ok=True)
+    (root / "config.json").write_text(
+        json.dumps(
+            {
+                "providers": [
+                    {
+                        "name": "mock",
+                        "style": "openai",
+                        "base": f"http://127.0.0.1:{llm_port}/v1",
+                        "key": "sk-test",
+                    }
+                ],
+                "current_provider": "mock",
+                "current_model": "mock-model",
+                "tools": False,
+            }
+        )
+    )
+
+    port = free_port()
+    env["CELL_SERVE_PORT"] = str(port)  # not used by the kernel; --port is explicit
+    proc = subprocess.Popen(
+        [str(BIN), "--serve", "--port", str(port), "--host", "127.0.0.1"],
+        env=env,
+        cwd=str(root),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        base = f"http://127.0.0.1:{port}"
+        health = wait_healthy(base, "", proc)
+        assert health["status"] == "ok", health
+        print("health:", health["version"], health["provider"], health["model"])
+
+        token = ""
+        for _ in range(50):
+            sj = root / "server.json"
+            if sj.exists():
+                token = json.loads(sj.read_text())["token"]
+                break
+            time.sleep(0.1)
+        assert token, "server.json never appeared"
+
+        # the discovery file must live under CELL_ROOT, not next to the binary
+        assert (root / "server.json").exists(), "CELL_ROOT isolation broken"
+
+        created = api(base, token, "POST", "/v1/sessions")
+        sid = created["id"]
+        print("session:", sid)
+
+        turn = api(base, token, "POST", f"/v1/sessions/{sid}/turn", {"text": "hello cell"})
+        out = turn.get("output", "")
+        assert "mock reply" in out, f"turn output missing mock reply: {turn}"
+        print("turn output:", out[:60])
+
+        msgs = api(base, token, "GET", f"/v1/sessions/{sid}/messages")
+        roles = [m["role"] for m in msgs.get("messages", msgs.get("entries", []))]
+        assert "assistant" in roles, roles
+        print("transcript roles:", roles)
+
+        api(base, token, "POST", "/v1/shutdown")
+        proc.wait(timeout=15)
+        print("e2e_serve OK")
+        return 0
+    except Exception as e:
+        print(f"e2e_serve FAILED: {e}")
+        if proc.poll() is None:
+            proc.kill()
+        return 1
+    finally:
+        llm.shutdown()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

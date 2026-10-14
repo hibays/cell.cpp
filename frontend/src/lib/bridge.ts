@@ -2,7 +2,7 @@
 // gracefully when the bridge is absent (e.g. running `bun run dev` in a plain
 // browser, where the native layer does not exist).
 
-import { parseJson, type ApiError } from './api'
+import { parseJson, resolveNative, type ApiError } from './api'
 
 export interface ExportResult {
   ok?: boolean
@@ -12,7 +12,9 @@ export interface ExportResult {
 }
 
 function hasBridge(): boolean {
-  return typeof window !== 'undefined' && typeof window.cell?.cell_bootstrap === 'function'
+  // webui binds globals (window.cell_bootstrap); the window.cell.* namespace
+  // is the documented contract — resolveNative accepts both forms.
+  return resolveNative('cell_hello') !== undefined
 }
 
 async function call<T>(fn: () => Promise<string>): Promise<T> {
@@ -24,22 +26,22 @@ export const bridge = {
 
   async exportSession(sessionId: string, outPath?: string): Promise<ExportResult> {
     if (!hasBridge()) return { error: 'native bridge unavailable (dev mode)' }
-    return call<ExportResult>(() => window.cell.cell_export_session(sessionId, outPath))
+    return call<ExportResult>(() => resolveNative('cell_export_session')!(sessionId, outPath))
   },
 
   async exportBatch(sessionIds: string[]): Promise<ExportResult[]> {
     if (!hasBridge()) return sessionIds.map((id) => ({ id, error: 'native bridge unavailable (dev mode)' }))
-    return call<ExportResult[]>(() => window.cell.cell_export_batch(sessionIds))
+    return call<ExportResult[]>(() => resolveNative('cell_export_batch')!(sessionIds))
   },
 
   async exportAll(): Promise<ExportResult[]> {
     if (!hasBridge()) return [{ error: 'native bridge unavailable (dev mode)' }]
-    return call<ExportResult[]>(() => window.cell.cell_export_all())
+    return call<ExportResult[]>(() => resolveNative('cell_export_all')!())
   },
 
   async reveal(path: string): Promise<void> {
     if (!hasBridge()) return
-    await window.cell.cell_reveal(path)
+    await resolveNative('cell_reveal')!(path)
   },
 
   async openExternal(url: string): Promise<void> {
@@ -47,19 +49,19 @@ export const bridge = {
       window.open(url, '_blank', 'noopener')
       return
     }
-    await window.cell.cell_open_external(url)
+    await resolveNative('cell_open_external')!(url)
   },
 
   async capabilities(): Promise<Record<string, unknown>> {
     if (!hasBridge()) return { shell: 'browser' }
-    return call<Record<string, unknown>>(() => window.cell.cell_native_capabilities())
+    return call<Record<string, unknown>>(() => resolveNative('cell_native_capabilities')!())
   },
 
   /** In-app toast for now; the native placeholder reports it is not implemented. */
   async notify(text: string): Promise<void> {
     if (!hasBridge()) return
     try {
-      await window.cell.cell_notify(text)
+      await resolveNative('cell_notify')!(text)
     } catch {
       /* native notifications are a placeholder; the web toast is the real one */
     }

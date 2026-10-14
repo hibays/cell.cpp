@@ -459,6 +459,41 @@ namespace cellui
                 std::fprintf(stderr, "cellui: %s\n", g_state.serve_error.c_str());
         }
 
+        // ---- display scaling (Windows high-DPI) -------------------------------
+        // Without a DPI-awareness declaration the process is system-DPI-unaware:
+        // DWM bitmap-stretches the window → blurry text and a physically wrong
+        // size on 125/150 % displays. Per-monitor-v2 keeps the WebView crisp,
+        // and the requested size is then interpreted in physical pixels, so the
+        // logical size is scaled by the monitor's factor here.
+#ifdef _WIN32
+        {
+            if (HMODULE user32 = GetModuleHandleW(L"user32.dll"))
+            {
+                using SetCtxFn = BOOL(WINAPI *)(DPI_AWARENESS_CONTEXT);
+                if (auto set_ctx =
+                        reinterpret_cast<SetCtxFn>(GetProcAddress(user32, "SetProcessDpiAwarenessContext"));
+                    set_ctx != nullptr)
+                {
+                    set_ctx(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+                }
+            }
+            HDC dc = GetDC(nullptr);
+            if (dc != nullptr)
+            {
+                UINT dpi = GetDeviceCaps(dc, LOGPIXELSX); // 96 = 100 %
+                ReleaseDC(nullptr, dc);
+                if (dpi > 96)
+                {
+                    // exact rational scale (144 -> 1.5x): integer division would
+                    // round 1.5 down to 1 and the window would come out tiny
+                    // while the WebView lays out at 1.5 — clipped, oversized UI
+                    width = (unsigned)(((unsigned long long)width * dpi + 48) / 96);
+                    height = (unsigned)(((unsigned long long)height * dpi + 48) / 96);
+                }
+            }
+        }
+#endif
+
         // ---- the window ------------------------------------------------------
         // WebView2 native window is the product (user's chosen path); the
         // app-mode browser window is the fallback. WebUI's show() outcomes vary

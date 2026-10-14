@@ -62,6 +62,19 @@ jobs:
           PYTHON: python3
         run: bash tests/serve_e2e/run.sh
 
+      - name: Install bun (front-end joint tests)
+        run: |
+          curl -fsSL https://bun.sh/install | bash
+          echo "$HOME/.bun/bin" >> "$GITHUB_PATH"
+
+      - name: Front-end <-> kernel joint tests
+        env:
+          CELL_BIN: ${{ github.workspace }}/build/bin/cell
+        working-directory: frontend
+        run: |
+          bun install --frozen-lockfile
+          bun test tests/
+
   # ---------------------------------------------------------------------------
   linux-asan:
     name: Linux · ASan + UBSan

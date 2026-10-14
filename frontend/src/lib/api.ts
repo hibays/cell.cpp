@@ -2,6 +2,23 @@
 // docs/RESTful.md). One base URL + one bearer token, discovered at runtime
 // through the native bridge (cell_bootstrap).
 
+/** Resolve a native bridge function by name.
+ *
+ * webui publishes bound C++ functions as *globals* (`window.cell_bootstrap`),
+ * while the shell contract also allows a `window.cell.*` namespace. This is
+ * the single resolution point — it is what made the landing page report
+ * "kernel not ready" when only the global form existed.
+ */
+export function resolveNative(name: string): ((...args: unknown[]) => Promise<string>) | undefined {
+  const g = globalThis as unknown as Record<string, unknown>
+  const ns = g['cell'] as Record<string, unknown> | undefined
+  const inNs = ns ? ns[name] : undefined
+  if (typeof inNs === 'function') return inNs as (...args: unknown[]) => Promise<string>
+  const flat = g[name]
+  if (typeof flat === 'function') return flat as (...args: unknown[]) => Promise<string>
+  return undefined
+}
+
 export interface Bootstrap {
   version: string
   serve_ok: boolean
@@ -86,8 +103,12 @@ export class ApiClient {
   token = ''
 
   async bootstrap(): Promise<Bootstrap> {
-    const raw = await window.cell.cell_bootstrap()
-    return parseJson<Bootstrap>(raw)!
+    // resolveNative: webui exposes bound functions as globals
+    // (window.cell_bootstrap), while the shell contract historically used a
+    // window.cell.* namespace — accept both, and let dev mode degrade.
+    const fn = resolveNative('cell_bootstrap')
+    if (!fn) throw new Error('native bridge unavailable (dev mode)')
+    return parseJson<Bootstrap>(await fn())!
   }
 
   private authHeaders(extra?: HeadersInit): Headers {

@@ -575,6 +575,22 @@ if(CELL_BUILD_TESTS)
             TIMEOUT 120)
         file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/ctest-smoke")
     endif()
+
+    # Joint kernel+client e2e: boots `cell --serve` against a mock LLM in a
+    # temp CELL_ROOT and drives health -> session -> turn -> transcript, i.e.
+    # the exact workflow the front-end runs. Needs any Python 3.
+    if(CELL_BUILD_CLI)
+        find_package(Python3 COMPONENTS Interpreter)
+        if(Python3_FOUND)
+            add_test(NAME cell.e2e_serve
+                COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/e2e_serve.py")
+            set_tests_properties(cell.e2e_serve PROPERTIES
+                ENVIRONMENT "CELL_BIN=$<TARGET_FILE:cell_cli>"
+                TIMEOUT 180)
+        else()
+            message(STATUS "Python3 not found — cell.e2e_serve skipped")
+        endif()
+    endif()
 endif()
 
 # -----------------------------------------------------------------------------

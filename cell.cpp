@@ -2012,7 +2012,15 @@ namespace cell
         return s;
     }
 
-    std::filesystem::path root = plat::executable_dir() / ".cell";
+    // CELL_ROOT overrides the per-executable state directory. It is the
+    // isolation seam for the e2e / joint tests (they point it at a temp dir so
+    // a test run never touches the user's sessions, vault or server.json) and
+    // for anyone running several shells side by side.
+    std::filesystem::path root = [] {
+        if (const char *p = std::getenv("CELL_ROOT"); p && *p)
+            return std::filesystem::path(p);
+        return plat::executable_dir() / ".cell";
+    }();
 
     static std::optional<std::filesystem::path> &workdir_cache()
     {
