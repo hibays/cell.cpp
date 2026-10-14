@@ -67,12 +67,18 @@ jobs:
       # must be produced *before* CMake configures: the embed step decides
       # whether to include the real SPA at configure time. The generated header
       # is the thing cell.cellui_boot then asserts contains /webui.js.
-      # $GITHUB_PATH keeps bun visible to the following steps.
+      #
+      # The installer drops bun in $BUN_INSTALL/bin but only patches the shell
+      # profile — writing $GITHUB_PATH does NOT help, because that takes effect
+      # for the *next* step and this one still cannot see bun (exit 127). Export
+      # the PATH inside this step, and pin BUN_INSTALL so the location is known.
       - name: Build front-end (cellui embeds it)
         shell: bash
         run: |
+          export BUN_INSTALL="$HOME/.bun"
           curl -fsSL https://bun.sh/install | bash
-          echo "$HOME/.bun/bin" >> "$GITHUB_PATH"
+          export PATH="$BUN_INSTALL/bin:$PATH"
+          command -v bun && bun --version
           cd webui/frontend
           bun install
           bun run build
