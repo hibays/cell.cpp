@@ -26,10 +26,23 @@ if (!existsSync(dist)) {
   process.exit(1)
 }
 
-const html = readFileSync(dist, 'utf8')
+let html = readFileSync(dist, 'utf8')
 if (!html.includes('<div id="app">')) {
   console.error('[embed] dist/index.html does not look like a built SPA')
   process.exit(1)
+}
+
+// WebUI serves the embedded SPA for "/" verbatim and never auto-injects its
+// native bridge. The page must load /webui.js itself or window.cell_bootstrap
+// (and every other bind) is undefined, so the GUI reports "kernel not ready".
+// Inject the bridge load unless the page already references it.
+if (!html.includes('/webui.js')) {
+  const tag = "\n<script src=\"/webui.js\"></script>\n"
+  const headClose = html.indexOf('</head>')
+  const headOpen = html.indexOf('<head>')
+  if (headClose !== -1) html = html.slice(0, headClose) + tag + html.slice(headClose)
+  else if (headOpen !== -1) html = html.slice(0, headOpen + 6) + tag + html.slice(headOpen + 6)
+  else html = tag + html
 }
 
 // C++11 raw string literal: R"cellui(...)cellui" — no escaping of quotes,

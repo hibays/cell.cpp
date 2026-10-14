@@ -32,9 +32,13 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # x64-windows-static makes vcpkg resolve curl/libsodium/openssl as
+          # static .lib files, so cell.exe / cellui.exe ship as self-contained
+          # single files (the alternative — packaging a tree of vcpkg DLLs — is
+          # exactly what the old, broken one-exe zip was missing).
           - name: windows-x64-msvc
             os: windows-2022
-            cmake_extra: -DCELL_BUILD_STATIC=ON
+            cmake_extra: -DCELL_BUILD_STATIC=ON -DVCPKG_TARGET_TRIPLET=x64-windows-static
             pkg: zip
           - name: linux-x64-gcc14
             os: ubuntu-24.04
@@ -59,6 +63,21 @@ jobs:
         if: runner.os == 'macOS'
         run: brew install ninja libsodium nlohmann-json
 
+      # cellui embeds the built front-end (webui/frontend/dist/index.html), so it
+      # must be produced *before* CMake configures: the embed step decides
+      # whether to include the real SPA at configure time. The generated header
+      # is the thing cell.cellui_boot then asserts contains /webui.js.
+      # $GITHUB_PATH keeps bun visible to the following steps.
+      - name: Build front-end (cellui embeds it)
+        shell: bash
+        run: |
+          curl -fsSL https://bun.sh/install | bash
+          echo "$HOME/.bun/bin" >> "$GITHUB_PATH"
+          cd webui/frontend
+          bun install
+          bun run build
+          test -f dist/index.html || { echo "front-end build produced no dist/index.html"; exit 1; }
+
       # No -G here on purpose: let CMake pick the installed Visual Studio via
       # vswhere (VS 2022 on the windows-2022 runner, or a newer VS 17/18 on a
       # developer machine). Forcing -G Ninja in a non-VS shell made CMake pick
@@ -72,7 +91,8 @@ jobs:
           -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
           -DCELL_BUILD_CLI=ON
           -DCELL_BUILD_SHARED=OFF
-          -DCELL_BUILD_WEBUI=OFF
+          -DCELL_BUILD_WEBUI=ON
+          -DCELL_EMBED_WEBUI=ON
           ${{ matrix.cmake_extra }}
 
       - name: Configure (POSIX)
@@ -82,7 +102,8 @@ jobs:
           -DCMAKE_BUILD_TYPE=Release
           -DCELL_BUILD_CLI=ON
           -DCELL_BUILD_SHARED=OFF
-          -DCELL_BUILD_WEBUI=OFF
+          -DCELL_BUILD_WEBUI=ON
+          -DCELL_EMBED_WEBUI=ON
           ${{ matrix.cmake_extra }}
 
       - name: Build (Windows MSVC)
@@ -93,6 +114,11 @@ jobs:
         if: runner.os != 'Windows'
         run: cmake --build build --parallel
 
+      # ctest includes cell.cellui_boot, which asserts the shipped cellui binary
+      # really embeds /webui.js — the regression that made the GUI report
+      # "kernel not ready". Set CELLUI_BOOT_TEST=1 to additionally spawn the
+      # shell and wait for the in-process kernel; that needs a real display, so
+      # it stays off on headless runners.
       - name: Test (Windows MSVC)
         if: runner.os == 'Windows'
         run: ctest --test-dir build -C Release --output-on-failure
@@ -106,20 +132,24 @@ jobs:
           CELL_LLDB: ${{ runner.os == 'macOS' && '1' || '0' }}
 
       - name: Package
+        if: matrix.name == 'windows-x64-msvc'
         run: |
           New-Item -ItemType Directory -Force -Path pkg/cell-${{ inputs.tag }} | Out-Null
           Copy-Item -Path build/bin/cell.exe -Destination pkg/cell-${{ inputs.tag }}/
+          Copy-Item -Path build/bin/cellui.exe -Destination pkg/cell-${{ inputs.tag }}/
           Copy-Item -Path README.md -Destination pkg/cell-${{ inputs.tag }}/
           Copy-Item -Path LICENSE -Destination pkg/cell-${{ inputs.tag }}/
+          Copy-Item -Path assets/brand -Destination pkg/cell-${{ inputs.tag }}/brand -Recurse
           Compress-Archive -Path pkg/cell-${{ inputs.tag }} -DestinationPath cell-${{ inputs.tag }}-windows-x64-msvc.zip
-        if: matrix.name == 'windows-x64-msvc'
 
       - name: Package (posix)
         if: matrix.name != 'windows-x64-msvc'
         run: |
           mkdir -p pkg/cell-${{ inputs.tag }}
           cp build/bin/cell pkg/cell-${{ inputs.tag }}/
+          cp build/bin/cellui pkg/cell-${{ inputs.tag }}/
           cp README.md LICENSE pkg/cell-${{ inputs.tag }}/
+          cp -r assets/brand pkg/cell-${{ inputs.tag }}/brand
           tar -czf cell-${{ inputs.tag }}-${{ matrix.name }}.tar.gz -C pkg cell-${{ inputs.tag }}
 
       - uses: actions/upload-artifact@v4

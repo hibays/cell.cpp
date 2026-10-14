@@ -11,7 +11,9 @@
 //
 // Run: bun test tests/
 import { describe, expect, test } from 'bun:test'
-import { resolveNative } from '../src/lib/api'
+import { readFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { ApiClient, resolveNative } from '../src/lib/api'
 
 describe('native bridge resolver', () => {
   test('finds the documented window.cell.* namespace', () => {
@@ -131,4 +133,79 @@ describe('kernel joint workflow (CELL_BIN)', () => {
       if (proc.exitCode === null) proc.kill()
     }
   }, 60000)
+})
+
+// -----------------------------------------------------------------------------
+//  WebUI hook side: the landing page reports "kernel not ready" when the native
+//  bridge ApiClient.bootstrap() awaits never becomes available. Two independent
+//  regressions caused this historically:
+//    (a) the embedded SPA never loaded /webui.js, so window.cell_bootstrap was
+//        simply undefined;
+//    (b) the bridge is constructed on DOMContentLoaded while this ES module runs
+//        earlier, so bootstrap() must poll instead of failing on the first check.
+//  These tests lock both behaviours in, and run with `bun test` (no kernel).
+// -----------------------------------------------------------------------------
+describe('cellui bootstrap over webui hook', () => {
+  test('bootstrap() resolves once the bridge appears (DOMContentLoaded race)', async () => {
+    const api = new ApiClient()
+    // simulate WebUI constructing the bridge on DOMContentLoaded, i.e. a few
+    // hundred ms after this module executed
+    setTimeout(() => {
+      ;(globalThis as unknown as Record<string, unknown>)['cell_bootstrap'] = () =>
+        Promise.resolve(
+          JSON.stringify({ version: '0.1.0', serve_ok: true, uptime_s: 1, platform: ['win', 0] }),
+        )
+    }, 120)
+    const boot = await api.bootstrap()
+    expect(boot.version).toBe('0.1.0')
+    expect(boot.serve_ok).toBe(true)
+    delete (globalThis as unknown as Record<string, unknown>)['cell_bootstrap']
+  })
+
+  test('bootstrap() rejects when the bridge never loads (dev-mode guard)', async () => {
+    const api = new ApiClient()
+    expect(api.bootstrap()).rejects.toThrow(/native bridge unavailable/)
+  })
+
+  test('resolves the window.cell.* namespace if the shell binds that form', async () => {
+    const api = new ApiClient()
+    ;(globalThis as unknown as Record<string, unknown>)['cell'] = {
+      cell_bootstrap: () =>
+        Promise.resolve(
+          JSON.stringify({ version: '9.9.9', serve_ok: true, uptime_s: 0, platform: ['lin', 1] }),
+        ),
+    }
+    const boot = await api.bootstrap()
+    expect(boot.version).toBe('9.9.9')
+    delete (globalThis as unknown as Record<string, unknown>)['cell']
+  })
+})
+
+// Regression guard for the "内核未就绪" bug: the embedded SPA (after
+// scripts/embed_webui.mjs packs it) must load /webui.js, or WebUI never binds
+// window.cell_bootstrap and the GUI reports "kernel not ready". The source
+// dist/index.html legitimately has no /webui.js — the injection happens in the
+// embed step, so we run that step and inspect its generated header.
+describe('built front-end embeds the native bridge', () => {
+  const distPath = `${import.meta.dir}/../dist/index.html`
+  const scriptPath = `${import.meta.dir}/../../scripts/embed_webui.mjs`
+  const distExists = (() => {
+    try {
+      return readFileSync(distPath, 'utf8').includes('<div id="app">')
+    } catch {
+      return false
+    }
+  })()
+
+  test.skipIf(!distExists)('embed_webui.mjs injects /webui.js into the embedded payload', () => {
+    const outDir = `${tmpdir()}/cell-embed-check-${Date.now()}`
+    const res = Bun.spawnSync({
+      cmd: [process.execPath, scriptPath, outDir],
+      cwd: `${import.meta.dir}/../..`,
+    })
+    expect(res.success).toBe(true)
+    const header = readFileSync(`${outDir}/cellui_web.h`, 'utf8')
+    expect(header).toContain('CELLUI_HAVE_EMBEDDED_WEB')
+    expect(header).toContain('/webui.js')
+  })
 })

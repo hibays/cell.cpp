@@ -23,11 +23,28 @@
 cmake_minimum_required(VERSION 3.21)
 
 project(cell
-    VERSION 0.1.0
+    VERSION 0.1.1
     DESCRIPTION "A single-file AI coding agent in modern C++26"
     LANGUAGES C CXX) # C for the vendored WebUI / civetweb sources
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
+
+# -----------------------------------------------------------------------------
+#  Windows resource (brand icon + version stamp)
+#
+#  Embed the brand mark (cell.ico) and a version resource into the .exe so the
+#  binaries carry the cell identity in Explorer and on the taskbar. RC is only
+#  meaningful on Windows; the brand assets are shipped in the release package on
+#  every platform (see .github/workflows/release.yml).
+# -----------------------------------------------------------------------------
+if(WIN32)
+    enable_language(RC)
+    set(CELL_BRAND_DIR "${CMAKE_CURRENT_SOURCE_DIR}/assets/brand")
+    configure_file("${CELL_BRAND_DIR}/win/cell.rc.in"
+        "${CMAKE_BINARY_DIR}/gen/brand/cell.rc" @ONLY)
+    configure_file("${CELL_BRAND_DIR}/win/cellui.rc.in"
+        "${CMAKE_BINARY_DIR}/gen/brand/cellui.rc" @ONLY)
+endif()
 
 # -----------------------------------------------------------------------------
 #  Options
@@ -430,6 +447,9 @@ if(CELL_BUILD_CLI)
     add_executable(cell_cli cell.cpp)
     add_executable(cell::cli ALIAS cell_cli)
     set_target_properties(cell_cli PROPERTIES OUTPUT_NAME cell)
+    if(WIN32)
+        target_sources(cell_cli PRIVATE "${CMAKE_BINARY_DIR}/gen/brand/cell.rc")
+    endif()
     cell_configure_target(cell_cli)
 endif()
 
@@ -519,6 +539,9 @@ if(CELL_BUILD_WEBUI)
     if(CELL_WEBVIEW_STATIC AND NOT MSVC)
         target_link_options(cellui PRIVATE -fuse-ld=lld)
     endif()
+    if(WIN32)
+        target_sources(cellui PRIVATE "${CMAKE_BINARY_DIR}/gen/brand/cellui.rc")
+    endif()
     cell_configure_target(cellui)
 
     # embed the built front-end (webui/frontend/dist/index.html -> cellui_web.h)
@@ -576,20 +599,35 @@ if(CELL_BUILD_TESTS)
         file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/ctest-smoke")
     endif()
 
+    # Python drives both joint tests below, so look it up once for all of them
+    find_package(Python3 COMPONENTS Interpreter)
+
     # Joint kernel+client e2e: boots `cell --serve` against a mock LLM in a
     # temp CELL_ROOT and drives health -> session -> turn -> transcript, i.e.
     # the exact workflow the front-end runs. Needs any Python 3.
-    if(CELL_BUILD_CLI)
-        find_package(Python3 COMPONENTS Interpreter)
-        if(Python3_FOUND)
-            add_test(NAME cell.e2e_serve
-                COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/e2e_serve.py")
-            set_tests_properties(cell.e2e_serve PROPERTIES
-                ENVIRONMENT "CELL_BIN=$<TARGET_FILE:cell_cli>"
-                TIMEOUT 180)
-        else()
-            message(STATUS "Python3 not found — cell.e2e_serve skipped")
-        endif()
+    if(CELL_BUILD_CLI AND Python3_FOUND)
+        add_test(NAME cell.e2e_serve
+            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/e2e_serve.py")
+        set_tests_properties(cell.e2e_serve PROPERTIES
+            ENVIRONMENT "CELL_BIN=$<TARGET_FILE:cell_cli>"
+            TIMEOUT 180)
+    endif()
+
+    # cellui smoke: proves the desktop shell embeds the WebUI bridge
+    # (/webui.js must appear in the binary) and — under a display — that its
+    # in-process kernel actually boots. This is the portable half of the
+    # "kernel not ready" regression gate; the display-dependent boot check is
+    # opt-in via CELLUI_BOOT_TEST=1.
+    if(CELL_BUILD_WEBUI AND Python3_FOUND)
+        add_test(NAME cell.cellui_boot
+            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/cellui_smoke.py")
+        set_tests_properties(cell.cellui_boot PROPERTIES
+            ENVIRONMENT "CELLUI_BIN=$<TARGET_FILE:cellui>"
+            TIMEOUT 120)
+    endif()
+
+    if(NOT Python3_FOUND)
+        message(STATUS "Python3 not found — cell.e2e_serve / cell.cellui_boot skipped")
     endif()
 endif()
 

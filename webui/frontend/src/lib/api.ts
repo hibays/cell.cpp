@@ -106,9 +106,28 @@ export class ApiClient {
     // resolveNative: webui exposes bound functions as globals
     // (window.cell_bootstrap), while the shell contract historically used a
     // window.cell.* namespace — accept both, and let dev mode degrade.
-    const fn = resolveNative('cell_bootstrap')
+    //
+    // The WebUI bridge is constructed on DOMContentLoaded, but this ES module
+    // executes *before* DOMContentLoaded, so the bind can be absent for a moment
+    // right after load. Poll briefly instead of failing the first time.
+    const fn = await this.waitForBridge('cell_bootstrap')
     if (!fn) throw new Error('native bridge unavailable (dev mode)')
     return parseJson<Bootstrap>(await fn())!
+  }
+
+  /** Poll for a native bridge function to become available (handles the
+   *  DOMContentLoaded race between this module and WebUI's bridge setup). */
+  private async waitForBridge(
+    name: string,
+    tries = 40,
+    gapMs = 50,
+  ): Promise<((...args: unknown[]) => Promise<string>) | undefined> {
+    for (let i = 0; i < tries; i++) {
+      const fn = resolveNative(name)
+      if (fn) return fn
+      await new Promise((r) => setTimeout(r, gapMs))
+    }
+    return undefined
   }
 
   private authHeaders(extra?: HeadersInit): Headers {

@@ -15716,11 +15716,20 @@ details{break-inside:avoid}
                 constexpr size_t kMaxBody = 16 * 1024 * 1024;
                 set_socket_timeouts(c, 30000);
 
+                // The front-end is served by WebUI from its own origin and talks
+                // to this server over fetch(); without CORS headers Chromium
+                // blocks every cross-origin request (health, sessions, chat…),
+                // which surfaces in the GUI as "kernel not ready / offline".
+                const std::string kCors =
+                    "Access-Control-Allow-Origin: *\r\n"
+                    "Access-Control-Allow-Headers: Authorization, Content-Type\r\n"
+                    "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n";
+
                 auto send_error = [&](int status, const std::string &code, const std::string &message)
                 {
                     std::string body = nlohmann::json{{"error", {{"code", code}, {"message", message}}}}.dump();
-                    std::string head = std::format("HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                                                   status, status_text(status), body.size());
+                    std::string head = std::format("HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n{}\r\n",
+                                                   status, status_text(status), body.size(), kCors);
                     send_all(c, head.data(), head.size());
                     send_all(c, body.data(), body.size());
                 };
@@ -15811,17 +15820,31 @@ details{break-inside:avoid}
                 }
                 req.body = rest.substr(0, clen);
 
+                // CORS preflight: the browser sends an OPTIONS request before a
+                // cross-origin fetch(); answer it immediately with the CORS
+                // headers and a 204 so the real request can proceed. If we let
+                // it reach the router it would 404 and the browser would block
+                // the actual call (again surfacing as "kernel not ready").
+                if (req.method == "OPTIONS")
+                {
+                    std::string h = std::format("HTTP/1.1 204 No Content\r\n{}\r\n", kCors);
+                    send_all(c, h.data(), h.size());
+                    shutdown_write(c);
+                    close_socket(c);
+                    return;
+                }
+
                 responder res;
                 res.plain = [&](int status, const std::string &ctype, const std::string &body) -> bool
                 {
-                    std::string h = std::format("HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
-                                                status, status_text(status), ctype, body.size());
+                    std::string h = std::format("HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nCache-Control: no-store\r\n{}\r\nConnection: close\r\n\r\n",
+                                                status, status_text(status), ctype, body.size(), kCors);
                     return send_all(c, h.data(), h.size()) && (body.empty() || send_all(c, body.data(), body.size()));
                 };
                 res.stream_open = [&](const std::string &ctype, int status) -> bool
                 {
-                    std::string h = std::format("HTTP/1.1 {} {}\r\nContent-Type: {}\r\nCache-Control: no-store\r\nConnection: close\r\nX-Accel-Buffering: no\r\n\r\n",
-                                                status, status_text(status), ctype);
+                    std::string h = std::format("HTTP/1.1 {} {}\r\nContent-Type: {}\r\nCache-Control: no-store\r\n{}\r\nConnection: close\r\nX-Accel-Buffering: no\r\n\r\n",
+                                                status, status_text(status), ctype, kCors);
                     return send_all(c, h.data(), h.size());
                 };
                 res.stream_write = [&](const std::string &data) -> bool { return send_all(c, data.data(), data.size()); };

@@ -378,6 +378,29 @@ namespace cellui
         reply_json(e, nlohmann::json{{"delivered", false}, {"reason", "native notifications are not implemented; use the in-app toast"}});
     }
 
+    // WebUI serves the embedded SPA for "/" verbatim and does NOT auto-inject
+    // its native bridge. The page must reference /webui.js itself, otherwise
+    // window.cell_bootstrap (and every other bind) is undefined and the front-end
+    // boot() throws "native bridge unavailable" → the GUI reports "kernel not
+    // ready" even though the in-process agent service started fine. Inject the
+    // bridge load if the page does not already have it.
+    static std::string with_webui_bridge(std::string html)
+    {
+        if (html.find("/webui.js") != std::string::npos)
+            return html; // already wired (defensive against double-injection)
+        constexpr const char *kTag = "\n<script src=\"/webui.js\"></script>\n";
+        size_t pos = html.find("</head>");
+        if (pos != std::string::npos)
+            html.insert(pos, kTag);
+        else if ((pos = html.find("<head>")) != std::string::npos)
+            html.insert(pos + 6, kTag);
+        else if ((pos = html.find("</body>")) != std::string::npos)
+            html.insert(pos, kTag);
+        else
+            html = std::string{kTag} + html;
+        return html;
+    }
+
     // ---- entry point -----------------------------------------------------------
     static int run(int argc, char const *argv[])
     {
@@ -524,10 +547,12 @@ namespace cellui
         webui_bind(w, "cell_notify", guarded<bind_notify>);
 
 #ifdef CELLUI_HAVE_EMBEDDED_WEB
-        const std::string html = std::string{cellui_web_html};
+        std::string html = std::string{cellui_web_html};
 #else
-        const std::string html = std::string{kFallbackHtml};
+        std::string html = std::string{kFallbackHtml};
 #endif
+        // wire the WebUI native bridge (window.cell_bootstrap, …) into the page
+        html = with_webui_bridge(std::move(html));
 
         bool shown = false;
         if (!force_browser)
