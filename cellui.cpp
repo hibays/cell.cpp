@@ -530,7 +530,9 @@ namespace cellui
         // it; once seen and then gone for 3s, tear webui down so wait() returns
         // instead of the shell lingering headless (or dying with it).
         std::atomic<bool> stop_monitor{false};
-        std::thread monitor([&]
+        std::thread monitor;
+#ifdef _WIN32
+        monitor = std::thread([&]
                             {
             struct Scan
             {
@@ -572,6 +574,9 @@ namespace cellui
                 }
                 std::this_thread::sleep_for(std::chrono::milliseconds(500));
             } });
+#endif // _WIN32
+        // POSIX: the X11/Wayland counterpart needs a display connection of its
+        // own; there the exit hook (bind_events → disconnected) covers teardown.
 
         webui_wait(); // blocks until the window closes (or the supervisor exits it)
         stop_monitor.store(true);
