@@ -177,6 +177,34 @@ namespace cellui
         webui_return_string(e, s.c_str());
     }
 
+    // A throw inside a webui callback runs on webui's own thread and lands in
+    // std::terminate → the whole shell (window included) vanishes. That is the
+    // "window opens then silently dies" symptom. Every bound handler goes
+    // through this guard so a bridge error becomes a log line + error reply.
+    template <auto Handler>
+    static void guarded(webui_event_t *e)
+    {
+        try
+        {
+            Handler(e);
+        }
+        catch (const std::exception &ex)
+        {
+            std::fprintf(stderr, "cellui: bridge '%s' failed: %s\n", e->element, ex.what());
+            try
+            {
+                reply_json(e, {{"error", ex.what()}});
+            }
+            catch (...)
+            {
+            }
+        }
+        catch (...)
+        {
+            std::fprintf(stderr, "cellui: bridge '%s' failed (unknown exception)\n", e->element);
+        }
+    }
+
     static void bind_hello(webui_event_t *e)
     {
         webui_return_string(e, "cell native bridge ok");
@@ -357,7 +385,7 @@ namespace cellui
         int port = 0; // 0 = let the OS pick; the real port lands in server.json
         std::string host = "127.0.0.1";
         unsigned width = 1280, height = 860;
-        bool use_webview = false;
+        bool force_browser = false;
 
         // cellui accepts a small flag set of its own; everything else is passed
         // through to the agent CLI.
@@ -393,12 +421,12 @@ namespace cellui
                 }
             }
             else if (a == "--browser")
-                use_webview = true;
+                force_browser = true;
             else if (a == "--help" || a == "-h")
             {
-                std::printf("usage: cellui [--size WxH] [--port N] [--host ADDR] [--no-serve] [--webview]\n"
-                            "  default opens an app-mode browser window (DSHL-proven);\n"
-                            "  --webview tries the WebView2 backend instead\n");
+                std::printf("usage: cellui [--size WxH] [--port N] [--host ADDR] [--no-serve] [--browser]\n"
+                            "  default opens a WebView2 native window (falls back to a browser\n"
+                            "  app-window if the WebView is unavailable); --browser skips it\n");
                 return 0;
             }
             else
@@ -432,16 +460,11 @@ namespace cellui
         }
 
         // ---- the window ------------------------------------------------------
-        // Window strategy follows the DSHL launcher's hard-won invariant
-        // (G:/Projects/dsh-launcher, src/ui/browser.rs): the only reliable
-        // surface webui gives you is a BROWSER APP WINDOW — its WebView2
-        // backend drops show() calls depending on how the process was started
-        // (console vs detached), so it must never be the default. `--webview`
-        // keeps it reachable for experiments.
-        //
-        // Ground truth for "the UI is up" is a visible top-level window, which
-        // we get for free by watching the process' own window (see the wait
-        // loop below); bare return codes from webui_show_* are hints only.
+        // WebView2 native window is the product (user's chosen path); the
+        // app-mode browser window is the fallback. WebUI's show() outcomes vary
+        // with how the process was started (console / detached / redirected
+        // handles), so return codes alone are never trusted — the supervisor
+        // below watches for a VISIBLE top-level window of this pid instead.
         size_t w = webui_new_window();
         webui_set_runtime(w, None); // no Deno/Node/Bun needed
         webui_set_size(w, width, height);
@@ -455,15 +478,15 @@ namespace cellui
         // calls. Binding to the empty element installs the all-events handler.
         webui_bind(w, "", bind_events);
 
-        webui_bind(w, "cell_hello", bind_hello);
-        webui_bind(w, "cell_bootstrap", bind_bootstrap);
-        webui_bind(w, "cell_export_session", bind_export_session);
-        webui_bind(w, "cell_export_batch", bind_export_batch);
-        webui_bind(w, "cell_export_all", bind_export_all);
-        webui_bind(w, "cell_reveal", bind_reveal);
-        webui_bind(w, "cell_open_external", bind_open_external);
-        webui_bind(w, "cell_native_capabilities", bind_native_capabilities);
-        webui_bind(w, "cell_notify", bind_notify);
+        webui_bind(w, "cell_hello", guarded<bind_hello>);
+        webui_bind(w, "cell_bootstrap", guarded<bind_bootstrap>);
+        webui_bind(w, "cell_export_session", guarded<bind_export_session>);
+        webui_bind(w, "cell_export_batch", guarded<bind_export_batch>);
+        webui_bind(w, "cell_export_all", guarded<bind_export_all>);
+        webui_bind(w, "cell_reveal", guarded<bind_reveal>);
+        webui_bind(w, "cell_open_external", guarded<bind_open_external>);
+        webui_bind(w, "cell_native_capabilities", guarded<bind_native_capabilities>);
+        webui_bind(w, "cell_notify", guarded<bind_notify>);
 
 #ifdef CELLUI_HAVE_EMBEDDED_WEB
         const std::string html = std::string{cellui_web_html};
@@ -472,7 +495,7 @@ namespace cellui
 #endif
 
         bool shown = false;
-        if (use_webview)
+        if (!force_browser)
         {
             shown = webui_show_wv(w, html.c_str());
             if (!shown)
@@ -485,9 +508,10 @@ namespace cellui
             // app-mode browser window: the path DSHL ships on
             shown = webui_show_browser(w, html.c_str(), AnyBrowser);
         }
-        if (!shown && !use_webview)
+        if (!shown && !force_browser)
         {
-            // last resort, still worth one try before giving up
+            // webui's show() outcome depends on how this process was started
+            // (console / detached / redirected handles); one retry is cheap
             shown = webui_show_wv(w, html.c_str());
         }
         if (!shown)
@@ -500,7 +524,59 @@ namespace cellui
             return 2;
         }
 
-        webui_wait(); // blocks until the window closes
+        // ---- window supervisor (DSHL src/ui/browser.rs, condensed) -------------
+        // webui return codes are not ground truth. The invariant that holds:
+        // "the UI is up" ⇔ a VISIBLE top-level window of THIS pid exists. Poll
+        // it; once seen and then gone for 3s, tear webui down so wait() returns
+        // instead of the shell lingering headless (or dying with it).
+        std::atomic<bool> stop_monitor{false};
+        std::thread monitor([&]
+                            {
+            struct Scan
+            {
+                DWORD pid;
+                bool found;
+            };
+            int misses = 0;
+            bool seen = false;
+            while (!stop_monitor.load(std::memory_order_relaxed))
+            {
+                Scan scan{GetCurrentProcessId(), false};
+                EnumWindows(
+                    [](HWND h, LPARAM l) -> BOOL
+                    {
+                        auto *s = reinterpret_cast<Scan *>(l);
+                        DWORD pid = 0;
+                        GetWindowThreadProcessId(h, &pid);
+                        if (pid != s->pid)
+                            return TRUE;
+                        wchar_t title[64];
+                        if (IsWindowVisible(h) && GetWindowTextW(h, title, 64) > 0 &&
+                            wcscmp(title, L"cell") == 0)
+                        {
+                            s->found = true;
+                            return FALSE;
+                        }
+                        return TRUE;
+                    },
+                    reinterpret_cast<LPARAM>(&scan));
+                if (scan.found)
+                {
+                    seen = true;
+                    misses = 0;
+                }
+                else if (seen && ++misses >= 6) // 6 × 500ms without a window
+                {
+                    webui_exit();
+                    return;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            } });
+
+        webui_wait(); // blocks until the window closes (or the supervisor exits it)
+        stop_monitor.store(true);
+        if (monitor.joinable())
+            monitor.join();
         webui_exit(); // canonical teardown: stop servers, wake webui_wait()
         webui_clean();
 
