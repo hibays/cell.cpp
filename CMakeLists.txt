@@ -325,7 +325,13 @@ endif()
 #  Shared target configuration
 # -----------------------------------------------------------------------------
 function(cell_configure_target target)
-    target_compile_definitions(${target} PRIVATE CELL_VERSION="${CELL_VERSION_STRING}")
+    # CXX only, on purpose: target_compile_definitions also feeds the resource
+    # compiler, and the embedded quotes are fatal there. windres preprocesses
+    # through /bin/sh, which aborts on CMake's escaped -DCELL_VERSION=\"x\"
+    # ("unexpected EOF while looking for matching quote"). Guarding by language
+    # keeps the Windows resource files (brand icon + version stamp) compiling.
+    target_compile_definitions(${target} PRIVATE
+        "$<$<COMPILE_LANGUAGE:CXX>:CELL_VERSION=\"${CELL_VERSION_STRING}\">")
 
     if(WIN32)
         # the built-in HTTP server of `cell --serve` uses Winsock 2
