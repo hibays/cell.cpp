@@ -4,6 +4,7 @@
 import { reactive } from 'vue'
 import { api } from '../lib/api'
 import { classifyError } from '../lib/errors'
+import { createEventBus } from '../lib/events'
 import { createFrameScheduler } from '../lib/scheduler'
 import type {
   Approval,
@@ -11,7 +12,6 @@ import type {
   ConfigSnapshot,
   ProviderEntry,
   SessionSummary,
-  TurnEvent,
 } from '../lib/api'
 
 export type Phase = 'booting' | 'landing' | 'onboarding' | 'app'
@@ -299,20 +299,26 @@ const publishStream = createFrameScheduler(
   },
 )
 
-function onStreamEvent(e: TurnEvent): void {
-  if (e.type === 'output') {
-    streamBuffer += e.data.text
-    publishStream.request()
-  } else if (e.type === 'approval_request') {
-    onApproval(e.data)
-  } else if (e.type === 'error') {
-    // route on code, never on provider-dependent message text
-    const v = classifyError(e.data)
-    toast(v.retryable ? 'warn' : 'bad', v.title)
-  } else if (e.type === 'turn_start') {
-    state.streamModel = e.data.model
-  }
-}
+// Turn events are routed through a callback registry rather than one inline
+// switch, so a new kernel event is a new subscription instead of a new branch.
+const events = createEventBus()
+
+events.on('output', (e) => {
+  streamBuffer += e.data.text
+  publishStream.request()
+})
+
+events.on('approval_request', (e) => onApproval(e.data))
+
+events.on('error', (e) => {
+  // route on code, never on provider-dependent message text
+  const v = classifyError(e.data)
+  toast(v.retryable ? 'warn' : 'bad', v.title)
+})
+
+events.on('turn_start', (e) => {
+  state.streamModel = e.data.model
+})
 
 /** End a turn: drop any unpublished buffer, it is superseded by the transcript. */
 function endStream(): void {
@@ -329,7 +335,7 @@ export async function send(text: string): Promise<void> {
   state.streamStartedAt = Date.now()
   state.lastInterrupted = false
   try {
-    await api.streamTurn(id, text, onStreamEvent)
+    await api.streamTurn(id, text, (e) => events.emitRaw(e))
   } catch (e) {
     const v = classifyError(e)
     if (v.code === 'aborted') {
@@ -368,7 +374,7 @@ export async function resume(): Promise<void> {
   state.streamStartedAt = Date.now()
   state.lastInterrupted = false
   try {
-    await api.streamResume(id, onStreamEvent)
+    await api.streamResume(id, (e) => events.emitRaw(e))
   } catch (e) {
     const v = classifyError(e)
     toast(v.retryable ? 'warn' : 'bad', `${v.title} — ${v.hint}`)
