@@ -219,14 +219,14 @@ JS↔C++ bridge for shell integration and the HTML exports:
 
 ```bash
 # build the front-end once (bun), then the shell
-bun --cwd frontend install && bun --cwd frontend run build
+bun --cwd webui/frontend install && bun --cwd webui/frontend run build
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release && cmake --build build
 
 build/bin/cellui            # one portable binary, no runtime DLLs to ship
 ```
 
-The front-end dev loop runs in a browser (`bun --cwd frontend run dev`); see
-[frontend/README.md](frontend/README.md) for the UI stack and
+The front-end dev loop runs in a browser (`bun --cwd webui/frontend run dev`); see
+[webui/frontend/README.md](webui/frontend/README.md) for the UI stack and
 [docs/BUILDING.md](docs/BUILDING.md) §7 for the bridge/export API and the
 static-WebView2 details.
 

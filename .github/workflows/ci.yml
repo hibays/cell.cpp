@@ -70,7 +70,7 @@ jobs:
       - name: Front-end <-> kernel joint tests
         env:
           CELL_BIN: ${{ github.workspace }}/build/bin/cell
-        working-directory: frontend
+        working-directory: webui/frontend
         run: |
           bun install --frozen-lockfile
           bun test tests/
@@ -198,7 +198,7 @@ jobs:
             mingw-w64-ucrt-x86_64-nlohmann-json
 
       - name: Front-end — install, lint, build
-        working-directory: frontend
+        working-directory: webui/frontend
         run: |
           bun install --frozen-lockfile
           bun run lint

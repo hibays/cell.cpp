@@ -310,6 +310,9 @@ namespace cell
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#ifdef __APPLE__
+#include <mach-o/dyld.h> // _NSGetExecutablePath (executable_dir, merged from upstream)
+#endif
 #endif
 
 // -----------------------------------------------------------------------------
@@ -1877,6 +1880,23 @@ namespace cell
             buf.resize(n);
             return std::filesystem::path(buf).parent_path();
 #else
+#ifdef __APPLE__
+            // macOS has no /proc: ask dyld for the executable path
+            // (merged from upstream yauntyour/cell.cpp — _NSGetExecutablePath
+            // may return a symlinked or relative path, so canonicalize before
+            // taking the directory)
+            uint32_t cap = 0;
+            _NSGetExecutablePath(nullptr, &cap);
+            std::string mac_buf(cap ? cap : 4096, '\0');
+            if (_NSGetExecutablePath(mac_buf.data(), &cap) == 0)
+            {
+                std::error_code ec;
+                std::filesystem::path p(mac_buf.c_str());
+                auto canon = std::filesystem::weakly_canonical(p, ec);
+                return (ec ? p : canon).parent_path();
+            }
+            return std::filesystem::current_path();
+#else
             std::string buf(4096, '\0');
             ssize_t n = ::readlink("/proc/self/exe", buf.data(), buf.size());
             if (n > 0)
@@ -1885,6 +1905,7 @@ namespace cell
                 return std::filesystem::path(buf).parent_path();
             }
             return std::filesystem::current_path();
+#endif
 #endif
         }
 

@@ -22,7 +22,7 @@
 // =============================================================================
 
 #define CELL_NO_MAIN // cell.cpp is linked in; this file owns the entry point
-#include "cell.cpp"
+#include "../cell.cpp"
 
 #include "webui.h"
 

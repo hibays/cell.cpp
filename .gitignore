@@ -1,9 +1,8 @@
 # =============================================================================
 #  cell.cpp — ignore rules
 #
-#  Tracked on purpose:  cell.cpp · cellui.cpp · include/ · cmake/ · docs/
-#                       frontend/src · frontend/*.json · scripts/ · tests/
-#                       third_party/webui (vendored, needed for a single-file build)
+#  Layers:  core runtime = cell.cpp · include/ · cmake/ · docs/ · tests/
+#           webui layer  = webui/ (cellui.cpp · frontend/ · vendored webui)
 #  Ignored:             every build output, package manager cache and local tool
 #                       scratch space.
 # =============================================================================
@@ -55,10 +54,10 @@ ehthumbs.db
 
 # ---- front-end (bun / vite) --------------------------------------------------
 node_modules/
-frontend/node_modules/
-frontend/dist/
-frontend/.vite/
-frontend/.tanstack/
+webui/frontend/node_modules/
+webui/frontend/dist/
+webui/frontend/.vite/
+webui/frontend/.tanstack/
 bun.lockb.bak
 *.tsbuildinfo
 *.tsbuildinfo.*

@@ -36,7 +36,7 @@ option(CELL_BUILD_CLI            "Build the cell command-line executable"       
 option(CELL_BUILD_SHARED         "Build cell as a shared library (DLL / .so / .dylib)"       ON)
 option(CELL_BUILD_STATIC         "Build cell as a static library"                            OFF)
 option(CELL_BUILD_WEBUI          "Build cellui (WebUI desktop shell, single binary)"         ON)
-option(CELL_EMBED_WEBUI          "Embed the built front-end (frontend/dist) into cellui"     ON)
+option(CELL_EMBED_WEBUI          "Embed the built front-end (webui/frontend/dist) into cellui"     ON)
 option(CELL_WEBUI_LOG            "Verbose WebUI core logging (stderr) — debugging aid"       OFF)
 option(CELL_BUILD_TESTS          "Register ctest tests (self-test + embedding smoke test)"   ON)
 option(CELL_INSTALL              "Generate install rules and a CMake package (find_package)" ON)
@@ -434,14 +434,14 @@ if(CELL_BUILD_CLI)
 endif()
 
 # ---- vendored WebUI (the desktop shell driver) ------------------------------
-# third_party/webui carries the WebUI sources (webui.c + civetweb + the
+# webui/third_party/webui carries the WebUI sources (webui.c + civetweb + the
 # WebView2/WKWebView backends). On Windows the WebView2 loader is linked
-# statically (third_party/webui/lib/WebView2LoaderStatic.lib), so the shell
+# statically (webui/third_party/webui/lib/WebView2LoaderStatic.lib), so the shell
 # binary needs no runtime DLLs next to it.
 if(CELL_BUILD_WEBUI)
-    set(WEBUI_DIR ${CMAKE_CURRENT_SOURCE_DIR}/third_party/webui)
+    set(WEBUI_DIR ${CMAKE_CURRENT_SOURCE_DIR}/webui/third_party/webui)
     if(NOT EXISTS ${WEBUI_DIR}/include/webui.h)
-        message(FATAL_ERROR "third_party/webui is missing (expected ${WEBUI_DIR}/include/webui.h)")
+        message(FATAL_ERROR "webui/third_party/webui is missing (expected ${WEBUI_DIR}/include/webui.h)")
     endif()
 
     add_library(webui STATIC
@@ -508,7 +508,7 @@ endif()
 
 # ---- desktop shell (cellui) ---------------------------------------------------
 if(CELL_BUILD_WEBUI)
-    add_executable(cellui cellui.cpp)
+    add_executable(cellui webui/cellui.cpp)
     add_executable(cell::ui ALIAS cellui)
     target_include_directories(cellui PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_BINARY_DIR})
     # cell.cpp is linked into the shell; cellui.cpp itself defines CELL_NO_MAIN
@@ -521,13 +521,13 @@ if(CELL_BUILD_WEBUI)
     endif()
     cell_configure_target(cellui)
 
-    # embed the built front-end (frontend/dist/index.html -> cellui_web.h)
+    # embed the built front-end (webui/frontend/dist/index.html -> cellui_web.h)
     if(CELL_EMBED_WEBUI)
         find_program(CELL_WEB_BUILDER NAMES bun node nodejs)
-        if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/frontend/dist/index.html AND CELL_WEB_BUILDER)
+        if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/webui/frontend/dist/index.html AND CELL_WEB_BUILDER)
             add_custom_command(
                 OUTPUT ${CMAKE_BINARY_DIR}/cellui_web.h
-                COMMAND ${CELL_WEB_BUILDER} ${CMAKE_CURRENT_SOURCE_DIR}/scripts/embed_webui.mjs ${CMAKE_BINARY_DIR}
+                COMMAND ${CELL_WEB_BUILDER} ${CMAKE_CURRENT_SOURCE_DIR}/webui/scripts/embed_webui.mjs ${CMAKE_BINARY_DIR}
                 WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
                 COMMENT "embedding the built front-end into the cellui binary"
                 VERBATIM)

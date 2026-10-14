@@ -305,9 +305,9 @@ native window.
 
 | Piece | Where | Notes |
 | --- | --- | --- |
-| WebUI driver | `third_party/webui/` (vendored sources) | compiled from source; **WebView2 with a statically linked loader** on Windows (`third_party/webui/lib/WebView2LoaderStatic.lib`), WKWebView on macOS, webui's browser backend on Linux |
-| Native bridge | `cellui.cpp` | starts the service layer in-process (`cell_main("--serve")` on a worker thread), binds `cell_*` functions to JS, and bridges the **internal** HTML exporter for session/batch/full exports |
-| Front-end | `frontend/` (Vue 3 + TS + Vite) | built to a single HTML file and **embedded into the binary** (`scripts/embed_webui.mjs` → `cellui_web.h`) |
+| WebUI driver | `webui/third_party/webui/` (vendored sources) | compiled from source; **WebView2 with a statically linked loader** on Windows (`webui/third_party/webui/lib/WebView2LoaderStatic.lib`), WKWebView on macOS, webui's browser backend on Linux |
+| Native bridge | `webui/cellui.cpp` | starts the service layer in-process (`cell_main("--serve")` on a worker thread), binds `cell_*` functions to JS, and bridges the **internal** HTML exporter for session/batch/full exports |
+| Front-end | `frontend/` (Vue 3 + TS + Vite) | built to a single HTML file and **embedded into the binary** (`webui/scripts/embed_webui.mjs` → `cellui_web.h`) |
 
 ```bash
 # 1. build the front-end (once, or on every UI change)
@@ -377,7 +377,7 @@ ctest) on every platform.
 | End-to-end agent run | local mock OpenAI-compatible SSE server | ✅ CLI one-shot replies; a **pure-C program** linking `cell.dll` gets the same reply through `cell_run_oneshot()` with `rc=0` |
 | Service layer E2E | `tests/serve_e2e/run.sh` (mock provider + `cell --serve`) | ✅ all checks: auth, sessions, JSON + SSE turns, config, providers, notices, usages, skills, approvals (allow *and* deny), interrupt/resume, graceful shutdown |
 | Desktop shell (`cellui`) | GCC 16.2, `-DCELL_BUILD_WEBUI=ON`, front-end embedded | ✅ single binary links; WebView2 window opens (probe); **no `WebView2Loader.dll` dependency** (static loader); `objdump` shows only system DLLs |
-| Vendored WebUI from source | `third_party/webui` (webui.c + civetweb + win32_wv2.cpp) | ✅ compiles with MinGW + MSVC defines; static loader links with both |
+| Vendored WebUI from source | `webui/third_party/webui` (webui.c + civetweb + win32_wv2.cpp) | ✅ compiles with MinGW + MSVC defines; static loader links with both |
 | DLL export table | `objdump -p cell.dll` | ✅ exactly 5 exports: `cell_main`, `cell_version`, `cell_selftest`, `cell_run_oneshot`, `cell_free` |
 | AddressSanitizer | not available in MSYS2 UCRT64 (no sanitizer runtime shipped) | ⚠️ configure refuses with guidance; ASan is covered by the Linux CI job |
 
