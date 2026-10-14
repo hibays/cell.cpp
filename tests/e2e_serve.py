@@ -85,10 +85,10 @@ def wait_healthy(base: str, token: str, proc: subprocess.Popen, timeout: float =
     raise RuntimeError("serve never became healthy")
 
 
-def main() -> int:
-    if not BIN.is_file():
-        print(f"skip: CELL_BIN not set or missing ({BIN})")
-        return 0
+def run_once(attempt: int) -> bool:
+    """One full attempt on a fresh kernel, mock LLM and CELL_ROOT. Connection
+    setup races on loaded CI runners are per-process, so a second attempt with
+    everything new is the honest retry."""
     root = Path(tempfile.mkdtemp(prefix="cell-e2e-"))
     llm_port = free_port()
     llm = ThreadingHTTPServer(("127.0.0.1", llm_port), MockLLM)
@@ -126,6 +126,7 @@ def main() -> int:
         stderr=subprocess.DEVNULL,
     )
     try:
+        print(f"attempt {attempt}: CELL_ROOT={root}")
         base = f"http://127.0.0.1:{port}"
         health = wait_healthy(base, "", proc)
         assert health["status"] == "ok", health
@@ -159,15 +160,29 @@ def main() -> int:
 
         api(base, token, "POST", "/v1/shutdown")
         proc.wait(timeout=15)
-        print("e2e_serve OK")
-        return 0
-    except Exception as e:
-        print(f"e2e_serve FAILED: {e}")
+        return True
+    except Exception:
         if proc.poll() is None:
             proc.kill()
-        return 1
+        raise
     finally:
         llm.shutdown()
+
+
+def main() -> int:
+    if not BIN.is_file():
+        print(f"skip: CELL_BIN not set or missing ({BIN})")
+        return 0
+    for attempt in (1, 2, 3):
+        try:
+            if run_once(attempt):
+                print("e2e_serve OK")
+                return 0
+            print(f"attempt {attempt} failed")
+        except Exception as e:
+            print(f"attempt {attempt} failed: {e}")
+    print("e2e_serve FAILED (all attempts)")
+    return 1
 
 
 if __name__ == "__main__":

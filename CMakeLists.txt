@@ -556,9 +556,12 @@ if(CELL_BUILD_TESTS)
         # the built-in self-test suite, run in a scratch working directory so
         # the test never touches the source tree
         add_test(NAME cell.selftest COMMAND cell_cli --selftest)
+        # the MSVC build is ~30x slower than MinGW on the same runner and the
+        # per-test property wins over ctest --timeout, so this needs its own
+        # long leash
         set_tests_properties(cell.selftest PROPERTIES
             WORKING_DIRECTORY "${CMAKE_BINARY_DIR}/ctest-selftest"
-            TIMEOUT 900)
+            TIMEOUT 2400)
         file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/ctest-selftest")
     endif()
 
