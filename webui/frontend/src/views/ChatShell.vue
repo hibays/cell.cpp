@@ -6,6 +6,7 @@ import Composer from '../components/Composer.vue'
 import ApprovalCard from '../components/ApprovalCard.vue'
 import CommandPalette from '../components/CommandPalette.vue'
 import ExportPanel from '../components/ExportPanel.vue'
+import StatusBar from '../components/StatusBar.vue'
 import SettingsView from './SettingsView.vue'
 import { sessionTitle } from '../lib/format'
 
@@ -119,6 +120,9 @@ onMounted(async () => {
           <button v-if="store.streaming" class="q danger" @click="interrupt()">中断 (Esc)</button>
         </div>
       </div>
+
+      <!-- kernel state, active fence and the last classified failure -->
+      <StatusBar />
     </main>
 
     <div v-if="exportOpen" class="modal" @click.self="exportOpen = false">
