@@ -3755,7 +3755,11 @@ namespace cell
         // lazy depth-first walk shared by rg/glob/find: yields (absolute path, rel
         // path, is_directory) for every non-hidden entry, one level at a time, in
         // sorted order. consumers break out of the range-for to stop early.
-        static std::generator<std::tuple<std::filesystem::path, std::string, bool>> walk_entries(const std::filesystem::path &root_path)
+        // NOTE: root_path is taken *by value* on purpose — this is a coroutine, so
+        // the parameter lives in the coroutine frame; a reference parameter would
+        // dangle as soon as the caller's temporary dies at the end of the range
+        // initializer (caught by the ASan CI job).
+        static std::generator<std::tuple<std::filesystem::path, std::string, bool>> walk_entries(std::filesystem::path root_path)
         {
             struct frame
             {
@@ -4160,7 +4164,11 @@ namespace cell
                         continue;
                     if (larger_bytes > 0 && (long long)sz < larger_bytes)
                         continue;
-                    auto sys_t = std::chrono::file_clock::to_sys(mtime);
+                    // portable file_clock -> system_clock: MSVC's file_clock has
+                    // no to_sys(), so shift by the current offset between the two
+                    // clocks (exactly what clock_cast does for them)
+                    auto sys_t = std::chrono::time_point_cast<std::chrono::system_clock::duration>(
+                        mtime - std::filesystem::file_time_type::clock::now() + std::chrono::system_clock::now());
                     std::tm tm = utc_tm(std::chrono::system_clock::to_time_t(sys_t));
                     char stamp[32];
                     std::strftime(stamp, sizeof(stamp), "%Y-%m-%d %H:%M:%S", &tm);

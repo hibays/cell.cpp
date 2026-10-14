@@ -133,10 +133,12 @@ namespace cellui
         ShellExecuteW(nullptr, L"explore", w.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
 #elif defined(__APPLE__)
         std::string cmd = "open -R '" + abs.string() + "'";
-        std::system(cmd.c_str());
+        const int rc = std::system(cmd.c_str()); // best effort shell integration
+        (void)rc;
 #else
         std::string cmd = "xdg-open '" + abs.parent_path().string() + "'";
-        std::system(cmd.c_str());
+        const int rc = std::system(cmd.c_str()); // best effort shell integration
+        (void)rc;
 #endif
     }
 
@@ -147,10 +149,12 @@ namespace cellui
         ShellExecuteW(nullptr, L"open", w.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
 #elif defined(__APPLE__)
         std::string cmd = "open '" + url + "'";
-        std::system(cmd.c_str());
+        const int rc = std::system(cmd.c_str()); // best effort shell integration
+        (void)rc;
 #else
         std::string cmd = "xdg-open '" + url + "'";
-        std::system(cmd.c_str());
+        const int rc = std::system(cmd.c_str()); // best effort shell integration
+        (void)rc;
 #endif
     }
 
@@ -430,7 +434,8 @@ namespace cellui
 #else
                     cmd = std::format("curl -s -o /dev/null -X POST -H 'Authorization: Bearer {}' '{}'", token, url);
 #endif
-                    std::system(cmd.c_str());
+                    const int rc = std::system(cmd.c_str()); // best effort shell integration
+        (void)rc;
                 } })
                 .detach();
             std::this_thread::sleep_for(std::chrono::milliseconds(500));
