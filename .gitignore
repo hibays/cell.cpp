@@ -81,3 +81,5 @@ tools-local/
 # ---- large one-off analysis artefacts (not part of the design docs) ----------
 agent-gui-api-assessment.html
 .cell-selftest/
+
+.workbuddy/
