@@ -571,6 +571,10 @@ if(CELL_BUILD_WEBUI)
             # the generated header defines the payload; this flag is what makes
             # cellui.cpp include it (it cannot self-define before including)
             target_compile_definitions(cellui PRIVATE CELLUI_HAVE_EMBEDDED_WEB=1)
+            # remembered for the test registration below: cell.cellui_boot only
+            # gates the embedded SPA when this build was configured to embed it
+            # (CI's plain linux-gcc job has no dist and must stay green)
+            set(CELLUI_EMBEDDED_BUILD TRUE)
         else()
             message(STATUS "cellui: front-end not built (or no node/bun) — the binary falls back to a built-in placeholder page")
         endif()
@@ -625,16 +629,20 @@ if(CELL_BUILD_TESTS)
             TIMEOUT 180)
     endif()
 
-    # cellui smoke: proves the desktop shell embeds the WebUI bridge
-    # (/webui.js must appear in the binary) and — under a display — that its
-    # in-process kernel actually boots. This is the portable half of the
-    # "kernel not ready" regression gate; the display-dependent boot check is
-    # opt-in via CELLUI_BOOT_TEST=1.
+    # cellui smoke: proves the desktop shell really carries the built front-end
+    # (when this build configured the embed step — CELLUI_EXPECT_EMBED) and, on
+    # Windows, that its icon resource is loadable by id; under a display it can
+    # additionally prove the in-process kernel boots (opt-in via
+    # CELLUI_BOOT_TEST=1).
     if(CELL_BUILD_WEBUI AND Python3_FOUND)
         add_test(NAME cell.cellui_boot
             COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/cellui_smoke.py")
+        set(_cellui_boot_env "CELLUI_BIN=$<TARGET_FILE:cellui>")
+        if(CELLUI_EMBEDDED_BUILD)
+            list(APPEND _cellui_boot_env "CELLUI_EXPECT_EMBED=1")
+        endif()
         set_tests_properties(cell.cellui_boot PROPERTIES
-            ENVIRONMENT "CELLUI_BIN=$<TARGET_FILE:cellui>"
+            ENVIRONMENT "${_cellui_boot_env}"
             TIMEOUT 120)
     endif()
 

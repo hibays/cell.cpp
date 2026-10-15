@@ -1,19 +1,30 @@
 #!/usr/bin/env python3
 """Smoke test for the cellui desktop shell.
 
-Two independent checks, both guarding the "内核未就绪" (kernel not ready) class
-of failures:
+Three independent checks, all guarding the "silently wrong window" class of
+failures — a shell that builds cleanly, starts up, and still cannot do its job:
 
-  1. (hard gate, runs everywhere) The built binary embeds the WebUI front-end
-     bridge: the literal "/webui.js" must appear somewhere in the executable.
-     If it does not, the shell has no native bridge to bind and will always
-     report "kernel not ready" — exactly the regression that shipped once.
+  1. (hard gate when the build embeds the front-end) The binary must carry the
+     built SPA: the mount point `<div id="app">` that the front-end's entry HTML
+     defines and scripts/embed_webui.mjs hard-requires. CMake passes
+     CELLUI_EXPECT_EMBED=1 exactly when it configured the embed step (dist
+     present + a JS runtime found), so a configure that ran *before* the
+     front-end was built — the ordering release.yml warns about — fails here
+     instead of shipping a shell that only shows the placeholder page. When the
+     build legitimately has no front-end (CI's plain linux-gcc job, a machine
+     without bun) the variable is unset and this check notes the fallback.
+
+     The previous form of this check looked for /webui.js and could never fail:
+     `with_webui_bridge()` in cellui.cpp compiles that literal in unconditionally,
+     SPA or no SPA. The payload-level assertion — that the embed step really
+     injects the bridge tag — lives in the front-end joint test, which runs the
+     embed script and greps the header it generates.
 
   2. (opt-in, needs a display) Spawn the shell and wait for server.json, proving
      the in-process kernel actually boots. Skipped unless CELLUI_BOOT_TEST=1
      (set only in a job that runs under Xvfb / a real display). Headless CI
      runners cannot open the WebView window, so the boot check defaults off to
-     keep the suite green; the static embed gate above is the portable guarantee.
+     keep the suite green; the static gates above are the portable guarantee.
 
   3. (hard gate on Windows, static) The binary carries its brand icon as a
      *numerically* addressed RT_GROUP_ICON. That is what the shell's WM_SETICON
@@ -46,18 +57,36 @@ def free_port() -> int:
     return p
 
 
-def check_embedded_bridge() -> bool:
-    """The binary must contain the /webui.js string the embedded SPA loads."""
+# The SPA's mount point (defined by webui/frontend/index.html and hard-required
+# by scripts/embed_webui.mjs) plus the document language. Neither exists anywhere
+# in the C/C++ sources, so either one showing up in the binary means the built
+# front-end really made it in. Two markers only because an 8 KiB chunk boundary
+# could theoretically split one; both at once cannot happen.
+SPA_MARKERS = (b'id="app"', b'lang="zh-CN"')
+
+
+def check_embedded_frontend() -> bool:
+    """When CMake configured the embed step, the binary must carry the SPA.
+
+    CELLUI_EXPECT_EMBED=1 is set by CMakeLists.txt exactly when it added the
+    embed step; see the module docstring for why the marker is the SPA's mount
+    point rather than /webui.js.
+    """
     if not BIN.is_file():
         print(f"skip: CELLUI_BIN not set or missing ({BIN})")
         return True  # soft skip; the ctest gate guarantees the path exists
     data = BIN.read_bytes()
-    ok = b"/webui.js" in data
-    if ok:
-        print(f"embedded bridge: /webui.js present in {BIN.name} OK")
-    else:
-        print("FAIL: /webui.js not found in binary — shell cannot bind the native bridge")
-    return ok
+    if any(m in data for m in SPA_MARKERS):
+        print(f"embedded front-end: SPA present in {BIN.name} OK")
+        return True
+    if os.environ.get("CELLUI_EXPECT_EMBED") == "1":
+        print("FAIL: this build was configured with the front-end (CELLUI_EXPECT_EMBED=1) "
+              "but does not carry it — re-run cmake after building it "
+              "(webui/frontend: bun install && bun run build)")
+        return False
+    print("note: front-end not embedded in this build (configured without one) — "
+          "the shell shows a placeholder page")
+    return True
 
 
 def _pe_resource_leaves(data: bytes):
@@ -180,7 +209,7 @@ def check_kernel_boots() -> bool:
 
 
 def main() -> int:
-    ok = check_embedded_bridge()
+    ok = check_embedded_frontend()
     ok = check_window_icon_resource() and ok
     ok = check_kernel_boots() and ok
     if ok:

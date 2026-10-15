@@ -121,10 +121,10 @@ jobs:
         run: cmake --build build --parallel
 
       # ctest includes cell.cellui_boot, which asserts the shipped cellui binary
-      # really embeds /webui.js — the regression that made the GUI report
-      # "kernel not ready". Set CELLUI_BOOT_TEST=1 to additionally spawn the
-      # shell and wait for the in-process kernel; that needs a real display, so
-      # it stays off on headless runners.
+      # really carries the front-end built above (and, on Windows, that its icon
+      # resource is loadable by id). Set CELLUI_BOOT_TEST=1 to additionally spawn
+      # the shell and wait for the in-process kernel; that needs a real display,
+      # so it stays off on headless runners.
       - name: Test (Windows MSVC)
         if: runner.os == 'Windows'
         run: ctest --test-dir build -C Release --output-on-failure
