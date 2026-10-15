@@ -117,7 +117,9 @@ export function toRows(s: CapabilitySummary): CapabilityRow[] {
           : '开启'
         : '关闭',
     },
-    { label: '已加载技能', value: `${s.skills.length} 个` },
+    // "可用" not "已加载": these are the skills discovered under .cell/skills/,
+    // which is a different thing from the ones loaded into the session
+    { label: '可用技能', value: `${s.skills.length} 个` },
     { label: '累计 token', value: `${s.usage.tokIn} ↑ ${s.usage.tokOut} ↓` },
   ]
 }

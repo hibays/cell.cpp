@@ -336,7 +336,13 @@ function removeWorker(j: TeamworkJob, name: string): void {
       </li>
     </ul>
     <p v-else class="note">.cell/skills/ 下暂无技能（放入带 front matter 的 .md 即被扫描）</p>
-    <pre v-if="openSkill" class="skillBody">{{ openSkill.content }}</pre>
+    <div v-if="openSkill" class="skillViewer">
+      <div class="skillViewerHead">
+        <strong>{{ openSkill.name }}</strong>
+        <span class="muted">{{ openSkill.file }}</span>
+      </div>
+      <pre class="skillBody">{{ openSkill.content }}</pre>
+    </div>
   </section>
 </template>
 
@@ -536,13 +542,31 @@ label {
   font-size: 11px;
 }
 
+/* the viewer names the skill it belongs to: the body alone would be detached
+   from its row once the list scrolls */
+.skillViewer {
+  margin-top: 4px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.skillViewerHead {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 4px 8px;
+  border-bottom: 1px solid var(--line);
+  font-size: 11.5px;
+  color: var(--ink);
+}
+
 .skillBody {
-  margin: 4px 0 0;
+  margin: 0;
   padding: 8px;
   max-height: 220px;
   overflow: auto;
-  border: 1px solid var(--line);
-  border-radius: 8px;
   font-size: 11.5px;
   line-height: 1.5;
   color: var(--ink-dim);

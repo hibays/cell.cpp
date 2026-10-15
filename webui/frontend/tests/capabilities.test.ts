@@ -114,4 +114,19 @@ describe('capability summary', () => {
     const rows = toRows(summarizeCapabilities({ config: base }))
     for (const r of rows) expect(r.hint ?? '').not.toContain('规划中')
   })
+
+  test('the skills row counts what is available, not what is loaded', () => {
+    // discovered under .cell/skills/ is a different thing from loaded into the
+    // session, and only the former is what this count means
+    const rows = toRows(
+      summarizeCapabilities({
+        config: base,
+        skills: { skills: [{ name: 'a', description: '', file: 'a.md' }] },
+      }),
+    )
+    const sk = rows.find((r) => r.label === '可用技能')
+    expect(sk).toBeDefined()
+    expect(sk!.value).toContain('1')
+    expect(rows.some((r) => r.label === '已加载技能')).toBe(false)
+  })
 })
