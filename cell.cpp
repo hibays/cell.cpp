@@ -13278,12 +13278,14 @@ details{break-inside:avoid}
         static nlohmann::json teamworks_json(const std::string &sid)
         {
             nlohmann::json out = nlohmann::json::array();
-            std::error_code ec;
-            std::filesystem::path store_p = cell::session_dir(sid) / "teamworks.json";
-            if (!std::filesystem::exists(store_p, ec))
-                return out;
-            cell::async_io::flush(); // child transcripts are written asynchronously
-            nlohmann::json store = load_store_from(store_p);
+            // Each mutation updates the in-memory store cache synchronously and
+            // writes the file asynchronously (async_io::submit). Read from the
+            // cache — it is authoritative and never lags the mutation — rather
+            // than probing the filesystem with exists(): a freshly-created job's
+            // file may not have been flushed to disk yet, which would otherwise
+            // make the first read see an empty store even though the job exists.
+            cell::async_io::flush(); // drain any pending child-transcript writes
+            nlohmann::json store = load_store_from(cell::session_dir(sid) / "teamworks.json");
             auto jobs = store.find("jobs");
             if (jobs == store.end() || !jobs->is_object())
                 return out;
@@ -13302,12 +13304,13 @@ details{break-inside:avoid}
         static nlohmann::json teamworks_all_json(const std::string &current_sid)
         {
             nlohmann::json out = nlohmann::json::array();
+            // all_store_paths() already enumerates the on-disk stores and
+            // unconditionally appends the current session's store (whose file may
+            // still be queued for an async write). Read from the cache so a
+            // freshly-created job is visible even before its file is flushed.
+            cell::async_io::flush();
             for (auto &p : all_store_paths(true, current_sid))
             {
-                std::error_code ec;
-                if (!std::filesystem::exists(p, ec))
-                    continue;
-                cell::async_io::flush();
                 nlohmann::json store = load_store_from(p);
                 auto jobs = store.find("jobs");
                 if (jobs == store.end() || !jobs->is_object())
