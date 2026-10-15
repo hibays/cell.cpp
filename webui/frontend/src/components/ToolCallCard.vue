@@ -1,7 +1,7 @@
 <script setup lang="ts">
-import { computed } from 'vue'
+import { computed, ref } from 'vue'
 import type { UiToolCall } from '../store'
-import { formatDuration } from '../lib/format'
+import { clipOutput, formatDuration } from '../lib/format'
 
 const props = defineProps<{ tool: UiToolCall }>()
 
@@ -18,21 +18,49 @@ const statusLabel = computed(() => {
   }
 })
 const statusClass = computed(() => `s-${props.tool.status}`)
+
+// Tool output is arbitrary: a build log or `cat` of a big file can be megabytes.
+// Collapsed we show the tail (that is where a failure is), expanded we still cap
+// the DOM — rendering 5 MB of <pre> freezes the renderer, and a frozen UI hides
+// the very error the user opened the card to read.
+const OUTPUT_TAIL = 4000
+const OUTPUT_HARD_CAP = 200_000
+
+const showAll = ref(false)
+
+const view = computed(() =>
+  clipOutput(props.tool.output, {
+    tail: OUTPUT_TAIL,
+    cap: OUTPUT_HARD_CAP,
+    expand: showAll.value,
+  }),
+)
+
+// never put a megabyte string in a title attribute either
+const argsTitle = computed(() => (props.tool.args.length > 600 ? props.tool.args.slice(0, 600) + '…' : props.tool.args))
 </script>
 
 <template>
   <details class="tool" :class="statusClass">
-    <summary>
+    <summary class="summary">
       <span class="name">{{ tool.name }}</span>
       <span class="status">{{ statusLabel }}</span>
       <span v-if="tool.seconds !== undefined" class="secs">{{ formatDuration(tool.seconds) }}</span>
-      <code v-if="tool.args" class="args">{{
+      <code v-if="tool.args" class="args" :title="argsTitle">{{
         tool.args.length > 90 ? tool.args.slice(0, 89) + '…' : tool.args
       }}</code>
     </summary>
-    <pre v-if="tool.output" class="out">{{
-      tool.output.length > 4000 ? tool.output.slice(-4000) : tool.output
-    }}</pre>
+
+    <template v-if="tool.output">
+      <p v-if="view.cut" class="cut">
+        <span v-if="view.fromEnd">输出过长，仅显示末尾 {{ OUTPUT_TAIL.toLocaleString() }} 字符</span>
+        <span v-else>输出过长，已截断至前 {{ OUTPUT_HARD_CAP.toLocaleString() }} 字符</span>
+        <button type="button" class="more" @click="showAll = !showAll">
+          {{ showAll ? '只看末尾' : '展开全部' }}
+        </button>
+      </p>
+      <pre class="out">{{ view.text }}</pre>
+    </template>
   </details>
 </template>
 
@@ -85,6 +113,28 @@ const statusClass = computed(() => `s-${props.tool.status}`)
   text-overflow: ellipsis;
   white-space: nowrap;
   flex: 1;
+}
+
+.cut {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+  padding: 6px 12px;
+  border-top: 1px solid var(--line-soft);
+  background: rgba(245, 158, 11, 0.08);
+  color: var(--warn);
+  font-size: 11px;
+}
+
+.more {
+  border: 1px solid var(--line);
+  background: transparent;
+  color: inherit;
+  border-radius: 6px;
+  padding: 1px 8px;
+  font: inherit;
+  cursor: pointer;
 }
 
 .out {

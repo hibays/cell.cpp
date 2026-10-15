@@ -52,3 +52,34 @@ export function sessionTitle(snippet: string | undefined, fallback: string): str
 export function truncate(s: string, n: number): string {
   return s.length > n ? `${s.slice(0, n - 1)}…` : s
 }
+
+export interface Clipped {
+  text: string
+  /** True when the view differs from the full output. */
+  cut: boolean
+  /** True when what is shown is the end of the output rather than the start. */
+  fromEnd: boolean
+}
+
+/**
+ * Clip tool output for display.
+ *
+ * Collapsed: show the tail, because that is where a failing command explains
+ * itself. Expanded: still cap the DOM — a multi-megabyte <pre> freezes the
+ * renderer, and a frozen UI hides the error the user opened the card to read.
+ */
+export function clipOutput(
+  text: string | undefined,
+  opts: { tail: number; cap: number; expand: boolean },
+): Clipped {
+  const s = text ?? ''
+  if (!s) return { text: '', cut: false, fromEnd: false }
+  if (opts.expand) {
+    return s.length > opts.cap
+      ? { text: s.slice(0, opts.cap), cut: true, fromEnd: false }
+      : { text: s, cut: false, fromEnd: false }
+  }
+  return s.length > opts.tail
+    ? { text: s.slice(-opts.tail), cut: true, fromEnd: true }
+    : { text: s, cut: false, fromEnd: false }
+}
