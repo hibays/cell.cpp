@@ -565,9 +565,15 @@ namespace cellui
             if (HMODULE user32 = GetModuleHandleW(L"user32.dll"))
             {
                 using SetCtxFn = BOOL(WINAPI *)(DPI_AWARENESS_CONTEXT);
-                if (auto set_ctx =
-                        reinterpret_cast<SetCtxFn>(GetProcAddress(user32, "SetProcessDpiAwarenessContext"));
-                    set_ctx != nullptr)
+                // GetProcAddress returns FARPROC; routing the cast through
+                // void(*)() is what satisfies -Wcast-function-type (GCC treats
+                // that one function type as matching everything), so the strict
+                // -Werror build dirs compile this file too — this cast used to
+                // be the only thing that failed, and only when some other
+                // change forced cellui.cpp to recompile there.
+                auto proc = reinterpret_cast<void (*)()>(
+                    GetProcAddress(user32, "SetProcessDpiAwarenessContext"));
+                if (auto set_ctx = reinterpret_cast<SetCtxFn>(proc); set_ctx != nullptr)
                 {
                     set_ctx(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
                 }
