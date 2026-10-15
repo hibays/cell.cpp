@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { interrupt, newSession, resume, selectSession, send, store, toggleSidebar } from '../store'
 import MessageItem from '../components/MessageItem.vue'
 import Composer from '../components/Composer.vue'
@@ -9,11 +9,60 @@ import ExportPanel from '../components/ExportPanel.vue'
 import StatusBar from '../components/StatusBar.vue'
 import SettingsView from './SettingsView.vue'
 import { sessionTitle } from '../lib/format'
+import { createScrollAnchor } from '../lib/scrollAnchor'
+import { computeWindow } from '../lib/window'
 
 const scroller = ref<HTMLDivElement | null>(null)
-const nearBottom = ref(true)
 const exportOpen = ref(false)
 const settingsOpen = ref(false)
+
+// --- scroll ownership ---------------------------------------------------------
+// The view follows new output only while the reader is at the tail. Our own
+// pinning fires the same scroll event a gesture does, so ownership is explicit
+// rather than inferred from the event.
+const anchor = createScrollAnchor()
+// only the affordance needs to be reactive; `stick` is consulted imperatively
+const showJump = ref(anchor.showJump)
+
+function syncAnchor(): void {
+  showJump.value = anchor.showJump
+}
+
+// --- windowing ----------------------------------------------------------------
+// A long session used to mount every message. Only the rows near the viewport
+// are mounted now; spacers stand in for the rest so the scrollbar stays honest.
+const scrollTop = ref(0)
+const viewport = ref(0)
+const heights = ref<number[]>([])
+
+const win = computed(() =>
+  computeWindow({
+    count: store.messages.length,
+    heights: heights.value,
+    scrollTop: scrollTop.value,
+    viewport: viewport.value,
+    overscan: 3,
+  }),
+)
+
+const visibleMessages = computed(() => store.messages.slice(win.value.start, win.value.end))
+
+let observer: ResizeObserver | null = null
+
+/** Record the heights of what is currently mounted; unmounted rows keep their estimate. */
+function measure(): void {
+  const root = scroller.value
+  if (!root || !observer) return
+  observer.disconnect()
+  const next = [...heights.value]
+  for (const el of root.querySelectorAll<HTMLElement>('[data-mk]')) {
+    observer.observe(el)
+    const idx = Number(el.dataset.mk)
+    const h = el.getBoundingClientRect().height
+    if (Number.isInteger(idx) && idx >= 0 && h > 0) next[idx] = h
+  }
+  heights.value = next
+}
 
 const currentTitle = computed(() =>
   sessionTitle(
@@ -24,33 +73,95 @@ const currentTitle = computed(() =>
 
 const chips = ['介绍一下这个仓库', '解释 cell.cpp 的架构', '帮我写一个 CMake 选项']
 
+function readScroller(): void {
+  const el = scroller.value
+  if (!el) return
+  scrollTop.value = el.scrollTop
+  viewport.value = el.clientHeight
+}
+
 function onScroll(): void {
   const el = scroller.value
   if (!el) return
-  nearBottom.value = el.scrollHeight - el.scrollTop - el.clientHeight < 120
+  readScroller()
+  anchor.onScroll(
+    { scrollTop: el.scrollTop, scrollHeight: el.scrollHeight, clientHeight: el.clientHeight },
+    'user',
+  )
+  syncAnchor()
 }
 
 async function scrollToBottom(): Promise<void> {
   await nextTick()
   const el = scroller.value
-  if (el) el.scrollTop = el.scrollHeight
+  if (!el) return
+  el.scrollTop = el.scrollHeight
+  // declare it: our pin must not read as the reader leaving the tail
+  anchor.onScroll(
+    { scrollTop: el.scrollTop, scrollHeight: el.scrollHeight, clientHeight: el.clientHeight },
+    'programmatic',
+  )
+  readScroller()
+  syncAnchor()
+}
+
+function jumpToLatest(): void {
+  anchor.reset()
+  syncAnchor()
+  void scrollToBottom()
 }
 
 watch(
   () => [store.streamText.length, store.messages.length] as const,
+  async () => {
+    if (anchor.stick) await scrollToBottom()
+    else {
+      anchor.onContentGrown({ scrollTop: 0, scrollHeight: 0, clientHeight: 0 })
+      syncAnchor()
+    }
+    await nextTick()
+    measure()
+  },
+)
+
+// a new session means a new list: forget both the window and the ownership
+watch(
+  () => store.currentSession,
   () => {
-    if (nearBottom.value) void scrollToBottom()
+    heights.value = []
+    anchor.reset()
+    syncAnchor()
+    void scrollToBottom()
   },
 )
 
 onMounted(async () => {
+  observer = new ResizeObserver((entries) => {
+    const next = [...heights.value]
+    let changed = false
+    for (const entry of entries) {
+      const el = entry.target as HTMLElement
+      const idx = Number(el.dataset.mk)
+      const h = el.getBoundingClientRect().height
+      if (Number.isInteger(idx) && idx >= 0 && h > 0 && next[idx] !== h) {
+        next[idx] = h
+        changed = true
+      }
+    }
+    if (changed) heights.value = next
+  })
+
+  readScroller()
   if (store.currentSession) await selectSession(store.currentSession)
   else {
     const id = await newSession()
     if (id) await selectSession(id)
   }
   await scrollToBottom()
+  measure()
 })
+
+onUnmounted(() => observer?.disconnect())
 </script>
 
 <template>
@@ -94,7 +205,15 @@ onMounted(async () => {
 
       <div ref="scroller" class="scroll" @scroll="onScroll">
         <div class="column">
-          <MessageItem v-for="m in store.messages" :key="m.key" :message="m" />
+          <!-- spacers keep the scrollbar honest for the rows that are not mounted -->
+          <div :style="{ height: `${win.padTop}px` }" />
+          <MessageItem
+            v-for="(m, i) in visibleMessages"
+            :key="m.key"
+            :message="m"
+            :data-mk="win.start + i"
+          />
+          <div :style="{ height: `${win.padBottom}px` }" />
           <div v-if="store.streaming" class="streaming">
             <pre class="stream-text">{{ store.streamText }}</pre>
             <span class="cursor" />
@@ -109,6 +228,11 @@ onMounted(async () => {
           </div>
         </div>
       </div>
+
+      <!-- ownership is the reader's: offer a way back instead of yanking the view -->
+      <button v-if="showJump" class="jump" type="button" @click="jumpToLatest()">
+        ↓ 回到最新
+      </button>
 
       <div class="composer-wrap">
         <Composer />
@@ -244,7 +368,29 @@ onMounted(async () => {
   font-size: 11px;
 }
 
+.jump {
+  position: absolute;
+  right: 28px;
+  bottom: 108px;
+  z-index: 5;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--bg-elev);
+  color: var(--ink-dim);
+  font: inherit;
+  font-size: 12px;
+  padding: 5px 14px;
+  cursor: pointer;
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.28);
+}
+
+.jump:hover {
+  color: var(--ink);
+  border-color: var(--ink-faint);
+}
+
 .main {
+  position: relative; /* anchors the jump-to-latest button */
   flex: 1;
   min-width: 0;
   display: flex;
