@@ -408,6 +408,16 @@ namespace cellui
     // resource 101, and the reason no `brand/cell.ico` has to sit next to the
     // binary. It must stay in step with IDI_CELL_ICON in that .rc.
     constexpr int kCellIconId = 101;
+    // Three places carry this number: this constant, IDI_CELL_ICON in both .rc
+    // files, and EXPECTED in tests/cellui_smoke.py. The smoke test pins the id
+    // *inside the built binary* (so the .rc side cannot drift); this pins the
+    // C++ side, because a drift here would leave a binary whose resource is
+    // perfectly fine and whose LoadImage silently fails — no headless test can
+    // see that, so both ends fail loudly instead: a compile error here, a red
+    // test there.
+    static_assert(kCellIconId == 101,
+                  "kCellIconId must match IDI_CELL_ICON in assets/brand/win/{cell,cellui}.rc.in "
+                  "and EXPECTED in tests/cellui_smoke.py");
 
 #ifdef _WIN32
     // webui cannot do this on Windows: webui_set_icon_file() only hands the
@@ -666,7 +676,13 @@ namespace cellui
         }
 
         // The window exists now, so give it the brand mark: without this the
-        // titlebar and Alt-Tab show whatever WebView2/webui left behind.
+        // titlebar and Alt-Tab show whatever WebView2/webui left behind. The
+        // window is already *visible* by the time this runs — it appears ~0.7s
+        // earlier, while the WebView thread is still creating the WebView2
+        // environment (webui_show_wv returns only after that, and under load it
+        // takes longer), so the default icon is briefly on screen. Unavoidable
+        // from here: the icon cannot be applied before webui_win32_get_hwnd()
+        // has a window to apply it to.
         apply_window_icon(w);
 
         // ---- window supervisor (DSHL src/ui/browser.rs, condensed) -------------
