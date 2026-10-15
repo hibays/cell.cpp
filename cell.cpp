@@ -13208,6 +13208,123 @@ details{break-inside:avoid}
             }
         }
 
+        // Serialize one teamwork job (the same fields collect_export_jobs reads)
+        // into the JSON shape the GUI panel consumes. Kept separate from the HTML
+        // exporter so the REST layer has a stable, typed contract.
+        static nlohmann::json teamwork_job_to_json(const nlohmann::json &job, const std::string &job_key)
+        {
+            nlohmann::json jv;
+            jv["id"] = jstr(job, "id", job_key);
+            jv["status"] = jstr(job, "status", "pending");
+            jv["work_type"] = jstr(job, "work_type", "serial");
+            jv["error"] = jstr(job, "error");
+            jv["created"] = creation_stamp(jint(job, "created_at", 0));
+            jv["current_stage"] = jint(job, "current_stage", -1);
+            bool is_wf = false;
+            if (auto wf = job.find("workflow"); wf != job.end() && wf->is_object())
+            {
+                is_wf = true;
+                jv["workflow_name"] = jstr(*wf, "name");
+                nlohmann::json stages = nlohmann::json::array();
+                if (auto st = wf->find("stages"); st != wf->end() && st->is_array())
+                    for (auto &s : *st)
+                    {
+                        nlohmann::json sv;
+                        sv["name"] = jstr(s, "name", "stage");
+                        sv["mode"] = jstr(s, "mode", "serial");
+                        sv["gate"] = jbool(s, "gate", false);
+                        if (auto ws = s.find("workers"); ws != s.end() && ws->is_array())
+                            sv["workers"] = (int)ws->size();
+                        stages.push_back(sv);
+                    }
+                jv["stages"] = stages;
+            }
+            jv["is_workflow"] = is_wf;
+            const nlohmann::json *reports =
+                job.contains("summary_reports") && job["summary_reports"].is_object() ? &job["summary_reports"] : nullptr;
+            nlohmann::json workers = nlohmann::json::array();
+            if (auto list = job.find("list"); list != job.end() && list->is_array())
+            {
+                int index = 0;
+                for (auto &w : *list)
+                {
+                    nlohmann::json wv;
+                    wv["name"] = jstr(w, "name", std::format("worker_{}", index));
+                    wv["stage"] = jint(w, "stage", -1);
+                    wv["stage_name"] = jstr(w, "stage_name");
+                    wv["provider"] = jstr(w, "provider");
+                    wv["model"] = jstr(w, "model");
+                    wv["status"] = "pending";
+                    if (reports)
+                        if (auto rr = reports->find(wv["name"].get<std::string>()); rr != reports->end() && rr->is_object())
+                        {
+                            wv["status"] = jstr(*rr, "status", "pending");
+                            wv["rounds"] = jint(*rr, "rounds", 0);
+                            wv["tool_calls"] = jint(*rr, "tool_calls", 0);
+                            if (wv["provider"].get<std::string>().empty())
+                                wv["provider"] = jstr(*rr, "provider");
+                            if (wv["model"].get<std::string>().empty())
+                                wv["model"] = jstr(*rr, "model");
+                        }
+                    workers.push_back(wv);
+                    index++;
+                }
+            }
+            jv["workers"] = workers;
+            return jv;
+        }
+
+        // One session's teamwork jobs (empty array when the store is absent).
+        static nlohmann::json teamworks_json(const std::string &sid)
+        {
+            nlohmann::json out = nlohmann::json::array();
+            std::error_code ec;
+            std::filesystem::path store_p = cell::session_dir(sid) / "teamworks.json";
+            if (!std::filesystem::exists(store_p, ec))
+                return out;
+            cell::async_io::flush(); // child transcripts are written asynchronously
+            nlohmann::json store = load_store_from(store_p);
+            auto jobs = store.find("jobs");
+            if (jobs == store.end() || !jobs->is_object())
+                return out;
+            for (auto it = jobs->begin(); it != jobs->end(); ++it)
+            {
+                if (!it->is_object())
+                    continue;
+                nlohmann::json jv = teamwork_job_to_json(*it, it.key());
+                jv["session"] = sid;
+                out.push_back(jv);
+            }
+            return out;
+        }
+
+        // Every session's teamwork jobs (across all working directories).
+        static nlohmann::json teamworks_all_json(const std::string &current_sid)
+        {
+            nlohmann::json out = nlohmann::json::array();
+            for (auto &p : all_store_paths(true, current_sid))
+            {
+                std::error_code ec;
+                if (!std::filesystem::exists(p, ec))
+                    continue;
+                cell::async_io::flush();
+                nlohmann::json store = load_store_from(p);
+                auto jobs = store.find("jobs");
+                if (jobs == store.end() || !jobs->is_object())
+                    continue;
+                std::string sid = p.parent_path().filename().string();
+                for (auto it = jobs->begin(); it != jobs->end(); ++it)
+                {
+                    if (!it->is_object())
+                        continue;
+                    nlohmann::json jv = teamwork_job_to_json(*it, it.key());
+                    jv["session"] = sid;
+                    out.push_back(jv);
+                }
+            }
+            return out;
+        }
+
         // recover the final assistant text from a persisted worker session
         static std::string last_assistant_text(const nlohmann::json &messages)
         {
@@ -24193,9 +24310,62 @@ int repl::run()
                                 rep.body = json{{"error", {{"code", "busy"}, {"message", "a turn is running in this session"}}}}.dump();
                                 return;
                             }
-                            h.remove(sid);
-                            rep.body = json{{"deleted", sid}}.dump();
-                        });
+                    h.remove(sid);
+                    rep.body = json{{"deleted", sid}}.dump();
+                });
+            }
+            else if (seg.size() == 4 && seg[0] == "v1" && seg[1] == "sessions" && seg[3] == "teamworks" && req.method == "GET")
+            {
+                std::string sid = seg[2];
+                on_core(r, [&, sid](core_reply &rep)
+                {
+                    if (!std::filesystem::exists(cell::session_dir(sid)))
+                    {
+                        rep.status = 404;
+                        rep.body = json{{"error", {{"code", "session_not_found"}, {"message", "no session with id " + sid}}}}.dump();
+                        return;
+                    }
+                    rep.body = json{{"session", sid}, {"jobs", cell::teamwork::teamworks_json(sid)}}.dump();
+                });
+            }
+            else if (seg.size() == 2 && seg[0] == "v1" && seg[1] == "teamworks" && req.method == "GET")
+            {
+                on_core(r, [&](core_reply &rep)
+                {
+                    rep.body = json{{"jobs", cell::teamwork::teamworks_all_json(h.now().id())}}.dump();
+                });
+            }
+            else if (seg.size() == 4 && seg[0] == "v1" && seg[1] == "sessions" && seg[3] == "compact" && req.method == "POST")
+            {
+                std::string sid = seg[2];
+                if (serve_bridge.turn_active.load())
+                {
+                    res.error(409, "busy", "a turn is running; compact after it finishes");
+                    return;
+                }
+                on_core(r, [&, sid](core_reply &rep)
+                {
+                    if (!std::filesystem::exists(cell::session_dir(sid)))
+                    {
+                        rep.status = 404;
+                        rep.body = json{{"error", {{"code", "session_not_found"}, {"message", "no session with id " + sid}}}}.dump();
+                        return;
+                    }
+                    std::string prev = h.now().id();
+                    h.use(sid);
+                    std::string status = compact(h.now());
+                    h.now().unload();
+                    cell::async_io::flush();
+                    cell::config::save(cfg);
+                    if (!prev.empty() && prev != sid)
+                        h.use(prev);
+                    bool compacted = status.find("context compacted") != std::string::npos;
+                    bool ok = compacted || status.find("context already small") != std::string::npos;
+                    rep.body = json{{"session", sid},
+                                   {"status", status},
+                                   {"compacted", compacted},
+                                   {"ok", ok}}.dump();
+                });
             }
             else
             {

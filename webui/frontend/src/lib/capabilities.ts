@@ -4,10 +4,13 @@
 // exist today: /v1/config (switches), /v1/skills (inventory) and /v1/usages
 // (spend).
 //
-// Deliberate honesty: the teamwork and compaction endpoints are still roadmap
-// (docs/RESTful.md §3.9), so this reports their *configured* state and marks
-// them planned. The panel must never present a control that has no endpoint
-// behind it.
+// Honesty policy: this module reports the agent's *configured* capability and
+// the *live* read state it can actually reach. The teamwork read endpoints
+// (GET /v1/teamworks, GET /v1/sessions/{id}/teamworks) and the manual compact
+// trigger (POST /v1/sessions/{id}/compact) are live (docs/RESTful.md §3.9), so
+// the panel now wires real controls to them. The teamwork *control* side
+// (run/stop/resume) is still roadmap — the panel shows read data only and says
+// so, and never presents a control that has no endpoint behind it.
 
 import type { ConfigSnapshot } from './api'
 
@@ -104,7 +107,7 @@ export function toRows(s: CapabilitySummary): CapabilityRow[] {
     {
       label: '子代理上限',
       value: s.teamworkEnabled ? String(s.teamworkChildren) : '未启用',
-      hint: s.teamworkEnabled ? 'teamwork 运行端点仍在规划中' : undefined,
+      hint: s.teamworkEnabled ? '只读，启动/停止端点仍在规划中' : undefined,
     },
     {
       label: '自动压缩',
@@ -113,7 +116,6 @@ export function toRows(s: CapabilitySummary): CapabilityRow[] {
           ? `${s.compaction.provider}:${s.compaction.model}`
           : '开启'
         : '关闭',
-      hint: s.compaction.auto ? '手动触发端点仍在规划中' : undefined,
     },
     { label: '已加载技能', value: `${s.skills.length} 个` },
     { label: '累计 token', value: `${s.usage.tokIn} ↑ ${s.usage.tokOut} ↓` },

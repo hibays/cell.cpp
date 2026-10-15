@@ -2,9 +2,9 @@
 //
 // The panel must describe what the agent can *actually* do, which today is
 // derived from three sources: /v1/config (switches), /v1/skills (inventory) and
-// /v1/usages (spend). Teamwork and compaction endpoints are still roadmap, so
-// this module deliberately reports their *configured* state and flags them
-// planned rather than pretending the controls exist.
+// /v1/usages (spend). The teamwork read endpoints and manual compact trigger are
+// live (docs/RESTful.md §3.9), so this module reports configured state plus the
+// live read availability; the teamwork *control* side is still flagged planned.
 //
 // Run: bun test tests/
 import { describe, expect, test } from 'bun:test'
@@ -89,5 +89,21 @@ describe('capability summary', () => {
       expect(typeof r.label).toBe('string')
       expect(typeof r.value).toBe('string')
     }
+  })
+
+  test('the compaction row no longer claims a trigger is planned', () => {
+    const rows = toRows(summarizeCapabilities({ config: { ...base, compact_auto: true } }))
+    const compact = rows.find((r) => r.label === '自动压缩')
+    expect(compact).toBeDefined()
+    expect(compact!.hint).toBeUndefined()
+  })
+
+  test('the teamwork row stays honest that control is still planned', () => {
+    const rows = toRows(summarizeCapabilities({ config: { ...base, teamwork_max_children: 2 } }))
+    const tw = rows.find((r) => r.label === '子代理上限')
+    expect(tw).toBeDefined()
+    expect(tw!.hint).toBeDefined()
+    expect(tw!.hint).not.toContain('teamwork 运行端点仍在规划中')
+    expect(tw!.hint).toContain('启动/停止端点仍在规划中')
   })
 })

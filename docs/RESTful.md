@@ -143,7 +143,7 @@ no caching. The stream ends with `turn_done` (or `error`).
 | ✅ | `POST /v1/sessions/{id}/turn` | 409 `busy` while another turn runs; 400 without `text`/`resume` |
 | ✅ | `POST /v1/sessions/{id}/interrupt` | sets the same cancel flag the CLI's Esc key uses → the turn stops at the next streaming callback, keeps partial output, records an interrupt state (409 `no_turn` when idle) |
 | ✅ | `POST /v1/sessions/{id}/turn` with `{"resume": true}` | ⤴ this is `/reload` |
-| 🚧 | `POST /v1/sessions/{id}/compact` | `/compact` (archive + summarize) |
+| ✅ | `POST /v1/sessions/{id}/compact` | `/compact` (archive + summarize); 409 `busy` while a turn runs, 404 for an unknown session; body `{session, status, compacted, ok}` |
 | 🚧 | `POST /v1/sessions/{id}/think` | covered today by `PATCH /v1/config {"think_level": …}` |
 
 ### 3.6 Approvals (implemented)
@@ -173,12 +173,29 @@ asks the HTTP client, both fail closed.
 | ✅ | `GET /v1/usages` | `.cell/usages.json` (`{models:{…}, sessions:{…}}`) |
 | 🚧 | `GET /v1/logs?tail=N` | tail of `.cell/logs/cell.log` |
 
-### 3.9 Teamwork (🚧 roadmap)
+### 3.9 Teamwork
 
-`GET/POST /v1/teamworks`, `POST /v1/teamworks/{id}/run|run_bg|stop|resume`,
-`GET /v1/teamworks/{id}/status|history|report` — the job store, background
-runner and notice-driven progress already exist internally (`/teamworks …`);
-they need the same queue+JSON treatment as the endpoints above.
+The job store and background runner already exist internally (`/teamworks …`).
+The **read** side is now served; the **control** side (run / stop / resume) still
+needs the queue+JSON treatment the other endpoints got.
+
+| Status | Endpoint | Notes |
+| --- | --- | --- |
+| ✅ | `GET /v1/sessions/{id}/teamworks` | this session's jobs as JSON (`404` for an unknown session) |
+| ✅ | `GET /v1/teamworks` | every session's jobs across all working directories, each tagged with its `session` id |
+| 🚧 | `POST /v1/teamworks` / `…/{id}/run\|run_bg\|stop\|resume` | create + control a job |
+| 🚧 | `GET /v1/teamworks/{id}/status\|history\|report` | per-job detail |
+
+Each job is:
+
+```json
+{ "id": "job-3", "session": "abc", "status": "running", "work_type": "serial",
+  "error": "", "created": "2026-10-15 11:00", "current_stage": 0,
+  "is_workflow": true, "workflow_name": "release",
+  "stages": [{ "name": "build", "mode": "serial", "gate": false, "workers": 2 }],
+  "workers": [{ "name": "w0", "stage": 0, "provider": "openai", "model": "gpt-4o",
+                "status": "done", "rounds": 3, "tool_calls": 11 }] }
+```
 
 ---
 
@@ -195,7 +212,7 @@ Each event is one `data: <json>` line; the JSON is `{"type": …, "data": {…}}
 | ✅ | `error` | `{code, message}` | terminal: internal failure inside the turn |
 | 🚧 | `token` / `reasoning` | `{text}` | semantic deltas (needs the turn-engine extraction) |
 | 🚧 | `tool_call` / `tool_result` | `{call_id, name, args}` / `{call_id, ok, …}` | structured tool events |
-| 🚧 | `usage` / `notice` / `compact` / `interrupt` | … | per-round accounting and lifecycle events |
+| 🚧 | `usage` / `notice` / `interrupt` | … | per-round accounting and lifecycle events |
 
 ---
 

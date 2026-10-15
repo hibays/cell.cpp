@@ -80,6 +80,26 @@ def api(base: str, token: str, method: str, path: str, body: dict | None = None)
         return json.loads(r.read() or b"{}")
 
 
+def api_code(base: str, token: str, method: str, path: str, body: dict | None = None):
+    """Return the HTTP status code, following redirects, without raising on 4xx/5xx.
+
+    urllib raises HTTPError for error statuses, so a plain api() call cannot
+    inspect a 404/409 body; this wrapper collapses that into a code."""
+    import urllib.error
+
+    req = urllib.request.Request(
+        base + path,
+        data=json.dumps(body).encode() if body is not None else None,
+        method=method,
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return r.status
+    except urllib.error.HTTPError as e:
+        return e.code
+
+
 def wait_healthy(base: str, token: str, proc: subprocess.Popen, timeout: float = 30.0):
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -175,6 +195,30 @@ def run_once(attempt: int) -> bool:
         roles = [m["role"] for m in msgs.get("messages", msgs.get("entries", []))]
         assert "assistant" in roles, roles
         print("transcript roles:", roles)
+
+        # ---- teamwork + compact endpoints (kernel-side, added later) ----
+        tw = api(base, token, "GET", f"/v1/sessions/{sid}/teamworks")
+        assert "jobs" in tw and isinstance(tw["jobs"], list), tw
+        print("teamworks (session):", len(tw["jobs"]), "job(s)")
+        tw_all = api(base, token, "GET", "/v1/teamworks")
+        assert "jobs" in tw_all and isinstance(tw_all["jobs"], list), tw_all
+        print("teamworks (all):", len(tw_all["jobs"]), "job(s)")
+        assert api_code(base, token, "GET", f"/v1/sessions/nope-{sid}/teamworks") == 404
+
+        # compact: a short conversation returns "already small" but the contract
+        # (200 + ok + session echo) holds, and it is safe to call twice
+        c1 = api(base, token, "POST", f"/v1/sessions/{sid}/compact")
+        assert c1.get("ok") is True and c1.get("session") == sid, c1
+        print("compact:", c1.get("status"))
+        c2 = api(base, token, "POST", f"/v1/sessions/{sid}/compact")
+        assert c2.get("ok") is True and c2.get("session") == sid, c2
+        assert api_code(base, token, "POST", f"/v1/sessions/nope-{sid}/compact") == 404
+        # a turn must not be running for compact; with none active it is 200
+        assert api_code(base, token, "POST", f"/v1/sessions/{sid}/compact") == 200
+        # compact must not corrupt the session: it must still answer a turn
+        after = api(base, token, "POST", f"/v1/sessions/{sid}/turn", {"text": "still alive after compact?"})
+        assert "mock reply" in after.get("output", ""), after
+        print("post-compact turn:", after.get("output", "")[:40])
 
         api(base, token, "POST", "/v1/shutdown")
         proc.wait(timeout=15)

@@ -103,6 +103,13 @@ check "transcript persisted" '"role":"assistant"' "$(curl -s -H "$AUTH" "$B/sess
 check "SSE framing" "data: " "$(curl -sN -H "$AUTH" -H 'Content-Type: application/json' -H 'Accept: text/event-stream' -d '{"text":"hello stream"}' "$B/sessions/$SID/turn")"
 check "SSE turn_done" '"type":"turn_done"' "$(curl -sN -H "$AUTH" -H 'Content-Type: application/json' -H 'Accept: text/event-stream' -d '{"text":"again"}' "$B/sessions/$SID/turn")"
 
+note "3b) teamwork + compact"
+check "teamworks (session) is a list" '"jobs"' "$(curl -s -H "$AUTH" "$B/sessions/$SID/teamworks")"
+check "teamworks (all) is a list" '"jobs"' "$(curl -s -H "$AUTH" "$B/teamworks")"
+check "teamworks unknown session is 404" "404" "$(curl -s -o /dev/null -w '%{http_code}' -H "$AUTH" "$B/sessions/nope/teamworks")"
+check "compact ok for short session" '"ok":true' "$(curl -s -H "$AUTH" -X POST -H 'Content-Type: application/json' -d '{}' "$B/sessions/$SID/compact")"
+check "compact unknown session is 404" "404" "$(curl -s -o /dev/null -w '%{http_code}' -H "$AUTH" -X POST -H 'Content-Type: application/json' -d '{}' "$B/sessions/nope/compact")"
+
 note "4) config"
 check "config GET" '"sandbox_mode"' "$(curl -s -H "$AUTH" "$B/config")"
 check "config PATCH" '"think_level":1' "$(curl -s -H "$AUTH" -X PATCH -H 'Content-Type: application/json' -d '{"think_level":"low"}' "$B/config")"

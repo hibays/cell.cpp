@@ -87,6 +87,53 @@ export interface ApiError {
   message: string
 }
 
+// ---- teamwork + compaction (REST contract in docs/RESTful.md §3.9) ----------
+// Read endpoints are live; the control side (run/stop/resume) is still roadmap.
+
+export interface TeamworkStage {
+  name: string
+  mode: string
+  gate: boolean
+  workers?: number
+}
+
+export interface TeamworkWorker {
+  name: string
+  stage: number
+  stage_name: string
+  provider: string
+  model: string
+  status: string
+  rounds?: number
+  tool_calls?: number
+}
+
+export interface TeamworkJob {
+  id: string
+  session: string
+  status: string
+  work_type: string
+  error: string
+  created: string
+  current_stage: number
+  is_workflow: boolean
+  workflow_name?: string
+  stages: TeamworkStage[]
+  workers: TeamworkWorker[]
+}
+
+export interface TeamworkList {
+  session?: string
+  jobs: TeamworkJob[]
+}
+
+export interface CompactResult {
+  session: string
+  status: string
+  compacted: boolean
+  ok: boolean
+}
+
 /** Parse JSON and check the minimal shape the bridge/API promises. */
 export function parseJson<T>(text: string): T | null {
   try {
@@ -290,6 +337,24 @@ export class ApiClient {
     return this.request<{ request_id: string; decision: string }>(`/approvals/${encodeURIComponent(id)}`, {
       method: 'POST',
       body: JSON.stringify({ decision, reason }),
+    })
+  }
+
+  // ---- teamwork + compaction ------------------------------------------------
+  /** Teamwork jobs for one session (read-only; control endpoints are roadmap). */
+  getSessionTeamworks(sessionId: string) {
+    return this.request<TeamworkList>(`/sessions/${encodeURIComponent(sessionId)}/teamworks`)
+  }
+
+  /** Teamwork jobs across every session. */
+  getTeamworks() {
+    return this.request<TeamworkList>('/teamworks')
+  }
+
+  /** Manually compact a session's context. 409 while a turn runs, 404 unknown. */
+  compactSession(sessionId: string) {
+    return this.request<CompactResult>(`/sessions/${encodeURIComponent(sessionId)}/compact`, {
+      method: 'POST',
     })
   }
 
