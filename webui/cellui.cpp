@@ -431,24 +431,29 @@ namespace cellui
         GetWindowThreadProcessId(hwnd, &owner);
         if (owner != GetCurrentProcessId())
             return;
-        HINSTANCE self = GetModuleHandleW(nullptr);
-        auto load = [self](int cx, int cy) -> HICON
+        HINSTANCE hinst = GetModuleHandleW(nullptr);
+        auto load = [hinst](int cx, int cy) -> HICON
         {
             return static_cast<HICON>(
-                LoadImageW(self, MAKEINTRESOURCEW(kCellIconId), IMAGE_ICON, cx, cy, 0));
+                LoadImageW(hinst, MAKEINTRESOURCEW(kCellIconId), IMAGE_ICON, cx, cy, 0));
         };
-        HICON big = load(GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON));
-        HICON small = load(GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON));
-        if (big == nullptr && small == nullptr)
+        // Not `big`/`small`: the Windows SDK's rpcndr.h still carries the MIDL
+        // legacy `#define small char`, so `HICON small = …` reaches the compiler
+        // as `HICON char = …` and MSVC rejects the file. MinGW defines nothing
+        // of the sort, which is how the first version of this code built cleanly
+        // here and failed only in ci.yml's MSVC job.
+        HICON icon_big = load(GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON));
+        HICON icon_small = load(GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON));
+        if (icon_big == nullptr && icon_small == nullptr)
         {
             std::fprintf(stderr, "cellui: this executable has no icon resource %d (see assets/brand/win/cellui.rc.in)\n",
                          kCellIconId);
             return;
         }
-        if (big != nullptr)
-            SendMessageW(hwnd, WM_SETICON, ICON_BIG, reinterpret_cast<LPARAM>(big));
-        if (small != nullptr)
-            SendMessageW(hwnd, WM_SETICON, ICON_SMALL, reinterpret_cast<LPARAM>(small));
+        if (icon_big != nullptr)
+            SendMessageW(hwnd, WM_SETICON, ICON_BIG, reinterpret_cast<LPARAM>(icon_big));
+        if (icon_small != nullptr)
+            SendMessageW(hwnd, WM_SETICON, ICON_SMALL, reinterpret_cast<LPARAM>(icon_small));
     }
 #else
     static void apply_window_icon(size_t) {} // Linux: webui_set_icon_file; macOS: bundle icon
