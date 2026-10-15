@@ -5,12 +5,12 @@
 // (spend).
 //
 // Honesty policy: this module reports the agent's *configured* capability and
-// the *live* read state it can actually reach. The teamwork read endpoints
-// (GET /v1/teamworks, GET /v1/sessions/{id}/teamworks) and the manual compact
-// trigger (POST /v1/sessions/{id}/compact) are live (docs/RESTful.md §3.9), so
-// the panel now wires real controls to them. The teamwork *control* side
-// (run/stop/resume) is still roadmap — the panel shows read data only and says
-// so, and never presents a control that has no endpoint behind it.
+// the *live* state it can actually reach. Teamwork and compaction are fully
+// live now (docs/RESTful.md §3.9): the read endpoints, the whole control side
+// (create/edit/remove job, run/resume/stop, append/remove worker), the skill
+// inventory/body/load endpoints and the manual compact trigger. Nothing in
+// this list is "planned" any more, so the panel never presents a control that
+// has no endpoint behind it.
 
 import type { ConfigSnapshot } from './api'
 
@@ -107,7 +107,7 @@ export function toRows(s: CapabilitySummary): CapabilityRow[] {
     {
       label: '子代理上限',
       value: s.teamworkEnabled ? String(s.teamworkChildren) : '未启用',
-      hint: s.teamworkEnabled ? '只读，启动/停止端点仍在规划中' : undefined,
+      hint: s.teamworkEnabled ? '可在下方「协作任务」区创建、运行或停止' : undefined,
     },
     {
       label: '自动压缩',

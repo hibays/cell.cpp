@@ -88,7 +88,9 @@ export interface ApiError {
 }
 
 // ---- teamwork + compaction (REST contract in docs/RESTful.md §3.9) ----------
-// Read endpoints are live; the control side (run/stop/resume) is still roadmap.
+// Both sides are live: the read endpoints, the control endpoints
+// (create/edit/remove job, run/resume/stop, append/remove worker) and the
+// manual compact trigger.
 
 export interface TeamworkStage {
   name: string
@@ -132,6 +134,51 @@ export interface CompactResult {
   status: string
   compacted: boolean
   ok: boolean
+}
+
+/** One child-agent entry as the create/append endpoints accept it.
+ *
+ * `works` is the task text; the kernel normalizes everything else (name,
+ * provider/model defaults, file grants) — see normalize_worker_item. The
+ * panel only ever needs `works` (+ an optional explicit `name`).
+ */
+export interface TeamworkWorkerInput {
+  works: string
+  name?: string
+  provider?: string
+  model?: string
+}
+
+/** Body of the create endpoint: a flat worker list or a named workflow. */
+export interface TeamworkJobInput {
+  'work-type'?: 'serial' | 'parallel'
+  list?: TeamworkWorkerInput[]
+}
+
+/** Uniform reply of every teamwork control endpoint. `message` carries the
+ *  kernel's human-readable detail (e.g. why a run was refused). */
+export interface TeamworkAction {
+  id: string
+  session: string
+  ok: boolean
+  worker?: string
+  message?: string
+}
+
+/** One skill's full body (front matter stripped). */
+export interface SkillDetail {
+  name: string
+  description: string
+  file: string
+  content: string
+}
+
+/** Reply of the skill-load endpoint (the REST twin of the /skill command). */
+export interface SkillLoadResult {
+  session: string
+  name: string
+  loaded: boolean
+  chars: number
 }
 
 /** Parse JSON and check the minimal shape the bridge/API promises. */
@@ -358,6 +405,66 @@ export class ApiClient {
     })
   }
 
+  // ---- teamwork control -----------------------------------------------------
+  // Paths mirror docs/RESTful.md §3.9. Failures arrive as ApiError with a
+  // stable code (invalid_job / edit_failed / remove_failed / run_failed /
+  // append_failed / remove_worker_failed / session_not_found).
+
+  private tw(sessionId: string, jobId?: string, tail = ''): string {
+    const base = `/sessions/${encodeURIComponent(sessionId)}/teamworks`
+    const job = jobId ? `/${encodeURIComponent(jobId)}` : ''
+    return `${base}${job}${tail}`
+  }
+
+  /** Create a pending job (`{work-type, list:[{works}]}`). */
+  createTeamworkJob(sessionId: string, body: TeamworkJobInput) {
+    return this.request<TeamworkAction>(this.tw(sessionId), { method: 'POST', body: JSON.stringify(body) })
+  }
+
+  /** Replace a pending job's definition (refused while running/completed). */
+  patchTeamworkJob(sessionId: string, jobId: string, body: TeamworkJobInput) {
+    return this.request<TeamworkAction>(this.tw(sessionId, jobId), {
+      method: 'PATCH',
+      body: JSON.stringify(body),
+    })
+  }
+
+  /** Remove a pending job. */
+  deleteTeamworkJob(sessionId: string, jobId: string) {
+    return this.request<TeamworkAction>(this.tw(sessionId, jobId), { method: 'DELETE' })
+  }
+
+  /** Cooperative stop: the runner pauses at its next round/stage boundary. */
+  stopTeamworkJob(sessionId: string, jobId: string) {
+    return this.request<TeamworkAction>(this.tw(sessionId, jobId, '/stop'), { method: 'POST' })
+  }
+
+  /** Start the job in the background (200 immediately; 400 run_failed when the
+   *  job has no child agents or is already running). */
+  runTeamworkJob(sessionId: string, jobId: string) {
+    return this.request<TeamworkAction>(this.tw(sessionId, jobId, '/run'), { method: 'POST' })
+  }
+
+  /** Continue a stopped job. */
+  resumeTeamworkJob(sessionId: string, jobId: string) {
+    return this.request<TeamworkAction>(this.tw(sessionId, jobId, '/resume'), { method: 'POST' })
+  }
+
+  /** Append one child agent to a pending job. */
+  appendTeamworkWorker(sessionId: string, jobId: string, worker: TeamworkWorkerInput) {
+    return this.request<TeamworkAction>(this.tw(sessionId, jobId, '/workers'), {
+      method: 'POST',
+      body: JSON.stringify(worker),
+    })
+  }
+
+  /** Remove one child agent from a pending job. */
+  removeTeamworkWorker(sessionId: string, jobId: string, worker: string) {
+    return this.request<TeamworkAction>(this.tw(sessionId, jobId, `/workers/${encodeURIComponent(worker)}`), {
+      method: 'DELETE',
+    })
+  }
+
   // ---- config / providers ---------------------------------------------------
   getConfig() {
     return this.request<ConfigSnapshot>('/config')
@@ -399,10 +506,29 @@ export class ApiClient {
     )
   }
 
-  // ---- misc -----------------------------------------------------------------
+  // ---- skills ----------------------------------------------------------------
+  // Inventory + body read are read-only file I/O; loadSkill mirrors the CLI's
+  // /skill command (the body joins the session's leading system block). There
+  // is no install/uninstall/enable API: skills are .md files under
+  // .cell/skills/, discovered on every scan.
   skills() {
     return this.request<{ skills: { name: string; description: string; file: string }[] }>('/skills')
   }
+
+  /** One skill's full body, front matter stripped. 404 unknown. */
+  skillContent(name: string) {
+    return this.request<SkillDetail>(`/skills/${encodeURIComponent(name)}`)
+  }
+
+  /** Load a skill into a session (409 while a turn runs, 404 unknown). */
+  loadSkill(sessionId: string, name: string) {
+    return this.request<SkillLoadResult>(
+      `/sessions/${encodeURIComponent(sessionId)}/skills/${encodeURIComponent(name)}`,
+      { method: 'POST' },
+    )
+  }
+
+  // ---- misc -----------------------------------------------------------------
 
   usages() {
     return this.request<Record<string, unknown>>('/usages')
