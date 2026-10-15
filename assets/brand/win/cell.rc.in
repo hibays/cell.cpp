@@ -5,7 +5,14 @@
 
 // Application icon — the brand mark (assets/brand/cell.ico). CMake substitutes
 // the absolute path at configure time so the resource compiler finds it.
-IDI_ICON1 ICON DISCARDABLE "@CELL_BRAND_DIR@/cell.ico"
+//
+// Spelled out rather than an undefined `IDI_ICON1` (which the resource compiler
+// stores as the *string* name "IDI_ICON1"); a number keeps it a plain
+// MAKEINTRESOURCE, which is what cellui uses to load the same icon for its
+// window (kCellIconId in webui/cellui.cpp — the two must stay in step). 101 is
+// the id DSHL embeds its packaged icon under.
+#define IDI_CELL_ICON 101
+IDI_CELL_ICON ICON DISCARDABLE "@CELL_BRAND_DIR@/cell.ico"
 
 // Version resource shown in Explorer / file properties.
 VS_VERSION_INFO VERSIONINFO

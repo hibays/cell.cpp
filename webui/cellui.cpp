@@ -401,6 +401,65 @@ namespace cellui
         return html;
     }
 
+    // ---- window icon -----------------------------------------------------------
+    // The brand mark is compiled into this executable by the resource compiler
+    // (assets/brand/win/cellui.rc.in), so it travels *inside* the single file —
+    // the same idea as the DSHL shell embedding packing/windows/dsh.ico as
+    // resource 101, and the reason no `brand/cell.ico` has to sit next to the
+    // binary. It must stay in step with IDI_CELL_ICON in that .rc.
+    constexpr int kCellIconId = 101;
+
+#ifdef _WIN32
+    // webui cannot do this on Windows: webui_set_icon_file() only hands the
+    // bytes to the GTK back-end and is inert here, so the Win32 window gets the
+    // icon directly.
+    //
+    // Two loads at the metric sizes — ICON_BIG is the taskbar / Alt-Tab image,
+    // ICON_SMALL the titlebar one, and a multi-size .ico gives each its crisp
+    // bitmap. The handles are deliberately never destroyed: Windows does not
+    // copy them, and the window outlives every other interest in this process.
+    static void apply_window_icon(size_t window)
+    {
+        HWND hwnd = static_cast<HWND>(webui_win32_get_hwnd(window));
+        if (hwnd == nullptr)
+            return; // no Win32 window (browser fallback, or not shown yet)
+        HINSTANCE self = GetModuleHandleW(nullptr);
+        auto load = [self](int cx, int cy) -> HICON
+        {
+            return static_cast<HICON>(
+                LoadImageW(self, MAKEINTRESOURCEW(kCellIconId), IMAGE_ICON, cx, cy, 0));
+        };
+        HICON big = load(GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON));
+        HICON small = load(GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON));
+        if (big == nullptr && small == nullptr)
+        {
+            std::fprintf(stderr, "cellui: this executable has no icon resource %d (see assets/brand/win/cellui.rc.in)\n",
+                         kCellIconId);
+            return;
+        }
+        if (big != nullptr)
+            SendMessageW(hwnd, WM_SETICON, ICON_BIG, reinterpret_cast<LPARAM>(big));
+        if (small != nullptr)
+            SendMessageW(hwnd, WM_SETICON, ICON_SMALL, reinterpret_cast<LPARAM>(small));
+    }
+#else
+    static void apply_window_icon(size_t) {} // Linux: webui_set_icon_file; macOS: bundle icon
+#endif
+
+    // A GTK window picks up its icon while it is being created, so the file has
+    // to be handed over before the first show. webui resolves the path against
+    // the working directory and then the executable's directory, and silently
+    // ignores it when neither holds the file — so a portable copy of the binary
+    // without the brand directory still opens, just with the default icon.
+    static void prime_window_icon(size_t window)
+    {
+#if defined(__linux__)
+        webui_set_icon_file(window, "brand/png/cell-192.png");
+#else
+        (void)window;
+#endif
+    }
+
     // ---- entry point -----------------------------------------------------------
     static int run(int argc, char const *argv[])
     {
@@ -530,6 +589,7 @@ namespace cellui
         // mode and the window would never become visible.
         // no fixed port: if the port is busy, webui would fail to show it
         webui_set_timeout(60); // cold browser/WebView start needs more than 15s
+        prime_window_icon(w);  // Linux/GTK only, and only before the first show
 
         // Hook the full event stream (connected / disconnected / navigation /
         // callback) so the shell reacts to the UI instead of only answering
@@ -585,6 +645,10 @@ namespace cellui
                 serve_thread.join();
             return 2;
         }
+
+        // The window exists now, so give it the brand mark: without this the
+        // titlebar and Alt-Tab show whatever WebView2/webui left behind.
+        apply_window_icon(w);
 
         // ---- window supervisor (DSHL src/ui/browser.rs, condensed) -------------
         // webui return codes are not ground truth. The invariant that holds:
