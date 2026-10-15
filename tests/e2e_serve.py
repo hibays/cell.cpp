@@ -205,6 +205,39 @@ def run_once(attempt: int) -> bool:
         print("teamworks (all):", len(tw_all["jobs"]), "job(s)")
         assert api_code(base, token, "GET", f"/v1/sessions/nope-{sid}/teamworks") == 404
 
+        # ---- teamwork control endpoints (create / stop / run-validate / append / delete) ----
+        created_job = api(base, token, "POST", f"/v1/sessions/{sid}/teamworks",
+                          {"work-type": "serial", "list": []})
+        assert created_job.get("ok") is True and created_job.get("id"), created_job
+        jid = created_job["id"]
+        print("teamwork created:", jid)
+        tw_after = api(base, token, "GET", f"/v1/sessions/{sid}/teamworks")
+        assert any(j["id"] == jid for j in tw_after["jobs"]), tw_after
+        assert api_code(base, token, "POST", f"/v1/sessions/nope-{sid}/teamworks",
+                        {"work-type": "serial", "list": []}) == 404
+
+        # stop is cooperative and harmless on a not-running job -> always ok
+        stopped = api(base, token, "POST", f"/v1/sessions/{sid}/teamworks/{jid}/stop")
+        assert stopped.get("ok") is True, stopped
+
+        # run on a job with no child agents must fail fast (no LLM needed) -> 400
+        assert api_code(base, token, "POST", f"/v1/sessions/{sid}/teamworks/{jid}/run") == 400
+
+        # append a child agent (file I/O, no LLM) -> ok, job gains a worker
+        appended = api(base, token, "POST", f"/v1/sessions/{sid}/teamworks/{jid}/workers",
+                       {"works": "summarize the project README"})
+        assert appended.get("ok") is True, appended
+        tw_worker = api(base, token, "GET", f"/v1/sessions/{sid}/teamworks")
+        jjob = next(j for j in tw_worker["jobs"] if j["id"] == jid)
+        assert len(jjob["workers"]) == 1, jjob
+        print("teamwork appended worker:", jjob["workers"][0]["name"])
+
+        # delete the pending job -> ok, then it is gone
+        deleted = api(base, token, "DELETE", f"/v1/sessions/{sid}/teamworks/{jid}")
+        assert deleted.get("ok") is True, deleted
+        tw_gone = api(base, token, "GET", f"/v1/sessions/{sid}/teamworks")
+        assert all(j["id"] != jid for j in tw_gone["jobs"]), tw_gone
+
         # compact: a short conversation returns "already small" but the contract
         # (200 + ok + session echo) holds, and it is safe to call twice
         c1 = api(base, token, "POST", f"/v1/sessions/{sid}/compact")
@@ -219,6 +252,34 @@ def run_once(attempt: int) -> bool:
         after = api(base, token, "POST", f"/v1/sessions/{sid}/turn", {"text": "still alive after compact?"})
         assert "mock reply" in after.get("output", ""), after
         print("post-compact turn:", after.get("output", "")[:40])
+
+        # ---- skills: inventory, body read, and the /skill load twin ----
+        # Skills are scanned fresh from <CELL_ROOT>/skills on every call, so the
+        # fixture can be dropped in after the kernel is already serving.
+        sk_dir = root / "skills"
+        sk_dir.mkdir(parents=True, exist_ok=True)
+        (sk_dir / "e2e-helper.md").write_text(
+            "---\nname: e2e-helper\ndescription: e2e fixture skill\n---\nDo the e2e thing.\nsecond line\n"
+        )
+        sk = api(base, token, "GET", "/v1/skills")
+        names = [s["name"] for s in sk["skills"]]
+        assert "e2e-helper" in names, names
+        print("skills:", names)
+        one = api(base, token, "GET", "/v1/skills/e2e-helper")
+        assert one.get("name") == "e2e-helper", one
+        assert "Do the e2e thing." in one.get("content", ""), one
+        assert "---" not in one.get("content", ""), "front matter must be stripped"
+        assert api_code(base, token, "GET", "/v1/skills/nope-skill") == 404
+        loaded = api(base, token, "POST", f"/v1/sessions/{sid}/skills/e2e-helper")
+        assert loaded.get("loaded") is True and loaded.get("chars", 0) > 0, loaded
+        print("skill loaded:", loaded["name"], loaded["chars"], "chars")
+        # the body must now be part of the conversation (like the /skill command)
+        msgs2 = api(base, token, "GET", f"/v1/sessions/{sid}/messages")
+        entries2 = msgs2.get("messages", msgs2.get("entries", []))
+        assert "system" in [m["role"] for m in entries2], [m["role"] for m in entries2]
+        assert "Do the e2e thing." in json.dumps(entries2), "loaded skill body not in transcript"
+        assert api_code(base, token, "POST", f"/v1/sessions/{sid}/skills/nope-skill") == 404
+        assert api_code(base, token, "POST", f"/v1/sessions/nope-{sid}/skills/e2e-helper") == 404
 
         api(base, token, "POST", "/v1/shutdown")
         proc.wait(timeout=15)

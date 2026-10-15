@@ -23987,6 +23987,28 @@ int repl::run()
                 res.json(200, json{{"skills", cell::serve::skills_json()}});
                 return;
             }
+            if (seg.size() == 3 && seg[0] == "v1" && seg[1] == "skills" && req.method == "GET")
+            {
+                // one skill's full body (front matter stripped) — read-only file
+                // I/O, answered directly like the inventory above. The name comes
+                // from front matter or the file stem, never from the path, so an
+                // unknown name is a 404 and nothing is writable through here.
+                auto all = cell::skills::list();
+                const cell::skills::skill *sk = cell::skills::find(all, seg[2]);
+                if (!sk)
+                {
+                    res.error(404, "skill_not_found", "no skill named " + seg[2]);
+                    return;
+                }
+                std::string body;
+                if (!cell::skills::content(*sk, body))
+                {
+                    res.error(500, "skill_unreadable", "cannot read " + sk->file);
+                    return;
+                }
+                res.json(200, json{{"name", sk->name}, {"description", sk->description}, {"file", sk->file}, {"content", body}});
+                return;
+            }
             if (seg.size() == 4 && seg[0] == "v1" && seg[1] == "sessions" && seg[3] == "interrupt" && req.method == "POST")
             {
                 if (!serve_bridge.turn_active.load())
@@ -24368,6 +24390,223 @@ int repl::run()
                                    {"status", status},
                                    {"compacted", compacted},
                                    {"ok", ok}}.dump();
+                });
+            }
+            else if (seg.size() == 5 && seg[0] == "v1" && seg[1] == "sessions" && seg[3] == "skills" && req.method == "POST")
+            {
+                // load a skill into a session — the REST twin of the /skill
+                // command: the body enters the conversation verbatim as a system
+                // message and is folded into the leading block
+                std::string sid = seg[2];
+                std::string name = seg[4];
+                if (serve_bridge.turn_active.load())
+                {
+                    res.error(409, "busy", "a turn is running; load the skill after it finishes");
+                    return;
+                }
+                on_core(r, [&, sid, name](core_reply &rep)
+                {
+                    if (!std::filesystem::exists(cell::session_dir(sid)))
+                    {
+                        rep.status = 404;
+                        rep.body = json{{"error", {{"code", "session_not_found"}, {"message", "no session with id " + sid}}}}.dump();
+                        return;
+                    }
+                    auto all = cell::skills::list();
+                    const cell::skills::skill *sk = cell::skills::find(all, name);
+                    if (!sk)
+                    {
+                        rep.status = 404;
+                        rep.body = json{{"error", {{"code", "skill_not_found"}, {"message", "no skill named " + name}}}}.dump();
+                        return;
+                    }
+                    std::string body;
+                    if (!cell::skills::content(*sk, body))
+                    {
+                        rep.status = 500;
+                        rep.body = json{{"error", {{"code", "skill_unreadable"}, {"message", "cannot read " + sk->file}}}}.dump();
+                        return;
+                    }
+                    std::string prev = h.now().id();
+                    h.use(sid);
+                    // the skill body enters the conversation verbatim (no heavy
+                    // fingerprint scan for non-tool channels); the skill name is
+                    // untrusted front matter, so control/ANSI chars are stripped
+                    std::string sname = cell::text::display_safe(sk->name);
+                    h.now().msg().push_back({{"role", "system"},
+                                             {"content", std::format("You have loaded the skill \"{}\". Follow its instructions for the rest of this session.\n\n{}", sname, body)}});
+                    cell::chat::fold_system_messages(h.now().msg()); // a skill loaded mid-conversation joins the leading block
+                    h.now().unload();
+                    cell::async_io::flush();
+                    cell::config::save(cfg);
+                    if (!prev.empty() && prev != sid)
+                        h.use(prev);
+                    log.info("skill", std::format("loaded via rest name={} chars={} session={}", sk->name, body.size(), sid));
+                    rep.body = json{{"session", sid}, {"name", sk->name}, {"loaded", true}, {"chars", body.size()}}.dump();
+                });
+            }
+            else if (seg.size() == 4 && seg[0] == "v1" && seg[1] == "sessions" && seg[3] == "teamworks" && req.method == "POST")
+            {
+                // create a teamwork job in this session (file I/O; no LLM needed)
+                std::string sid = seg[2];
+                auto body = parse_body();
+                if (!body)
+                    return;
+                on_core(r, [&, sid, body](core_reply &rep)
+                {
+                    if (!std::filesystem::exists(cell::session_dir(sid)))
+                    {
+                        rep.status = 404;
+                        rep.body = json{{"error", {{"code", "session_not_found"}, {"message", "no session with id " + sid}}}}.dump();
+                        return;
+                    }
+                    std::string out;
+                    if (!cell::teamwork::new_job(*body, cell::teamwork::max_children(cfg), out, sid))
+                    {
+                        rep.status = 400;
+                        rep.body = json{{"error", {{"code", "invalid_job"}, {"message", out}}}}.dump();
+                        return;
+                    }
+                    rep.body = json{{"id", out}, {"session", sid}, {"ok", true}}.dump();
+                });
+            }
+            else if (seg.size() == 5 && seg[0] == "v1" && seg[1] == "sessions" && seg[3] == "teamworks" && req.method == "PATCH")
+            {
+                // edit a pending job (file I/O; refuses running/completed jobs)
+                std::string sid = seg[2];
+                std::string jid = seg[4];
+                auto body = parse_body();
+                if (!body)
+                    return;
+                on_core(r, [&, sid, jid, body](core_reply &rep)
+                {
+                    if (!std::filesystem::exists(cell::session_dir(sid)))
+                    {
+                        rep.status = 404;
+                        rep.body = json{{"error", {{"code", "session_not_found"}, {"message", "no session with id " + sid}}}}.dump();
+                        return;
+                    }
+                    std::string out;
+                    if (!cell::teamwork::edit_job(jid, *body, cell::teamwork::max_children(cfg), out, sid))
+                    {
+                        rep.status = 400;
+                        rep.body = json{{"error", {{"code", "edit_failed"}, {"message", out}}}}.dump();
+                        return;
+                    }
+                    rep.body = json{{"id", jid}, {"session", sid}, {"ok", true}, {"message", out}}.dump();
+                });
+            }
+            else if (seg.size() == 5 && seg[0] == "v1" && seg[1] == "sessions" && seg[3] == "teamworks" && req.method == "DELETE")
+            {
+                // remove a pending job (refuses running/completed jobs)
+                std::string sid = seg[2];
+                std::string jid = seg[4];
+                on_core(r, [&, sid, jid](core_reply &rep)
+                {
+                    if (!std::filesystem::exists(cell::session_dir(sid)))
+                    {
+                        rep.status = 404;
+                        rep.body = json{{"error", {{"code", "session_not_found"}, {"message", "no session with id " + sid}}}}.dump();
+                        return;
+                    }
+                    std::string out;
+                    if (!cell::teamwork::remove_job(jid, true, out, sid))
+                    {
+                        rep.status = 400;
+                        rep.body = json{{"error", {{"code", "remove_failed"}, {"message", out}}}}.dump();
+                        return;
+                    }
+                    rep.body = json{{"id", jid}, {"session", sid}, {"ok", true}, {"message", out}}.dump();
+                });
+            }
+            else if (seg.size() == 6 && seg[0] == "v1" && seg[1] == "sessions" && seg[3] == "teamworks" && seg[5] == "stop" && req.method == "POST")
+            {
+                // cooperative stop: the runner pauses at the next round/stage boundary
+                std::string sid = seg[2];
+                std::string jid = seg[4];
+                on_core(r, [&, sid, jid](core_reply &rep)
+                {
+                    if (!std::filesystem::exists(cell::session_dir(sid)))
+                    {
+                        rep.status = 404;
+                        rep.body = json{{"error", {{"code", "session_not_found"}, {"message", "no session with id " + sid}}}}.dump();
+                        return;
+                    }
+                    cell::teamwork::request_stop(jid);
+                    rep.body = json{{"id", jid}, {"session", sid}, {"ok", true}, {"message", "stop requested"}}.dump();
+                });
+            }
+            else if (seg.size() == 6 && seg[0] == "v1" && seg[1] == "sessions" && seg[3] == "teamworks" && (seg[5] == "run" || seg[5] == "resume") && req.method == "POST")
+            {
+                // run/resume as a background job so the HTTP worker never blocks on a long run
+                std::string sid = seg[2];
+                std::string jid = seg[4];
+                on_core(r, [&, sid, jid](core_reply &rep)
+                {
+                    if (!std::filesystem::exists(cell::session_dir(sid)))
+                    {
+                        rep.status = 404;
+                        rep.body = json{{"error", {{"code", "session_not_found"}, {"message", "no session with id " + sid}}}}.dump();
+                        return;
+                    }
+                    std::string out;
+                    if (!cell::teamwork::run_job_bg(team_rt, jid, out))
+                    {
+                        rep.status = 400;
+                        rep.body = json{{"error", {{"code", "run_failed"}, {"message", out}}}}.dump();
+                        return;
+                    }
+                    rep.body = json{{"id", jid}, {"session", sid}, {"ok", true}, {"message", out}}.dump();
+                });
+            }
+            else if (seg.size() == 6 && seg[0] == "v1" && seg[1] == "sessions" && seg[3] == "teamworks" && seg[5] == "workers" && req.method == "POST")
+            {
+                // append a child agent to a pending job (file I/O)
+                std::string sid = seg[2];
+                std::string jid = seg[4];
+                auto body = parse_body();
+                if (!body)
+                    return;
+                on_core(r, [&, sid, jid, body](core_reply &rep)
+                {
+                    if (!std::filesystem::exists(cell::session_dir(sid)))
+                    {
+                        rep.status = 404;
+                        rep.body = json{{"error", {{"code", "session_not_found"}, {"message", "no session with id " + sid}}}}.dump();
+                        return;
+                    }
+                    std::string out;
+                    if (!cell::teamwork::append_worker(jid, *body, cell::teamwork::max_children(cfg), out, sid))
+                    {
+                        rep.status = 400;
+                        rep.body = json{{"error", {{"code", "append_failed"}, {"message", out}}}}.dump();
+                        return;
+                    }
+                    rep.body = json{{"id", jid}, {"session", sid}, {"ok", true}, {"message", out}}.dump();
+                });
+            }
+            else if (seg.size() == 7 && seg[0] == "v1" && seg[1] == "sessions" && seg[3] == "teamworks" && seg[5] == "workers" && req.method == "DELETE")
+            {
+                // remove a child agent from a pending job (file I/O)
+                std::string sid = seg[2];
+                std::string jid = seg[4];
+                std::string wname = seg[6];
+                on_core(r, [&, sid, jid, wname](core_reply &rep)
+                {
+                    if (!std::filesystem::exists(cell::session_dir(sid)))
+                    {
+                        rep.status = 404;
+                        rep.body = json{{"error", {{"code", "session_not_found"}, {"message", "no session with id " + sid}}}}.dump();
+                        return;
+                    }
+                    std::string out;
+                    if (!cell::teamwork::remove_worker(jid, wname, out, sid))
+                    {
+                        rep.status = 400;
+                        rep.body = json{{"error", {{"code", "remove_worker_failed"}, {"message", out}}}}.dump();
+                        return;
+                    }
+                    rep.body = json{{"id", jid}, {"session", sid}, {"worker", wname}, {"ok", true}, {"message", out}}.dump();
                 });
             }
             else

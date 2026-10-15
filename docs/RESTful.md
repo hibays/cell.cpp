@@ -35,10 +35,11 @@ cell serve: discovery file: /path/to/bin/.cell/server.json
 ### Execution model (important for clients)
 
 * One **core thread** owns the live session and the configuration. Control
-  endpoints (health, version, approvals, notices, usages, skills, interrupt,
+  endpoints (health, version, approvals, notices, usages, skill reads, interrupt,
   shutdown) are answered immediately by the HTTP worker thread; every endpoint
-  that touches session/config state is queued onto the core thread and the
-  worker waits for the response.
+  that touches session/config state (turns, compaction, teamwork control, skill
+  *loading*, …) is queued onto the core thread and the worker waits for the
+  response.
 * **One turn runs at a time** (the core is single-threaded). A second
   `POST …/turn` while one is running returns `409 busy`.
 * Turn output is streamed at **text level** (`output` events carrying the same
@@ -167,24 +168,47 @@ asks the HTTP client, both fail closed.
 
 ### 3.8 Skills, usage
 
+Skills are `.md` files under `.cell/skills/`, (re)scanned on every call — there is
+no install/enable API because there is no registry to write to; dropping a file
+in the directory *is* the install step. The two write-free reads plus the
+`/skill` load twin are served:
+
 | Status | Endpoint | Notes |
 | --- | --- | --- |
 | ✅ | `GET /v1/skills` | `{skills:[{name, description, file}]}` from `.cell/skills/` |
+| ✅ | `GET /v1/skills/{name}` | one skill's full body, front matter stripped (`404 skill_not_found`; names come from front matter/file stem, not the path) |
+| ✅ | `POST /v1/sessions/{id}/skills/{name}` | load a skill into a session — the REST twin of the CLI `/skill NAME`: the body joins the leading system block. `{session, name, loaded, chars}`; `404` unknown session/skill; `409 busy` while a turn runs |
 | ✅ | `GET /v1/usages` | `.cell/usages.json` (`{models:{…}, sessions:{…}}`) |
 | 🚧 | `GET /v1/logs?tail=N` | tail of `.cell/logs/cell.log` |
 
 ### 3.9 Teamwork
 
 The job store and background runner already exist internally (`/teamworks …`).
-The **read** side is now served; the **control** side (run / stop / resume) still
-needs the queue+JSON treatment the other endpoints got.
+The **read** side is served, and the **control** side is now served too: jobs can
+be created, edited, removed, run/resumed in the background, stopped cooperatively,
+and have child agents appended/removed — all over REST.
 
 | Status | Endpoint | Notes |
 | --- | --- | --- |
 | ✅ | `GET /v1/sessions/{id}/teamworks` | this session's jobs as JSON (`404` for an unknown session) |
 | ✅ | `GET /v1/teamworks` | every session's jobs across all working directories, each tagged with its `session` id |
-| 🚧 | `POST /v1/teamworks` / `…/{id}/run\|run_bg\|stop\|resume` | create + control a job |
-| 🚧 | `GET /v1/teamworks/{id}/status\|history\|report` | per-job detail |
+| ✅ | `POST /v1/sessions/{id}/teamworks` | create a job; body is the job config (`work-type`, `list`, …); returns `{id, session, ok}`; `400 invalid_job` on a bad config; `404` for an unknown session |
+| ✅ | `PATCH /v1/sessions/{id}/teamworks/{job}` | edit a **pending** job (`400 edit_failed` on a running/completed job) |
+| ✅ | `DELETE /v1/sessions/{id}/teamworks/{job}` | remove a **pending** job (`400 remove_failed` on a running/completed job) |
+| ✅ | `POST /v1/sessions/{id}/teamworks/{job}/run` | run the job **in the background** (non-blocking; `400 run_failed` if it has no child agents or is already running). Poll `GET …/teamworks` for progress. |
+| ✅ | `POST /v1/sessions/{id}/teamworks/{job}/resume` | resume a gated/stopped job from its saved stage (same background semantics as `run`) |
+| ✅ | `POST /v1/sessions/{id}/teamworks/{job}/stop` | cooperative stop — the runner pauses at the next round/stage boundary |
+| ✅ | `POST /v1/sessions/{id}/teamworks/{job}/workers` | append a child agent to a **pending** job; body is the worker extras (`provider`, `model`, `think`, `works`, `rules`, …) |
+| ✅ | `DELETE /v1/sessions/{id}/teamworks/{job}/workers/{worker}` | remove a child agent from a **pending** job |
+| 🚧 | `GET /v1/teamworks/{job}/report` | per-worker transcript/report (the list already returns per-worker `status`/`rounds`/`tool_calls`) |
+
+`run`/`resume` are **background** by design: a teamwork job runs many LLM rounds,
+so the HTTP worker must not block on it. The runner is the same machinery the CLI
+`/teamworks run_bg` uses, so progress arrives as notices and the job's `status`
+advances in its store (`pending → running → completed` / `failed`; a cooperative
+stop parks it at `waiting` with a `stopped` flag, which `resume` picks up).
+`stop` is cooperative (the engine checks the flag between rounds), matching the
+CLI `/teamworks stop`.
 
 Each job is:
 
@@ -287,8 +311,11 @@ management, approvals, notices, usage, skills, graceful shutdown.
 **Next (P1)**
 1. `turn_engine` extraction out of `repl::run()` → semantic `token` /
    `reasoning` / `tool_call` / `tool_result` / `usage` events.
-2. Teamwork endpoints over the existing job store + `run_bg`.
-3. `/compact`, `/clear`, archives, HTML export, logs tail.
+2. ~~Teamwork endpoints over the existing job store + `run_bg`.~~ ✅ done
+   (create / edit / remove / run / resume / stop / append-worker / remove-worker;
+   see §3.9). Remaining: per-worker `report` read (🚧).
+3. ~~`/compact`~~ ✅ done (§3.5); ~~skill reads + `/skill` load~~ ✅ done (§3.8).
+   Remaining: `/clear`, archives, HTML export, logs tail.
 4. SSE `Last-Event-ID` resume for interrupted streams; notices `follow=true`.
 
 **Later (P2)** — multi-turn parallelism per session, TLS/reverse-proxy
