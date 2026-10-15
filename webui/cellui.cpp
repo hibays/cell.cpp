@@ -422,7 +422,15 @@ namespace cellui
     {
         HWND hwnd = static_cast<HWND>(webui_win32_get_hwnd(window));
         if (hwnd == nullptr)
-            return; // no Win32 window (browser fallback, or not shown yet)
+            return; // no Win32 window yet
+        // Only a window of ours may be touched. In the browser fallback webui
+        // hands back the *browser's* window, and an HICON is a per-process
+        // handle: that process could not use one of ours, so this path stays
+        // icon-less instead of parking a handle that means nothing over there.
+        DWORD owner = 0;
+        GetWindowThreadProcessId(hwnd, &owner);
+        if (owner != GetCurrentProcessId())
+            return;
         HINSTANCE self = GetModuleHandleW(nullptr);
         auto load = [self](int cx, int cy) -> HICON
         {

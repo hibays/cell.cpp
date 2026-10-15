@@ -308,6 +308,7 @@ native window.
 | WebUI driver | `webui/third_party/webui/` (vendored sources) | compiled from source; **WebView2 with a statically linked loader** on Windows (`webui/third_party/webui/lib/WebView2LoaderStatic.lib`), WKWebView on macOS, webui's browser backend on Linux |
 | Native bridge | `webui/cellui.cpp` | starts the service layer in-process (`cell_main("--serve")` on a worker thread), binds `cell_*` functions to JS, and bridges the **internal** HTML exporter for session/batch/full exports |
 | Front-end | `frontend/` (Vue 3 + TS + Vite) | built to a single HTML file and **embedded into the binary** (`webui/scripts/embed_webui.mjs` → `cellui_web.h`) |
+| Window icon | `assets/brand/win/cellui.rc.in` | the brand mark is embedded as icon resource **101** and handed to the window with `WM_SETICON` (`apply_window_icon` in `cellui.cpp`) — `webui_set_icon_file()` is inert on Windows, so the Win32 path is ours. Linux hands `brand/png/cell-192.png` to GTK before the first show; macOS takes the bundle icon. The `.rc` id and `kCellIconId` must agree, and `cell.cellui_boot` fails the build if the resource is not loadable by a *numeric* id |
 
 ```bash
 # 1. build the front-end (once, or on every UI change)

@@ -129,6 +129,14 @@ def check_window_icon_resource() -> bool:
     if not numeric:
         print(f"FAIL: RT_GROUP_ICON is addressed by name {groups!r}; MAKEINTRESOURCE needs a numeric id")
         return False
+    # The exact id matters as much as it being numeric: cellui loads it through
+    # kCellIconId (webui/cellui.cpp) and the .rc defines IDI_CELL_ICON. Drifting
+    # any of the three would silently drop the window icon at runtime, which no
+    # headless test can see — so it is pinned here instead.
+    EXPECTED = 101
+    if numeric[0] != EXPECTED:
+        print(f"FAIL: RT_GROUP_ICON id is {numeric[0]}, expected {EXPECTED} (kCellIconId / IDI_CELL_ICON)")
+        return False
     print(f"window icon: RT_GROUP_ICON id={numeric[0]} (MAKEINTRESOURCE-loadable) OK")
     return True
 
