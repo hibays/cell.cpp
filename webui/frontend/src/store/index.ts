@@ -6,6 +6,7 @@ import { api } from '../lib/api'
 import { classifyError } from '../lib/errors'
 import { createEventBus } from '../lib/events'
 import { createFrameScheduler } from '../lib/scheduler'
+import { normalizeTranscript, type UiMessage } from '../lib/transcript'
 import type {
   Approval,
   Bootstrap,
@@ -16,23 +17,9 @@ import type {
 
 export type Phase = 'booting' | 'landing' | 'onboarding' | 'app'
 
-export interface UiToolCall {
-  id: string
-  name: string
-  args: string
-  status: 'running' | 'ok' | 'blocked' | 'denied'
-  output: string
-  seconds?: number
-}
-
-export interface UiMessage {
-  key: string
-  role: 'user' | 'assistant' | 'system' | 'tool'
-  text: string
-  reasoning?: string
-  tools?: UiToolCall[]
-  ts?: number
-}
+// Transcript normalisation lives in lib/transcript.ts (pure, unit tested); the
+// types are re-exported here so components keep one import site.
+export type { UiMessage, UiToolCall } from '../lib/transcript'
 
 export interface Toast {
   id: number
@@ -101,96 +88,6 @@ export function toast(kind: Toast['kind'], text: string): void {
   }, 4200)
 }
 
-// ---- transcript normalisation -------------------------------------------------
-// The service returns the raw transcript (OpenAI/Anthropic shapes). The UI needs
-// flat items: text, reasoning and tool calls with their results attached.
-
-type Json = Record<string, unknown>
-
-function asRecord(v: unknown): Json {
-  return typeof v === 'object' && v !== null ? (v as Json) : {}
-}
-
-function pickString(v: unknown): string | undefined {
-  return typeof v === 'string' ? v : undefined
-}
-
-export function normalizeTranscript(raw: unknown[]): UiMessage[] {
-  const out: UiMessage[] = []
-  const toolIndex = new Map<string, UiToolCall>()
-
-  for (const entry of raw) {
-    const m = asRecord(entry)
-    const role = typeof m.role === 'string' ? m.role : 'system'
-    const content = m.content
-    const reasoningText = pickString(m.reasoning_content) ?? pickString(m.reasoning)
-    const toolCalls = Array.isArray(m.tool_calls) ? m.tool_calls : []
-
-    if (role === 'tool') {
-      // tool result: attach to the matching call of the previous assistant msg
-      const text = typeof content === 'string' ? content : JSON.stringify(content ?? '')
-      const last = out.findLast((x) => (x.tools?.length ?? 0) > 0)
-      const target = last?.tools?.find((t) => t.status === 'running')
-      if (target) {
-        target.status = 'ok'
-        target.output = text
-      }
-      continue
-    }
-
-    if (role === 'assistant') {
-      const text = contentToText(content)
-      const reasoning = reasoningText
-      const tools: UiToolCall[] = []
-      for (const tc of toolCalls) {
-        const call = asRecord(tc)
-        const fn = asRecord(call.function)
-        const name = pickString(fn.name) ?? '?'
-        const args = pickString(fn.arguments) ?? ''
-        const card: UiToolCall = { id: pickString(call.id) ?? name, name, args, status: 'ok', output: '' }
-        tools.push(card)
-        toolIndex.set(card.id, card)
-      }
-      if (!text && !reasoning && tools.length === 0) continue
-      out.push({
-        key: `m${msgSeq++}`,
-        role: 'assistant',
-        text,
-        reasoning,
-        tools: tools.length ? tools : undefined,
-        ts: typeof m.ts === 'number' ? m.ts : undefined,
-      })
-      continue
-    }
-
-    if (role === 'user') {
-      const text = contentToText(content)
-      if (!text.trim()) continue
-      out.push({ key: `m${msgSeq++}`, role: 'user', text, ts: typeof m.ts === 'number' ? m.ts : undefined })
-      continue
-    }
-
-    // system notes are folded into the leading block by the agent; keep the UI quiet
-    if (role === 'system') continue
-  }
-  return out
-}
-
-function contentToText(content: unknown): string {
-  if (typeof content === 'string') return content
-  if (Array.isArray(content)) {
-    return content
-      .map((b) => {
-        const block = b as { type?: string; text?: string; content?: unknown }
-        if (block.type === 'text' && typeof block.text === 'string') return block.text
-        if (typeof block.content === 'string') return block.content
-        return ''
-      })
-      .filter(Boolean)
-      .join('\n')
-  }
-  return ''
-}
 
 // ---- actions ------------------------------------------------------------------
 export async function boot(): Promise<void> {
