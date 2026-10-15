@@ -216,9 +216,12 @@ def run_once(attempt: int) -> bool:
         assert api_code(base, token, "POST", f"/v1/sessions/nope-{sid}/teamworks",
                         {"work-type": "serial", "list": []}) == 404
 
-        # stop is cooperative and harmless on a not-running job -> always ok
+        # stop is cooperative and harmless on a not-running job -> ok
         stopped = api(base, token, "POST", f"/v1/sessions/{sid}/teamworks/{jid}/stop")
         assert stopped.get("ok") is True, stopped
+        # ... but an unknown job is a 404, not a silent "ok" (the flag would
+        # never be consumed and would linger in the stop set for ever)
+        assert api_code(base, token, "POST", f"/v1/sessions/{sid}/teamworks/tw-nope/stop") == 404
 
         # run on a job with no child agents must fail fast (no LLM needed) -> 400
         assert api_code(base, token, "POST", f"/v1/sessions/{sid}/teamworks/{jid}/run") == 400
@@ -280,6 +283,40 @@ def run_once(attempt: int) -> bool:
         assert "Do the e2e thing." in json.dumps(entries2), "loaded skill body not in transcript"
         assert api_code(base, token, "POST", f"/v1/sessions/{sid}/skills/nope-skill") == 404
         assert api_code(base, token, "POST", f"/v1/sessions/nope-{sid}/skills/e2e-helper") == 404
+
+        # ---- a freshly created, still unused session must accept the
+        # session-scoped routes: POST /v1/sessions -> create a job / compact /
+        # load a skill is the flow the panel drives right after boot, and
+        # POST .../turn already accepts such a session. The turn below also
+        # proves that loading a skill into it did not cost it its system prompt
+        # (ensure_prompt only ever fires on an empty transcript).
+        #
+        # Creating it HERE also pins a real bug that used to make this impossible:
+        # a turn re-keys the live session, and POST /v1/sessions then handed back
+        # the id it had just left instead of a new one.
+        fresh = api(base, token, "POST", "/v1/sessions")["id"]
+        assert fresh != sid, "create after a turn must yield a new session id"
+        fresh_dir = root / "sessions" / fresh.split("-")[0] / fresh
+        assert not fresh_dir.exists(), "fixture assumption: an unused session has no directory yet"
+        loaded2 = api(base, token, "POST", f"/v1/sessions/{fresh}/skills/e2e-helper")
+        assert loaded2.get("loaded") is True, loaded2
+        job2 = api(base, token, "POST", f"/v1/sessions/{fresh}/teamworks",
+                   {"work-type": "serial", "list": []})
+        assert job2.get("ok") is True, job2
+        assert api(base, token, "POST", f"/v1/sessions/{fresh}/compact").get("session") == fresh
+        # an id that is neither on disk nor the active session is still a 404
+        assert api_code(base, token, "POST", f"/v1/sessions/ghost-{fresh}/teamworks",
+                        {"work-type": "serial", "list": []}) == 404
+        turn2 = api(base, token, "POST", f"/v1/sessions/{fresh}/turn", {"text": "fresh session turn"})
+        assert "mock reply" in turn2.get("output", ""), turn2
+        entries3 = api(base, token, "GET", f"/v1/sessions/{fresh}/messages")
+        sys_text = "".join(str(m.get("content", ""))
+                           for m in entries3.get("messages", entries3.get("entries", []))
+                           if m.get("role") == "system")
+        prompt_text = api(base, token, "GET", "/v1/config").get("system_prompt", "")
+        assert prompt_text and prompt_text in sys_text, "system prompt missing after a skill load into a fresh session"
+        assert "Do the e2e thing." in sys_text, "skill body lost on a fresh session"
+        print("fresh session (no dir yet): skill load + job + compact + prompt intact")
 
         api(base, token, "POST", "/v1/shutdown")
         proc.wait(timeout=15)

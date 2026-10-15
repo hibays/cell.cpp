@@ -13154,10 +13154,11 @@ details{break-inside:avoid}
         static void collect_export_jobs(const std::string &session_id, std::vector<cell::chat::teamwork_job_view> &out)
         {
             std::filesystem::path store_p = cell::session_dir(session_id) / "teamworks.json";
-            std::error_code ec;
-            if (!std::filesystem::exists(store_p, ec))
-                return;
-            async_io::flush(); // child transcripts are written asynchronously
+            // read through the store cache exactly like teamworks_json(): an
+            // exists() probe would miss a job whose file is still queued for the
+            // async writer (every mutation updates the cache synchronously but
+            // writes the file in the background)
+            async_io::flush(); // this function also reads child transcripts below
             nlohmann::json store = load_store_from(store_p);
             auto jobs = store.find("jobs");
             if (jobs == store.end() || !jobs->is_object())
@@ -13304,7 +13305,7 @@ details{break-inside:avoid}
             // than probing the filesystem with exists(): a freshly-created job's
             // file may not have been flushed to disk yet, which would otherwise
             // make the first read see an empty store even though the job exists.
-            cell::async_io::flush(); // drain any pending child-transcript writes
+            cell::async_io::flush(); // a cache miss reads the file, so let queued writes land
             nlohmann::json store = load_store_from(cell::session_dir(sid) / "teamworks.json");
             auto jobs = store.find("jobs");
             if (jobs == store.end() || !jobs->is_object())
@@ -23898,6 +23899,22 @@ int repl::run()
             serve_bridge.set_snapshot(p ? p->name : "(none)", cfg.current_model, session, cfg.sandbox_mode);
         };
 
+        // A session is addressable when its directory exists OR it is the session
+        // the kernel currently has loaded. A session created through
+        // POST /v1/sessions is a real session with a live in-memory transcript but
+        // no directory yet - the file is only written on unload - and POST …/turn
+        // accepts it, so the session-scoped routes must accept it too instead of
+        // 404ing the documented create -> use flow (create job / compact / load
+        // skill right after creating a session). Nothing is loosened for a crafted
+        // id: it is neither on disk nor the active id, so it still 404s and can
+        // never steer a write outside the session tree.
+        // Core thread only: it reads the live history.
+        auto session_known = [&](const std::string &sid)
+        {
+            std::error_code ec;
+            return std::filesystem::exists(cell::session_dir(sid), ec) || sid == h.now().id();
+        };
+
         auto dispatch = [&](const cell::serve::request &req, cell::serve::responder &res)
         {
             // ---- authentication (everything but /v1/health) ------------------
@@ -24386,7 +24403,7 @@ int repl::run()
                 std::string sid = seg[2];
                 on_core(r, [&, sid](core_reply &rep)
                 {
-                    if (!std::filesystem::exists(cell::session_dir(sid)))
+                    if (!session_known(sid))
                     {
                         rep.status = 404;
                         rep.body = json{{"error", {{"code", "session_not_found"}, {"message", "no session with id " + sid}}}}.dump();
@@ -24412,7 +24429,7 @@ int repl::run()
                 }
                 on_core(r, [&, sid](core_reply &rep)
                 {
-                    if (!std::filesystem::exists(cell::session_dir(sid)))
+                    if (!session_known(sid))
                     {
                         rep.status = 404;
                         rep.body = json{{"error", {{"code", "session_not_found"}, {"message", "no session with id " + sid}}}}.dump();
@@ -24448,7 +24465,7 @@ int repl::run()
                 }
                 on_core(r, [&, sid, name](core_reply &rep)
                 {
-                    if (!std::filesystem::exists(cell::session_dir(sid)))
+                    if (!session_known(sid))
                     {
                         rep.status = 404;
                         rep.body = json{{"error", {{"code", "session_not_found"}, {"message", "no session with id " + sid}}}}.dump();
@@ -24471,6 +24488,14 @@ int repl::run()
                     }
                     std::string prev = h.now().id();
                     h.use(sid);
+                    // ensure_prompt() only ever fires on an empty transcript, so a
+                    // fresh session (one that has never run a turn) must get its
+                    // system prompt injected BEFORE the skill body lands - otherwise
+                    // the skill would be the only system content and the real prompt
+                    // would never be added. The CLI /skill command always runs after
+                    // the REPL's own ensure_prompt(); REST cannot assume that, so it
+                    // does it here.
+                    ensure_prompt(h.now());
                     // the skill body enters the conversation verbatim (no heavy
                     // fingerprint scan for non-tool channels); the skill name is
                     // untrusted front matter, so control/ANSI chars are stripped
@@ -24496,7 +24521,7 @@ int repl::run()
                     return;
                 on_core(r, [&, sid, body](core_reply &rep)
                 {
-                    if (!std::filesystem::exists(cell::session_dir(sid)))
+                    if (!session_known(sid))
                     {
                         rep.status = 404;
                         rep.body = json{{"error", {{"code", "session_not_found"}, {"message", "no session with id " + sid}}}}.dump();
@@ -24522,7 +24547,7 @@ int repl::run()
                     return;
                 on_core(r, [&, sid, jid, body](core_reply &rep)
                 {
-                    if (!std::filesystem::exists(cell::session_dir(sid)))
+                    if (!session_known(sid))
                     {
                         rep.status = 404;
                         rep.body = json{{"error", {{"code", "session_not_found"}, {"message", "no session with id " + sid}}}}.dump();
@@ -24540,12 +24565,18 @@ int repl::run()
             }
             else if (seg.size() == 5 && seg[0] == "v1" && seg[1] == "sessions" && seg[3] == "teamworks" && req.method == "DELETE")
             {
-                // remove a pending job (refuses running/completed jobs)
+                // remove a job that is neither running nor completed. The `true`
+                // (agent-initiated) is deliberate, not an oversight: this channel is
+                // reachable by anything holding the bearer token - including the
+                // agent itself, through a shell tool that reads server.json - so a
+                // finished job keeps the same protection the agent's own teamwork
+                // tool has. The trusted CLI `/teamworks rm` passes false and can
+                // therefore also drop a completed job.
                 std::string sid = seg[2];
                 std::string jid = seg[4];
                 on_core(r, [&, sid, jid](core_reply &rep)
                 {
-                    if (!std::filesystem::exists(cell::session_dir(sid)))
+                    if (!session_known(sid))
                     {
                         rep.status = 404;
                         rep.body = json{{"error", {{"code", "session_not_found"}, {"message", "no session with id " + sid}}}}.dump();
@@ -24568,10 +24599,20 @@ int repl::run()
                 std::string jid = seg[4];
                 on_core(r, [&, sid, jid](core_reply &rep)
                 {
-                    if (!std::filesystem::exists(cell::session_dir(sid)))
+                    if (!session_known(sid))
                     {
                         rep.status = 404;
                         rep.body = json{{"error", {{"code", "session_not_found"}, {"message", "no session with id " + sid}}}}.dump();
+                        return;
+                    }
+                    // validate before flagging: a stop request for an unknown job
+                    // would never be consumed and would linger in the stop set, and
+                    // the caller would get an "ok" for a job that does not exist
+                    cell::teamwork::job_ref ref;
+                    if (!cell::teamwork::find_job_anywhere(jid, ref, sid))
+                    {
+                        rep.status = 404;
+                        rep.body = json{{"error", {{"code", "job_not_found"}, {"message", "no teamwork " + jid + " in this session or its working directory"}}}}.dump();
                         return;
                     }
                     cell::teamwork::request_stop(jid);
@@ -24585,7 +24626,7 @@ int repl::run()
                 std::string jid = seg[4];
                 on_core(r, [&, sid, jid](core_reply &rep)
                 {
-                    if (!std::filesystem::exists(cell::session_dir(sid)))
+                    if (!session_known(sid))
                     {
                         rep.status = 404;
                         rep.body = json{{"error", {{"code", "session_not_found"}, {"message", "no session with id " + sid}}}}.dump();
@@ -24611,7 +24652,7 @@ int repl::run()
                     return;
                 on_core(r, [&, sid, jid, body](core_reply &rep)
                 {
-                    if (!std::filesystem::exists(cell::session_dir(sid)))
+                    if (!session_known(sid))
                     {
                         rep.status = 404;
                         rep.body = json{{"error", {{"code", "session_not_found"}, {"message", "no session with id " + sid}}}}.dump();
@@ -24635,7 +24676,7 @@ int repl::run()
                 std::string wname = seg[6];
                 on_core(r, [&, sid, jid, wname](core_reply &rep)
                 {
-                    if (!std::filesystem::exists(cell::session_dir(sid)))
+                    if (!session_known(sid))
                     {
                         rep.status = 404;
                         rep.body = json{{"error", {{"code", "session_not_found"}, {"message", "no session with id " + sid}}}}.dump();

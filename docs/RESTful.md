@@ -62,6 +62,15 @@ cell serve: discovery file: /path/to/bin/.cell/server.json
 * `request_id` — e.g. `ap-6ace6d2c-0`, stable for the pending approval.
 * Jobs/teamwork keep their existing ids (`job-N`, worker names).
 
+A session-scoped route accepts a `session_id` when its directory exists **or** it
+is the session the kernel currently has loaded. A session handed out by
+`POST /v1/sessions` is real — and `POST …/turn` accepts it — from the moment it is
+created, even though its directory only appears once the transcript is first
+written (so "create a session, then create a job / compact / load a skill" works
+before the first message). An id that is neither on disk nor active is
+`404 session_not_found`, which also means a crafted id cannot steer a write
+anywhere: it never resolves to a path.
+
 ### Errors
 
 ```json
@@ -72,7 +81,7 @@ cell serve: discovery file: /path/to/bin/.cell/server.json
 | --- | --- | --- |
 | 400 | `bad_request` | malformed JSON / missing field / invalid enum value |
 | 401 | `unauthorized` | missing or wrong bearer token |
-| 404 | `not_found` | unknown route / session / provider / approval |
+| 404 | `not_found`, `session_not_found`, `skill_not_found`, `job_not_found` | unknown route / session / skill / teamwork job / provider / approval |
 | 409 | `busy`, `no_turn` | a turn is already running · interrupt with no turn |
 | 413 | `payload_too_large` | request head > 64 KiB or body > 16 MiB |
 | 422 | `sandbox_blocked`, `notices_rejected` | refused by the sandbox · notice rejected |
@@ -194,10 +203,10 @@ and have child agents appended/removed — all over REST.
 | ✅ | `GET /v1/teamworks` | every session's jobs across all working directories, each tagged with its `session` id |
 | ✅ | `POST /v1/sessions/{id}/teamworks` | create a job; body is the job config (`work-type`, `list`, …); returns `{id, session, ok}`; `400 invalid_job` on a bad config; `404` for an unknown session |
 | ✅ | `PATCH /v1/sessions/{id}/teamworks/{job}` | edit a **pending** job (`400 edit_failed` on a running/completed job) |
-| ✅ | `DELETE /v1/sessions/{id}/teamworks/{job}` | remove a **pending** job (`400 remove_failed` on a running/completed job) |
+| ✅ | `DELETE /v1/sessions/{id}/teamworks/{job}` | remove a job that is **not running and not completed** (`400 remove_failed`). Completed jobs stay protected on this channel on purpose: it is reachable by anything holding the token, including the agent itself, whereas the CLI `/teamworks rm` is a trusted human channel and can drop them |
 | ✅ | `POST /v1/sessions/{id}/teamworks/{job}/run` | run the job **in the background** (non-blocking; `400 run_failed` if it has no child agents or is already running). Poll `GET …/teamworks` for progress. |
 | ✅ | `POST /v1/sessions/{id}/teamworks/{job}/resume` | resume a gated/stopped job from its saved stage (same background semantics as `run`) |
-| ✅ | `POST /v1/sessions/{id}/teamworks/{job}/stop` | cooperative stop — the runner pauses at the next round/stage boundary |
+| ✅ | `POST /v1/sessions/{id}/teamworks/{job}/stop` | cooperative stop — the runner pauses at the next round/stage boundary; `404 job_not_found` for an unknown job |
 | ✅ | `POST /v1/sessions/{id}/teamworks/{job}/workers` | append a child agent to a **pending** job; body is the worker extras (`provider`, `model`, `think`, `works`, `rules`, …) |
 | ✅ | `DELETE /v1/sessions/{id}/teamworks/{job}/workers/{worker}` | remove a child agent from a **pending** job |
 | 🚧 | `GET /v1/teamworks/{job}/report` | per-worker transcript/report (the list already returns per-worker `status`/`rounds`/`tool_calls`) |
