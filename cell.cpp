@@ -11081,26 +11081,46 @@ details{break-inside:avoid}
             // drop the in-memory session and reset to a fresh one; the on-disk file is kept
             void forget_current()
             {
-                auto it = session_list.find(current);
-                if (it != session_list.end())
-                    session_list.erase(it);
+                // one session can be open under two keys at once - "current" and
+                // its full id, because use() re-keys the live session without
+                // clearing the old entry. Erase every alias: dropping only the
+                // current key leaves the id we just left behind, so the "new"
+                // session silently reuses it (/new and POST /v1/sessions after any
+                // turn used to hand back the id they had just left).
+                std::string forgotten;
+                if (auto it = session_list.find(current); it != session_list.end())
+                    forgotten = it->second.id();
+                for (auto it = session_list.begin(); it != session_list.end();)
+                {
+                    if (!forgotten.empty() && it->second.id() == forgotten)
+                        it = session_list.erase(it);
+                    else
+                        ++it;
+                }
                 current = "current";
                 box::reset_read_log(); // fresh context: recorded reads no longer apply
             }
             void remove(const std::string &session_id)
             {
-                for (auto it = session_list.begin(); it != session_list.end(); ++it)
+                // same alias rule as forget_current(): a surviving duplicate would
+                // resurrect the deleted session on the next unload
+                bool found = false;
+                std::error_code ec;
+                for (auto it = session_list.begin(); it != session_list.end();)
                 {
                     if (it->second.id() != session_id)
+                    {
+                        ++it;
                         continue;
+                    }
+                    found = true;
                     std::string key = it->first;
-                    std::error_code ec;
-                    std::filesystem::remove_all(session_dir(session_id), ec);
-                    session_list.erase(it);
+                    it = session_list.erase(it);
                     if (current == key)
                         current = "current";
-                    break;
                 }
+                if (found)
+                    std::filesystem::remove_all(session_dir(session_id), ec);
             }
         };
     } // namespace chat
@@ -19532,6 +19552,28 @@ static int run_selftest()
             auto &fresh = h2.now();
             R.expect(fresh.id() != sid && fresh.msg().empty(), "forget_current switches to a fresh empty session");
             R.expect(cell::box::exist(cell::chat::session(sid).path().string()), "forget_current keeps old session file on disk");
+        }
+        // A turn re-keys the live session to its full id while the "current" entry
+        // survives, so one session can be open under two keys at once. Both
+        // forget_current() and remove() must drop every alias: dropping only one
+        // left the id we had just left behind, and the "new" session reused it
+        // (POST /v1/sessions and /new after any turn), while a deleted session
+        // could be resurrected by its surviving copy on the next unload.
+        {
+            cell::chat::history h4;
+            std::string first = h4.now().id(); // the "current" entry
+            h4.use(first);                     // a turn switches to the full id ...
+            (void)h4.now();                    // ... materialising the second entry
+            h4.forget_current();
+            R.expect(h4.now().id() != first, "forget_current drops every alias of the session");
+        }
+        {
+            cell::chat::history h5;
+            std::string del = h5.now().id();
+            h5.use(del);
+            (void)h5.now();
+            h5.remove(del);
+            R.expect(h5.now().id() != del, "remove drops every alias of the deleted session");
         }
         // the kept file must still reload into a fresh history (i.e. /session <id> can revisit it)
         cell::chat::history h3;
