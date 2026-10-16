@@ -126,7 +126,7 @@ anywhere: it never resolves to a path.
 | ✅ | `POST /v1/sessions` | creates a fresh current session → `201 {id, cwd, previous}` (equivalent of `/new`; uses the server's working directory) |
 | ✅ | `GET /v1/sessions/{id}/messages?after=N&limit=M` | transcript entries verbatim (`role`/`content`/tool calls/reasoning); 404 when the session has no transcript yet |
 | ✅ | `DELETE /v1/sessions/{id}` | removes the session folder; 409 while a turn runs in it |
-| 🚧 | `POST /v1/sessions/{id}/clear` | `/clear` (reset context, keep the file) |
+| ✅ | `POST /v1/sessions/{id}/clear` | `/clear` (reset context, keep the file) |
 | 🚧 | `GET /v1/sessions/{id}/archives` | `/saved list` |
 | 🚧 | `POST /v1/sessions/{id}/export` | the self-contained HTML exporter (`/export`) |
 
@@ -211,7 +211,7 @@ and have child agents appended/removed — all over REST.
 | ✅ | `POST /v1/sessions/{id}/teamworks/{job}/stop` | cooperative stop — the runner pauses at the next round/stage boundary; `404 job_not_found` for an unknown job |
 | ✅ | `POST /v1/sessions/{id}/teamworks/{job}/workers` | append a child agent to a **pending** job; body is the worker extras (`provider`, `model`, `think`, `works`, `rules`, …) |
 | ✅ | `DELETE /v1/sessions/{id}/teamworks/{job}/workers/{worker}` | remove a child agent from a **pending** job |
-| 🚧 | `GET /v1/teamworks/{job}/report` | per-worker transcript/report (the list already returns per-worker `status`/`rounds`/`tool_calls`) |
+| ✅ | `GET /v1/sessions/{sid}/teamworks/{job}/report` | per-worker report: `{session, job, status, work_type, created, workers:[{name, works, provider, model, status, rounds, tool_calls, summary, reviews_approved, reviews_denied, input/output/total_tokens, has_transcript, transcript_bytes, messages?, transcript?}]}`. Counters come from the job's own `summary_reports` and the conversation from the worker's persisted file — nothing is recomputed. `?transcript=1` includes the message array (capped at 4 MiB); `404` unknown job or session |
 
 `run`/`resume` are **background** by design: a teamwork job runs many LLM rounds,
 so the HTTP worker must not block on it. The runner is the same machinery the CLI

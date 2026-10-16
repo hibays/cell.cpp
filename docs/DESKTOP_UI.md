@@ -35,11 +35,11 @@ Anatomy of the target screen, top to bottom:
 | --- | --- | --- | --- |
 | **B1** | structured turn events: `reasoning`, `token`, `tool_call`, `tool_result`, `usage`, `interrupt`, `notice` | ✅ done (P3) except `notice` | the 轨迹 tab, per-turn stats and *streaming* tool cards all need semantics; without them the client must re-fetch the transcript after every turn |
 | **B2** | session metadata in `GET /v1/sessions`: `title`, `updated_at`, `messages`, `cwd` | `id`, `cwd`, `messages`, `snippet` | grouping + relative age + search in the sidebar; without `updated_at` the list cannot be ordered or grouped by recency |
-| **B3** | teamwork detail: `GET /v1/teamworks/{job}/report`, per-worker status/rounds/tools | jobs list + reports only through the CLI/`tw` tool | the "N 个子智能体" chip and the trace view's sub-agent section |
+| **B3** | teamwork detail: `GET /v1/teamworks/{job}/report`, per-worker status/rounds/tools | ✅ done (P5) | the "N 个子智能体" chip and the trace view's sub-agent section |
 | **B4** | per-turn stats: turns, steps (tool calls), decode tok/s, ttft, token totals, cache hit | ✅ done (P3) via the `usage` event (`decode_ms` from the first token, so the rate is honest); turns/steps come from the transcript | the telemetry strip |
 | **B5** | `GET /v1/files?path=` (workspace listing) | ✅ done (P2) | `@` file mentions and the attachment picker |
 | **B6** | `GET /v1/logs?tail=N` | ✅ done (P4) | the right bar's diagnostics tab |
-| **B7** | `GET /v1/sessions/{id}/clear`, `archives`, `export` (documented 🚧) | ✗ | session hygiene in the sidebar |
+| **B7** | `GET /v1/sessions/{id}/clear`, `archives`, `export` (documented 🚧) | ✅ `/clear` done (P5); archives and a REST export still 🚧 | session hygiene in the sidebar |
 
 B1/B2/B4 are on the critical path for phase 1–3; B3 unlocks the trace tab's
 sub-agent view; B5–B7 are later.
@@ -112,9 +112,14 @@ units), `vue-tsc --noEmit`, `vite build` + `embed_webui.mjs`, `cell.cellui_boot`
   edited, derived from the transcript's mutating tool calls — no endpoint needed),
   日志 (the log tail, polled only while the tab is on screen). The viewer reads
   through `GET /v1/files/content`, which is sandboxed to the workdir and marks
-  binary files rather than shipping mojibake. **Still open:** B3 (per-worker
-  `GET /v1/teamworks/{job}/report`), B7 session hygiene (`/clear`, archives,
-  export), diff review inside the viewer, and uploaded (as opposed to
+  binary files rather than shipping mojibake.
+- **P5 — the last two kernel answers.** B3 per-worker
+  `GET /v1/sessions/{sid}/teamworks/{job}/report` (counters read from the run's own
+  `summary_reports`, the child's transcript on request), surfaced as a 子智能体
+  block in the trace view; and B7's `/clear` as `POST /v1/sessions/{id}/clear`
+  with the CLI's guards — it refuses while a turn or a background job runs — plus
+  the `/clear` command in the composer. **Still open:** session archives, a REST
+  export endpoint, diff review inside the viewer, and uploaded (as opposed to
   referenced) attachments.
 
 ## 5. Non-goals and constraints
