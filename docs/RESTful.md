@@ -189,7 +189,8 @@ in the directory *is* the install step. The two write-free reads plus the
 | ✅ | `POST /v1/sessions/{id}/skills/{name}` | load a skill into a session — the REST twin of the CLI `/skill NAME`: the body joins the leading system block. `{session, name, loaded, chars}`; `404` unknown session/skill; `409 busy` while a turn runs |
 | ✅ | `GET /v1/usages` | `.cell/usages.json` (`{models:{…}, sessions:{…}}`; records carry `cached_tokens`/`prompt_tokens` when the provider reports a prompt cache) |
 | ✅ | `GET /v1/files?path=` | one directory level under the session's working directory, for the shell's `@`-mentions and its attachment picker: `{cwd, path, entries:[{name, path, dir, size, mtime}], truncated}`, hidden entries skipped, directories first, paths relative to the workdir. `400 path_outside_workdir` when the path escapes the workdir (symlinks resolved first) |
-| 🚧 | `GET /v1/logs?tail=N` | tail of `.cell/logs/cell.log` |
+| ✅ | `GET /v1/files/content?path=&max=` | one workspace file's content for the viewer: `{path, name, size, mtime, truncated, binary, content}`. Same containment rule as the listing; `max` defaults to 256 KiB and is capped at 1 MiB; a NUL byte marks the file `binary` and ships no content; UTF-8 is sanitised for the JSON round trip. `400` for a missing/escaping path or a directory, `404` unreadable |
+| ✅ | `GET /v1/logs?tail=N` | tail of `.cell/logs/cell.log`: `{path, size, truncated, lines}`. The buffer is flushed first — without that the pane would show an empty file while the process is running — and only the last 512 KiB are read; `tail` defaults to 200 and is capped at 2000 |
 
 ### 3.9 Teamwork
 
@@ -250,7 +251,7 @@ Each event is one `data: <json>` line; the JSON is `{"type": …, "data": {…}}
 | ✅ | `tool_result` | `{id, name, status, seconds, output, truncated}` | that call finished; `id` is the pairing key (two calls to the same tool is the normal case). `status` is the kernel's `ok`/`failed`/`unknown`/`exception`/`blocked`, and `output` is capped at 16 KiB with `truncated` set — the full text is in the transcript |
 | ✅ | `usage` | `{in_tokens, out_tokens, total_tokens, cached_tokens, prompt_tokens, request_ms, decode_ms}` | one measurement per LLM request (a turn with tool calls has several). `decode_ms` runs from the first token, so `out_tokens / decode_ms` is a decode rate rather than a flattered one |
 | ✅ | `interrupt` | `{partial_chars}` | a cancel was observed: the partial answer is final, not still arriving |
-| 🚧 | `notice` | `{…}` | notices posted for the running session, streamed instead of polled |
+| ✅ | `notice` | `{id, session, from, topic, body, created_at}` | a notice posted for the session that stream belongs to. Notices are still queued for `GET /v1/notices` (the CLI polls); the event is the shell's way of seeing one arrive. A notice for another session is dropped by the stream's sink |
 
 ---
 

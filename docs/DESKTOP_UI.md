@@ -38,7 +38,7 @@ Anatomy of the target screen, top to bottom:
 | **B3** | teamwork detail: `GET /v1/teamworks/{job}/report`, per-worker status/rounds/tools | jobs list + reports only through the CLI/`tw` tool | the "N 个子智能体" chip and the trace view's sub-agent section |
 | **B4** | per-turn stats: turns, steps (tool calls), decode tok/s, ttft, token totals, cache hit | ✅ done (P3) via the `usage` event (`decode_ms` from the first token, so the rate is honest); turns/steps come from the transcript | the telemetry strip |
 | **B5** | `GET /v1/files?path=` (workspace listing) | ✅ done (P2) | `@` file mentions and the attachment picker |
-| **B6** | `GET /v1/logs?tail=N` (documented 🚧) | ✗ | a right bar for diagnostics; low priority |
+| **B6** | `GET /v1/logs?tail=N` | ✅ done (P4) | the right bar's diagnostics tab |
 | **B7** | `GET /v1/sessions/{id}/clear`, `archives`, `export` (documented 🚧) | ✗ | session hygiene in the sidebar |
 
 B1/B2/B4 are on the critical path for phase 1–3; B3 unlocks the trace tab's
@@ -106,10 +106,16 @@ units), `vue-tsc --noEmit`, `vite build` + `embed_webui.mjs`, `cell.cellui_boot`
   The shell folds the events into a live turn (lib/liveTurn.ts) and renders
   reasoning, tool cards, tok/s and cache hit *while the turn runs*; the trace tab
   shows the running turn instead of waiting for it to end.
-- **P4 — depth.** B3 (per-worker `GET /v1/teamworks/{job}/report`), B6 logs tail,
-  B7 session hygiene (`/clear`, archives, export), `notice` events, diff review,
-  a files panel in the right bar, uploaded (as opposed to referenced)
-  attachments.
+- **P4 — depth (done, except as listed).** B6 logs tail, `notice` events streamed
+  with a per-session filter, and the right-hand panel is real: 文件 (browse the
+  workdir + a capped, highlighted viewer), 改动 (files this session has written or
+  edited, derived from the transcript's mutating tool calls — no endpoint needed),
+  日志 (the log tail, polled only while the tab is on screen). The viewer reads
+  through `GET /v1/files/content`, which is sandboxed to the workdir and marks
+  binary files rather than shipping mojibake. **Still open:** B3 (per-worker
+  `GET /v1/teamworks/{job}/report`), B7 session hygiene (`/clear`, archives,
+  export), diff review inside the viewer, and uploaded (as opposed to
+  referenced) attachments.
 
 ## 5. Non-goals and constraints
 
