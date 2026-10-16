@@ -33,10 +33,10 @@ Anatomy of the target screen, top to bottom:
 
 | id | capability | today | why the UI needs it |
 | --- | --- | --- | --- |
-| **B1** | structured turn events: `reasoning`, `token`, `tool_call`, `tool_result`, `usage`, `interrupt`, `notice` | only `turn_start`/`output`/`approval_request`/`error`/`turn_done` (raw stdout capture) | the 轨迹 tab, per-turn stats and *streaming* tool cards all need semantics; today the client must re-fetch the transcript after every turn and can never show a tool card while it runs |
+| **B1** | structured turn events: `reasoning`, `token`, `tool_call`, `tool_result`, `usage`, `interrupt`, `notice` | ✅ done (P3) except `notice` | the 轨迹 tab, per-turn stats and *streaming* tool cards all need semantics; without them the client must re-fetch the transcript after every turn |
 | **B2** | session metadata in `GET /v1/sessions`: `title`, `updated_at`, `messages`, `cwd` | `id`, `cwd`, `messages`, `snippet` | grouping + relative age + search in the sidebar; without `updated_at` the list cannot be ordered or grouped by recency |
 | **B3** | teamwork detail: `GET /v1/teamworks/{job}/report`, per-worker status/rounds/tools | jobs list + reports only through the CLI/`tw` tool | the "N 个子智能体" chip and the trace view's sub-agent section |
-| **B4** | per-turn stats: turns, steps (tool calls), decode tok/s, ttft, token totals, cache hit | `/v1/usages` aggregates only | the telemetry strip |
+| **B4** | per-turn stats: turns, steps (tool calls), decode tok/s, ttft, token totals, cache hit | ✅ done (P3) via the `usage` event (`decode_ms` from the first token, so the rate is honest); turns/steps come from the transcript | the telemetry strip |
 | **B5** | `GET /v1/files?path=` (workspace listing) | ✅ done (P2) | `@` file mentions and the attachment picker |
 | **B6** | `GET /v1/logs?tail=N` (documented 🚧) | ✗ | a right bar for diagnostics; low priority |
 | **B7** | `GET /v1/sessions/{id}/clear`, `archives`, `export` (documented 🚧) | ✗ | session hygiene in the sidebar |
@@ -97,12 +97,19 @@ units), `vue-tsc --noEmit`, `vite build` + `embed_webui.mjs`, `cell.cellui_boot`
   `Y` / `N`; plus kernel **B5** (read-only file listing, sandboxed to the
   working directory) which is what makes `@` files and the attachment picker
   real rather than decorative.
-- **P3 — semantic stream.** Kernel **B1** (structured events) + B4 (per-turn
-  stats) + B3 (sub-agent detail); the trace view becomes live and the telemetry
-  strip shows tok/s and cache hit for the running turn.
-- **P4 — depth.** B6 logs tail, B7 session hygiene (`/clear`, archives, export),
-  diff review, a files panel in the right bar, uploaded (as opposed to
-  referenced) attachments.
+- **P3 — semantic stream (done).** Kernel **B1**: the turn engine emits `token`,
+  `reasoning`, `tool_call`, `tool_result`, `usage` and `interrupt` through a
+  process-wide sink that only the service layer installs (the CLI pays one null
+  check per delta), paired by tool-call id and capped where a live stream should
+  not carry a transcript. **B4** rides on the `usage` event, whose `decode_ms`
+  starts at the first token so the decode rate is measured rather than flattered.
+  The shell folds the events into a live turn (lib/liveTurn.ts) and renders
+  reasoning, tool cards, tok/s and cache hit *while the turn runs*; the trace tab
+  shows the running turn instead of waiting for it to end.
+- **P4 — depth.** B3 (per-worker `GET /v1/teamworks/{job}/report`), B6 logs tail,
+  B7 session hygiene (`/clear`, archives, export), `notice` events, diff review,
+  a files panel in the right bar, uploaded (as opposed to referenced)
+  attachments.
 
 ## 5. Non-goals and constraints
 
