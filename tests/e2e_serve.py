@@ -626,9 +626,36 @@ def run_once(attempt: int) -> bool:
         assert "### 你" in md["markdown"] and "### cell" in md["markdown"], md["markdown"][:300]
         js = api(base, token, "GET", f"/v1/sessions/{esid}/export")
         assert js["format"] == "json" and isinstance(js["messages"], list) and js["messages"], js
+        # html is the self-contained page the CLI writes, teamwork pane included
+        html = api(base, token, "GET", f"/v1/sessions/{esid}/export?format=html")
+        assert html["format"] == "html" and html["html"].lstrip().startswith("<!DOCTYPE html>"), html["html"][:80]
+        assert "</html>" in html["html"][-200:], html["html"][-120:]
         assert api_code(base, token, "GET", f"/v1/sessions/{esid}/export?format=pdf") == 400
         assert api_code(base, token, "GET", "/v1/sessions/ghost-x/export?format=md") == 404
-        print(f"export: md ({md['count']} messages) + json, refusals")
+        print(f"export: md ({md['count']}) + json + html ({len(html['html'])} bytes), refusals")
+
+        # ---- a second turn waits its turn instead of being refused ----
+        # The core runs one turn at a time on purpose, but refusing loses the
+        # message: the other session's turn must come through, after a wait.
+        slow_sid = api(base, token, "POST", "/v1/sessions")["id"]
+        other_sid = api(base, token, "POST", "/v1/sessions")["id"]
+
+        def slow_turn2():
+            try:
+                api(base, token, "POST", f"/v1/sessions/{slow_sid}/turn", {"text": "占着核心 [SLOW]"})
+            except Exception:
+                pass
+
+        st = threading.Thread(target=slow_turn2)
+        st.start()
+        time.sleep(0.6)
+        queued = api(base, token, "POST", f"/v1/sessions/{other_sid}/turn", {"text": "排队等我"})
+        st.join(timeout=30)
+        assert "mock reply" in queued.get("output", ""), queued
+        assert queued.get("waited_ms", 0) > 0, f"the second turn did not wait: {queued.get('waited_ms')}"
+        # the queued session has its own transcript: they really were different sessions
+        assert api(base, token, "GET", f"/v1/sessions/{other_sid}/messages")["messages"]
+        print(f"queued turn: waited {queued['waited_ms']}ms and then ran")
 
         # ---- per-worker report: the trace view's sub-agent block ----
         jid = job2.get("job") or job2.get("id") or job2.get("job_id")
