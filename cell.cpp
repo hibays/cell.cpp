@@ -13210,12 +13210,117 @@ details{break-inside:avoid}
             return true;
         }
 
+        // Per-worker report for one job: what each child agent actually did, and
+        // on request its transcript. The counters come from the job's
+        // summary_reports and the conversation from the worker's own file under
+        // the job directory — nothing here is recomputed, so the numbers are the
+        // ones the run reported. An empty object means "no such job", which the
+        // REST layer turns into a 404.
+        static nlohmann::json teamwork_report_json(const std::string &sid, const std::string &job_id,
+                                                   bool want_transcript)
+        {
+            nlohmann::json empty;
+            cell::async_io::flush(); // a store-cache miss reads the file
+            nlohmann::json store = load_store_from(cell::session_dir(sid) / "teamworks.json");
+            auto jobs = store.find("jobs");
+            if (jobs == store.end() || !jobs->is_object())
+                return empty;
+            const nlohmann::json *job = nullptr;
+            for (auto it = jobs->begin(); it != jobs->end(); ++it)
+                if (it->is_object() && (it.key() == job_id || jstr(*it, "id", "") == job_id))
+                {
+                    job = &(*it);
+                    break;
+                }
+            if (!job)
+                return empty;
+            nlohmann::json out{{"session", sid},
+                               {"job", jstr(*job, "id", job_id)},
+                               {"status", jstr(*job, "status", "pending")},
+                               {"work_type", jstr(*job, "work_type", "serial")},
+                               {"created", creation_stamp(jint(*job, "created_at", 0))},
+                               {"workers", nlohmann::json::array()}};
+            const nlohmann::json *reports = nullptr;
+            if (auto it = job->find("summary_reports"); it != job->end() && it->is_object())
+                reports = &(*it);
+            std::filesystem::path dir = job_dir_of(*job, store_path(sid));
+            auto list = job->find("list");
+            if (list == job->end() || !list->is_array())
+                return out;
+            int index = 0;
+            for (auto &w : *list)
+            {
+                std::string name = jstr(w, "name", std::format("worker_{}", index));
+                nlohmann::json wv;
+                wv["name"] = name;
+                wv["works"] = jstr(w, "works");
+                wv["provider"] = jstr(w, "provider");
+                wv["model"] = jstr(w, "model");
+                wv["status"] = "pending";
+                wv["rounds"] = 0;
+                wv["tool_calls"] = 0;
+                if (reports)
+                    if (auto rr = reports->find(name); rr != reports->end() && rr->is_object())
+                    {
+                        wv["status"] = jstr(*rr, "status", "pending");
+                        wv["rounds"] = jint(*rr, "rounds", 0);
+                        wv["tool_calls"] = jint(*rr, "tool_calls", 0);
+                        wv["summary"] = jstr(*rr, "summary");
+                        wv["reviews_approved"] = jint(*rr, "reviews_approved", 0);
+                        wv["reviews_denied"] = jint(*rr, "reviews_denied", 0);
+                        wv["input_tokens"] = jint(*rr, "input_tokens", 0);
+                        wv["output_tokens"] = jint(*rr, "output_tokens", 0);
+                        wv["total_tokens"] = jint(*rr, "total_tokens", 0);
+                        if (wv["provider"].get<std::string>().empty())
+                            wv["provider"] = jstr(*rr, "provider");
+                        if (wv["model"].get<std::string>().empty())
+                            wv["model"] = jstr(*rr, "model");
+                    }
+                // the child's own transcript, when asked for: capped, because a
+                // long worker run is megabytes and the panel wants a page
+                std::error_code fec;
+                std::filesystem::path wf = worker_file_path(dir, name, index);
+                if (std::filesystem::exists(wf, fec))
+                {
+                    // size only: the report does not need the worker's mtime, and
+                    // box::file_stat's second parameter is a clock time point
+                    std::error_code sec;
+                    long long wsize = (long long)std::filesystem::file_size(wf, sec);
+                    if (sec)
+                        wsize = -1;
+                    wv["transcript_bytes"] = wsize;
+                    wv["has_transcript"] = true;
+                    if (want_transcript && wsize > 0 && wsize <= 4 * 1024 * 1024)
+                    {
+                        std::string raw;
+                        if (cell::box::read(wf.string(), raw))
+                        {
+                            auto parsed = nlohmann::json::parse(raw, nullptr, false);
+                            if (!parsed.is_discarded() && parsed.is_object())
+                            {
+                                wv["reused"] = jbool(parsed, "reused", false);
+                                if (auto msgs = parsed.find("messages"); msgs != parsed.end() && msgs->is_array())
+                                {
+                                    wv["messages"] = (int)msgs->size();
+                                    if (want_transcript)
+                                        wv["transcript"] = *msgs;
+                                }
+                            }
+                        }
+                    }
+                }
+                out["workers"].push_back(wv);
+                index++;
+            }
+            return out;
+        }
+
         // export view of one session's jobs: the store record plus each child's
         // persisted transcript. `chat` renders this; /export calls it on demand.
         static void collect_export_jobs(const std::string &session_id, std::vector<cell::chat::teamwork_job_view> &out)
         {
             std::filesystem::path store_p = cell::session_dir(session_id) / "teamworks.json";
-            // read through the store cache exactly like teamworks_json(): an
+        // read through the store cache exactly like teamworks_json(): an
             // exists() probe would miss a job whose file is still queued for the
             // async writer (every mutation updates the cache synchronously but
             // writes the file in the background)
@@ -24932,6 +25037,101 @@ int repl::run()
                 on_core(r, [&](core_reply &rep)
                 {
                     rep.body = json{{"jobs", cell::teamwork::teamworks_all_json(h.now().id())}}.dump();
+                });
+            }
+            else if (seg.size() == 6 && seg[0] == "v1" && seg[1] == "sessions" && seg[3] == "teamworks" && seg[5] == "report" && req.method == "GET")
+            {
+                std::string sid = seg[2];
+                std::string job = seg[4];
+                bool want_transcript = false;
+                if (auto it = req.query.find("transcript"); it != req.query.end() && (it->second == "1" || it->second == "true"))
+                    want_transcript = true;
+                on_core(r, [&, sid, job, want_transcript](core_reply &rep)
+                {
+                    if (!session_known(sid))
+                    {
+                        rep.status = 404;
+                        rep.body = json{{"error", {{"code", "session_not_found"}, {"message", "no session with id " + sid}}}}.dump();
+                        return;
+                    }
+                    nlohmann::json body = cell::teamwork::teamwork_report_json(sid, job, want_transcript);
+                    if (body.empty())
+                    {
+                        rep.status = 404;
+                        rep.body = json{{"error", {{"code", "job_not_found"}, {"message", "no teamwork job " + job}}}}.dump();
+                        return;
+                    }
+                    rep.body = body.dump();
+                });
+            }
+            else if (seg.size() == 4 && seg[0] == "v1" && seg[1] == "sessions" && seg[3] == "clear" && req.method == "POST")
+            {
+                // The REST twin of the CLI's /clear, guards and all: a background
+                // job holds a snapshot of its reports, so wiping the store under
+                // it would lose them and leave directories the store can no longer
+                // reach. The transcript an interrupt could resume goes with it,
+                // and the recorded reads no longer apply to an empty context.
+                std::string sid = seg[2];
+                if (serve_bridge.turn_active.load())
+                {
+                    res.error(409, "busy", "a turn is running; clear after it finishes");
+                    return;
+                }
+                on_core(r, [&, sid](core_reply &rep)
+                {
+                    if (!session_known(sid))
+                    {
+                        rep.status = 404;
+                        rep.body = json{{"error", {{"code", "session_not_found"}, {"message", "no session with id " + sid}}}}.dump();
+                        return;
+                    }
+                    std::string running;
+                    {
+                        nlohmann::json store = cell::teamwork::load_store(sid);
+                        if (auto jobs = store.find("jobs"); jobs != store.end() && jobs->is_object())
+                            for (auto &[jid, jb] : jobs->items())
+                                if (jb.value("status", "") == "running")
+                                {
+                                    running = jid;
+                                    break;
+                                }
+                    }
+                    if (!running.empty())
+                    {
+                        rep.status = 409;
+                        rep.body = json{{"error", {{"code", "teamwork_running"},
+                                                  {"message", "stop " + running + " first, then clear"}}}}
+                                      .dump();
+                        return;
+                    }
+                    std::string prev = h.now().id();
+                    h.use(sid);
+                    long long before = (long long)h.now().msg().size();
+                    h.now().msg().clear();
+                    h.now().clear_interrupt();
+                    cell::box::reset_read_log();
+                    long long jobs_removed = 0;
+                    {
+                        nlohmann::json store = cell::teamwork::load_store(sid);
+                        auto jobs = store.find("jobs");
+                        if (jobs != store.end() && jobs->is_object())
+                        {
+                            std::error_code rec;
+                            for (auto &[jid, jb] : jobs->items())
+                            {
+                                std::filesystem::remove_all(cell::teamwork::job_storage_dir(jb, sid), rec);
+                                jobs_removed++;
+                            }
+                        }
+                        cell::teamwork::save_store(sid, nlohmann::json::object());
+                    }
+                    ensure_prompt(h.now());
+                    h.now().unload();
+                    cell::async_io::flush();
+                    if (!prev.empty() && prev != sid)
+                        h.use(prev);
+                    cell::sys::logger::instance().info("sess", std::format("cleared id={} msgs_before={}", sid, before));
+                    rep.body = json{{"session", sid}, {"cleared", true}, {"removed", before}, {"jobs", jobs_removed}}.dump();
                 });
             }
             else if (seg.size() == 4 && seg[0] == "v1" && seg[1] == "sessions" && seg[3] == "compact" && req.method == "POST")
