@@ -502,6 +502,21 @@ def run_once(attempt: int) -> bool:
         assert "slow" in nturn.get("output", ""), nturn.get("output", "")[:60]
         print("notice event streamed:", notices[0]["topic"], "(cross-session filtered)")
 
+        # ---- export: the browser fallback for the native shell's HTML export --
+        esid = api(base, token, "POST", "/v1/sessions")["id"]
+        api(base, token, "POST", f"/v1/sessions/{esid}/turn", {"text": "导出前的一句"})
+        md = api(base, token, "GET", f"/v1/sessions/{esid}/export?format=md")
+        assert md["format"] == "md" and md["count"] >= 2, md
+        assert "导出前的一句" in md["markdown"], md["markdown"][:200]
+        assert md["markdown"].startswith(f"# cell session {esid}"), md["markdown"][:60]
+        # the reply is a transcript, not a terminal dump
+        assert "### 你" in md["markdown"] and "### cell" in md["markdown"], md["markdown"][:300]
+        js = api(base, token, "GET", f"/v1/sessions/{esid}/export")
+        assert js["format"] == "json" and isinstance(js["messages"], list) and js["messages"], js
+        assert api_code(base, token, "GET", f"/v1/sessions/{esid}/export?format=pdf") == 400
+        assert api_code(base, token, "GET", "/v1/sessions/ghost-x/export?format=md") == 404
+        print(f"export: md ({md['count']} messages) + json, refusals")
+
         # ---- per-worker report: the trace view's sub-agent block ----
         jid = job2.get("job") or job2.get("id") or job2.get("job_id")
         assert jid, job2
