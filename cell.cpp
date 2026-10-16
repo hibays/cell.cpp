@@ -5884,11 +5884,16 @@ namespace cell
                         }
                     }
                 }
+                // Inside the mutex: two threads logging at once used to interleave
+                // their console lines, which shows up in the log as garbled
+                // timestamps followed by stray bytes.
                 if (console)
                 {
                     // leading newline to avoid log appearing right after unfinished streaming content
                     std::fputc('\n', stderr);
+                    std::fflush(stderr);
                     eprintln(c, "{}", line);
+                    std::fflush(stdout);
                 }
             }
 
@@ -25077,7 +25082,10 @@ int repl::run()
                     {
                     }
                 }
-                res.json(200, cell::serve::log_tail_json(tail));
+                cell::sys::logger::instance().error("serve", "logs_route_enter");
+                nlohmann::json tail_out = cell::serve::log_tail_json(tail);
+                cell::sys::logger::instance().error("serve", std::format("logs_route_exit lines={}", (int)tail_out["lines"].size()));
+                res.json(200, tail_out);
                 return;
             }
             if (seg.size() == 2 && seg[0] == "v1" && seg[1] == "skills" && req.method == "GET")
