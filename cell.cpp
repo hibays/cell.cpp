@@ -16615,6 +16615,87 @@ details{break-inside:avoid}
             return out;
         }
 
+        // Is `rel` (interpreted inside `root`) still inside `root`? Symlinks are
+        // resolved first, so `link -> /etc` cannot be used to step out. Used by
+        // the read-only file listing that feeds the shell's @-mentions: an
+        // endpoint that happily walks `../../..` would render the whole disk for
+        // anyone holding the token.
+        inline bool resolve_within(const std::filesystem::path &root, const std::string &rel,
+                                   std::filesystem::path &out)
+        {
+            std::error_code ec;
+            std::filesystem::path root_canon = std::filesystem::weakly_canonical(root, ec);
+            if (ec)
+                return false;
+            std::filesystem::path canon = std::filesystem::weakly_canonical(rel.empty() ? root_canon : (root_canon / rel), ec);
+            if (ec)
+                return false;
+            std::string r = root_canon.generic_string(), s = canon.generic_string();
+            if (s.size() < r.size() || s.compare(0, r.size(), r) != 0)
+                return false;
+            if (s.size() != r.size() && s[r.size()] != '/') // "proj" must not match "project"
+                return false;
+            out = canon;
+            return true;
+        }
+
+        // One directory level, directories first then by name, hidden entries
+        // skipped — the same rule the rg/find walker applies, so what the picker
+        // offers is what the tools will actually search. Paths come back relative
+        // to the working directory, which is the form a prompt can carry.
+        inline nlohmann::json files_json(const std::filesystem::path &dir, size_t limit = 400)
+        {
+            nlohmann::json entries = nlohmann::json::array();
+            std::error_code ec;
+            std::filesystem::path wd = cell::workdir();
+            std::error_code rec;
+            std::filesystem::path rel_dir = std::filesystem::relative(dir, wd, rec);
+            nlohmann::json reply{{"cwd", wd.generic_string()},
+                                 {"path", rec ? std::string(".") : rel_dir.generic_string()},
+                                 {"entries", entries},
+                                 {"truncated", false}};
+            if (!std::filesystem::is_directory(dir, ec))
+                return reply;
+            std::vector<nlohmann::json> rows;
+            for (auto &e : std::filesystem::directory_iterator(dir, ec))
+            {
+                if (ec)
+                    break;
+                std::string name = e.path().filename().string();
+                if (name.empty() || name.front() == '.')
+                    continue;
+                std::error_code tec;
+                bool is_dir = e.is_directory(tec);
+                std::error_code sec;
+                long long size = is_dir ? 0 : (long long)std::filesystem::file_size(e.path(), sec);
+                if (sec)
+                    size = -1;
+                std::error_code mec;
+                auto mtime = std::filesystem::last_write_time(e.path(), mec);
+                std::error_code rtec;
+                std::filesystem::path rel = std::filesystem::relative(e.path(), wd, rtec);
+                rows.push_back(nlohmann::json{{"name", name},
+                                              {"path", rtec ? e.path().filename().generic_string() : rel.generic_string()},
+                                              {"dir", is_dir},
+                                              {"size", size},
+                                              {"mtime", mec ? 0LL : unix_seconds(mtime)}});
+            }
+            std::sort(rows.begin(), rows.end(), [](const nlohmann::json &a, const nlohmann::json &b)
+                      {
+                          if (a["dir"].get<bool>() != b["dir"].get<bool>())
+                              return a["dir"].get<bool>();
+                          return a["name"].get<std::string>() < b["name"].get<std::string>();
+                      });
+            reply["truncated"] = rows.size() > limit;
+            for (size_t i = 0; i < std::min(rows.size(), limit); i++)
+                entries.push_back(std::move(rows[i]));
+            // the reply was built before the rows existed, and the initializer
+            // list copied `entries`: without this assignment every response
+            // carried an empty list
+            reply["entries"] = std::move(entries);
+            return reply;
+        }
+
         inline nlohmann::json messages_json(const std::string &sid, size_t after, size_t limit)
         {
             cell::chat::session s(sid);
@@ -24217,6 +24298,23 @@ int repl::run()
             if (seg.size() == 2 && seg[0] == "v1" && seg[1] == "skills" && req.method == "GET")
             {
                 res.json(200, json{{"skills", cell::serve::skills_json()}});
+                return;
+            }
+            if (seg.size() == 2 && seg[0] == "v1" && seg[1] == "files" && req.method == "GET")
+            {
+                // Read-only listing for the shell's @-mentions and its attachment
+                // picker. The root is the session's working directory and `path`
+                // is resolved *inside* it: without that check the endpoint would
+                // happily enumerate the whole disk for anyone holding the token.
+                auto it_path = req.query.find("path");
+                std::string rel = it_path == req.query.end() ? "" : it_path->second;
+                std::filesystem::path dir;
+                if (!cell::serve::resolve_within(cell::workdir(), rel, dir))
+                {
+                    res.error(400, "path_outside_workdir", "path escapes the working directory");
+                    return;
+                }
+                res.json(200, cell::serve::files_json(dir));
                 return;
             }
             if (seg.size() == 3 && seg[0] == "v1" && seg[1] == "skills" && req.method == "GET")

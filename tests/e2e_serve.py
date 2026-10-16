@@ -280,6 +280,28 @@ def run_once(attempt: int) -> bool:
         assert "mock reply" in after.get("output", ""), after
         print("post-compact turn:", after.get("output", "")[:40])
 
+        # ---- file listing: the shell's @-mentions and attachment picker ----
+        # Read-only and rooted at the working directory: a path that leaves it
+        # must be refused, or the endpoint would enumerate the whole disk for
+        # anyone holding the token.
+        (root / "probe.txt").write_text("hello")
+        (root / "subdir").mkdir(exist_ok=True)
+        (root / ".hidden").write_text("no")
+        listing = api(base, token, "GET", "/v1/files")
+        names = [e["name"] for e in listing["entries"]]
+        assert "probe.txt" in names, names
+        assert "subdir" in names, names
+        assert ".hidden" not in names, f"hidden entries must stay hidden: {names}"
+        dirs = [bool(e["dir"]) for e in listing["entries"]]
+        assert dirs == sorted(dirs, reverse=True), f"directories sort first: {dirs}"
+        rel = {e["name"]: e["path"] for e in listing["entries"]}
+        assert rel["probe.txt"] == "probe.txt" and rel["subdir"] == "subdir", rel
+        sub = api(base, token, "GET", "/v1/files?path=subdir")
+        assert sub["path"] == "subdir", sub
+        assert api_code(base, token, "GET", "/v1/files?path=../..") == 400
+        assert api_code(base, token, "GET", "/v1/files?path=../../etc") == 400
+        print("file listing: entries + workdir containment enforced")
+
         # ---- skills: inventory, body read, and the /skill load twin ----
         # Skills are scanned fresh from <CELL_ROOT>/skills on every call, so the
         # fixture can be dropped in after the kernel is already serving.
