@@ -11338,7 +11338,9 @@ details{break-inside:avoid}
                         long long input_chars, long long output_chars,
                         std::optional<long long> input_tokens, std::optional<long long> output_tokens,
                         std::optional<long long> total_tokens,
-                        long long messages = 0)
+                        long long messages = 0,
+                        std::optional<long long> cached_tokens = std::nullopt,
+                        std::optional<long long> prompt_tokens = std::nullopt)
         {
             std::lock_guard<std::mutex> lk(stats_mutex());
             auto &j = mem();
@@ -11354,6 +11356,14 @@ details{break-inside:avoid}
                     rec["output_tokens"] = (long long)num_arg(rec, "output_tokens", 0) + *output_tokens;
                 if (total_tokens)
                     rec["total_tokens"] = (long long)num_arg(rec, "total_tokens", 0) + *total_tokens;
+                // prompt-cache counters are carried separately from input_tokens:
+                // for the Anthropic shape input_tokens *excludes* cache reads, so a
+                // hit rate derived from it would be too high. The shell shows the
+                // running totals, and cached/prompt is the rate the log line prints.
+                if (cached_tokens && *cached_tokens > 0)
+                    rec["cached_tokens"] = (long long)num_arg(rec, "cached_tokens", 0) + *cached_tokens;
+                if (prompt_tokens && *prompt_tokens > 0)
+                    rec["prompt_tokens"] = (long long)num_arg(rec, "prompt_tokens", 0) + *prompt_tokens;
             };
             auto &sess = j["sessions"][session_id];
             if (!sess.is_object())
@@ -11399,11 +11409,12 @@ details{break-inside:avoid}
         }
         static std::string fmt(const nlohmann::json &rec)
         {
-            return std::format("requests={} messages={} in_chars={} out_chars={} in_tok={} out_tok={} total_tok={}",
+            return std::format("requests={} messages={} in_chars={} out_chars={} in_tok={} out_tok={} total_tok={} cached_tok={}/{}",
                                (long long)num_arg(rec, "requests", 0), (long long)num_arg(rec, "messages", 0),
                                (long long)num_arg(rec, "input_chars", 0), (long long)num_arg(rec, "output_chars", 0),
                                (long long)num_arg(rec, "input_tokens", 0), (long long)num_arg(rec, "output_tokens", 0),
-                               (long long)num_arg(rec, "total_tokens", 0));
+                               (long long)num_arg(rec, "total_tokens", 0),
+                               (long long)num_arg(rec, "cached_tokens", 0), (long long)num_arg(rec, "prompt_tokens", 0));
         }
         static std::string summarize()
         {
@@ -16493,6 +16504,15 @@ details{break-inside:avoid}
         }
 
         // The session catalogue: the same scan /sessions performs, in JSON.
+        // Unix seconds for a filesystem timestamp (file_clock's epoch is
+        // unspecified; to_sys() is the standard bridge).
+        inline long long unix_seconds(std::filesystem::file_time_type t)
+        {
+            return (long long)std::chrono::duration_cast<std::chrono::seconds>(
+                       std::chrono::file_clock::to_sys(t).time_since_epoch())
+                .count();
+        }
+
         inline nlohmann::json sessions_json()
         {
             cell::async_io::flush(); // listings must reflect queued session writes
@@ -16520,7 +16540,19 @@ details{break-inside:avoid}
                     std::error_code fec;
                     if (!std::filesystem::exists(tf, fec))
                         continue;
-                    nlohmann::json e{{"id", f.path().filename().string()}, {"cwd", group_cwd}, {"messages", 0}, {"snippet", ""}};
+                    // `title` is the first user turn as-is (newlines folded, kept
+                    // longer than the 60-char `snippet`) and `updated_at` is the
+                    // transcript's mtime: the shell groups and orders by recency and
+                    // shows a relative age, which the id cannot express.
+                    nlohmann::json e{{"id", f.path().filename().string()},
+                                     {"cwd", group_cwd},
+                                     {"messages", 0},
+                                     {"snippet", ""},
+                                     {"title", ""},
+                                     {"updated_at", 0LL}};
+                    auto mtime = std::filesystem::last_write_time(tf, fec);
+                    if (!fec)
+                        e["updated_at"] = unix_seconds(mtime);
                     try
                     {
                         std::ifstream fin(tf);
@@ -16549,6 +16581,19 @@ details{break-inside:avoid}
                                     }
                             if (!snip.empty())
                             {
+                                std::string title;
+                                title.reserve(snip.size());
+                                for (char ch : snip) // one line: the row is a single line
+                                {
+                                    if (ch == '\r')
+                                        continue;
+                                    title += (ch == '\n' || ch == '\t') ? ' ' : ch;
+                                }
+                                while (!title.empty() && title.front() == ' ')
+                                    title.erase(title.begin());
+                                if (title.size() > 120)
+                                    title = title.substr(0, 120);
+                                e["title"] = title;
                                 if (snip.size() > 60)
                                     snip = snip.substr(0, 57) + "...";
                                 e["snippet"] = snip;
@@ -21206,6 +21251,34 @@ int repl::run()
             return std::nullopt;
         return (double)cached / (double)total;
     };
+    // The same two numbers the rate above is made of, for the usage counters.
+    auto usage_cache_counts = [](const nlohmann::json &u) -> std::optional<std::pair<long long, long long>>
+    {
+        if (!u.is_object())
+            return std::nullopt;
+        long long cached = -1, total = -1;
+        if (u.contains("prompt_tokens_details") && u["prompt_tokens_details"].is_object())
+        {
+            cached = (long long)num_arg(u["prompt_tokens_details"], "cached_tokens", 0);
+            if (u.contains("prompt_tokens") && u["prompt_tokens"].is_number_integer())
+                total = u["prompt_tokens"].get<long long>();
+        }
+        else if (u.contains("input_tokens_details") && u["input_tokens_details"].is_object())
+        {
+            cached = (long long)num_arg(u["input_tokens_details"], "cached_tokens", 0);
+            if (u.contains("input_tokens") && u["input_tokens"].is_number_integer())
+                total = u["input_tokens"].get<long long>();
+        }
+        else if (u.contains("cache_read_input_tokens") && u["cache_read_input_tokens"].is_number_integer())
+        {
+            cached = u["cache_read_input_tokens"].get<long long>();
+            if (u.contains("input_tokens") && u["input_tokens"].is_number_integer())
+                total = cached + u["input_tokens"].get<long long>() + (long long)num_arg(u, "cache_creation_input_tokens", 0);
+        }
+        if (cached < 0 || total <= 0)
+            return std::nullopt;
+        return std::make_pair(cached, total);
+    };
 
     // -------- phase: session bootstrap — resume, cwd follow, skills injection,
     // boot probe and the exit guard --------
@@ -21557,7 +21630,10 @@ int repl::run()
                                     label, summary.size(), sec,
                                     usage_in(usage).has_value() ? std::to_string(*usage_in(usage)) : "n/a",
                                     usage_out(usage).has_value() ? std::to_string(*usage_out(usage)) : "n/a"));
-        cell::stats::add(h.now().id(), std::format("{}:{}", p->name, model), content_chars(prompt), (long long)summary.size(), usage_in(usage), usage_out(usage), usage_total(usage), 0);
+        auto compact_cache = usage_cache_counts(usage);
+        cell::stats::add(h.now().id(), std::format("{}:{}", p->name, model), content_chars(prompt), (long long)summary.size(), usage_in(usage), usage_out(usage), usage_total(usage), 0,
+                         compact_cache ? std::optional<long long>(compact_cache->first) : std::nullopt,
+                         compact_cache ? std::optional<long long>(compact_cache->second) : std::nullopt);
         return summary;
     };
 
@@ -22379,7 +22455,10 @@ int repl::run()
                             cell::sys::error("[tool call rejected: {} - stopping this run]", res[i].name);
                             break;
                         }
-                    cell::stats::add(h.now().id(), cfg.model_label(), in_chars, out_chars, usage_in(usage), usage_out(usage), usage_total(usage), (long long)(h.now().msg().size() - before));
+                    auto cache_counts = usage_cache_counts(usage);
+                    cell::stats::add(h.now().id(), cfg.model_label(), in_chars, out_chars, usage_in(usage), usage_out(usage), usage_total(usage), (long long)(h.now().msg().size() - before),
+                                     cache_counts ? std::optional<long long>(cache_counts->first) : std::nullopt,
+                                     cache_counts ? std::optional<long long>(cache_counts->second) : std::nullopt);
                     if (approval_refused)
                     {
                         done = true;
