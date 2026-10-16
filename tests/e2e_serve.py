@@ -207,7 +207,19 @@ def api(base: str, token: str, method: str, path: str, body: dict | None = None)
     except Exception as e:
         # name the request: a bare "Remote end closed connection without response"
         # says nothing about which of forty steps was running
-        raise RuntimeError(f"{method} {path}: {type(e).__name__}: {e}") from e
+        detail = f"{method} {path}: {type(e).__name__}: {e}"
+        # A GET is idempotent, so one retry is what any client should do — and a
+        # reset on an otherwise healthy connection is exactly the kind of noise a
+        # test must not spend a cycle on. A POST is never retried: a turn that may
+        # already have run must not run twice.
+        if method == "GET":
+            time.sleep(0.2)
+            try:
+                with urllib.request.urlopen(req, timeout=30) as r:
+                    return json.loads(r.read() or b"{}")
+            except Exception:
+                pass
+        raise RuntimeError(detail) from e
 
 
 def api_code(base: str, token: str, method: str, path: str, body: dict | None = None):

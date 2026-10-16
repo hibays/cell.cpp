@@ -15805,6 +15805,33 @@ details{break-inside:avoid}
 #endif
         }
 
+        // Read and discard whatever the peer sent after its request, so the close
+        // below is a clean FIN. Bounded by a short timeout: a client that keeps a
+        // connection open must not hold this thread.
+        inline void drain_before_close(socket_t s)
+        {
+            set_socket_timeouts(s, 50);
+            char tmp[4096];
+            for (;;)
+            {
+#ifdef _WIN32
+                int n = ::recv(s, tmp, sizeof tmp, 0);
+                if (n <= 0)
+                    return; // WSAETIMEDOUT (drained) or the peer went away
+                if (last_socket_error() == WSAEINTR)
+                    continue;
+#else
+                ssize_t n = ::recv(s, tmp, sizeof tmp, 0);
+                if (n > 0)
+                    continue; // more to drain
+                if (n < 0 && errno == EINTR)
+                    continue; // a signal interrupted the read; keep going
+                return;        // EAGAIN (drained), EOF, or an error — all fine here
+#endif
+            }
+        }
+
+
         // poll a socket for readability; the acceptor uses it so shutdown never
         // has to close a socket another thread is blocked in
         inline bool wait_readable(socket_t s, int ms)
@@ -16299,6 +16326,14 @@ details{break-inside:avoid}
                 }
                 if (!res.responded)
                     send_error(404, "not_found", std::format("no route for {} {}", req.method, req.path));
+                // Closing a socket that still has unread data in its receive queue
+                // makes the kernel send RST rather than FIN — and an RST discards
+                // whatever the peer has not read yet, including the response we
+                // just sent. The client sees a reset where it expected an answer
+                // (a browser reports that as a failed fetch; the serve e2e failed
+                // this way, flakily, only on macOS). Draining with a short timeout
+                // first costs one syscall on the normal path.
+                drain_before_close(c);
                 shutdown_write(c);
             }
 
@@ -25087,10 +25122,7 @@ int repl::run()
                     {
                     }
                 }
-                cell::sys::logger::instance().error("serve", "logs_route_enter");
-                nlohmann::json tail_out = cell::serve::log_tail_json(tail);
-                cell::sys::logger::instance().error("serve", std::format("logs_route_exit lines={}", (int)tail_out["lines"].size()));
-                res.json(200, tail_out);
+                res.json(200, cell::serve::log_tail_json(tail));
                 return;
             }
             if (seg.size() == 2 && seg[0] == "v1" && seg[1] == "skills" && req.method == "GET")
