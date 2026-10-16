@@ -7,6 +7,7 @@
 // live stream. Tool steps reuse ToolCallCard so diffs, exit codes and output
 // clipping have exactly one renderer.
 import { computed, ref } from 'vue'
+import ApprovalLog from '../components/ApprovalLog.vue'
 import SubAgents from '../components/SubAgents.vue'
 import { store } from '../store'
 import ToolCallCard from '../components/ToolCallCard.vue'
@@ -54,6 +55,7 @@ function stepLabel(s: TraceStep): string {
     </div>
 
     <div class="list">
+      <ApprovalLog />
       <SubAgents />
 
       <section v-for="t in turns" :key="t.key" class="turn">

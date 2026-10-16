@@ -14,6 +14,7 @@ import { applyTheme, resolveTheme, saveTheme, type ThemeName } from '../lib/them
 import { normalizeTranscript, type UiMessage } from '../lib/transcript'
 import type {
   Approval,
+  ApprovalRecord,
   Bootstrap,
   ConfigSnapshot,
   FileContent,
@@ -56,6 +57,8 @@ interface State {
   showArchived: boolean
   /** What has been uploaded into the workspace's .cell-uploads/ so far. */
   uploads: { name: string; path: string; size: number }[]
+  /** The approval audit for this session (who allowed or denied what). */
+  approvalsLog: ApprovalRecord[]
   streamStartedAt: number
   streamModel: string
   approvals: Approval[]
@@ -113,6 +116,7 @@ const state = reactive<State>({
   live: null,
   showArchived: false,
   uploads: [],
+  approvalsLog: [],
   streamStartedAt: 0,
   streamModel: '',
   approvals: [],
@@ -442,6 +446,20 @@ export async function refreshJobs(): Promise<void> {
     state.jobs = (await api.getSessionTeamworks(id)).jobs
   } catch {
     state.jobs = []
+  }
+}
+
+/** The approval audit for the session on screen. */
+export async function refreshApprovals(tail = 100): Promise<void> {
+  const id = state.currentSession
+  if (!id) {
+    state.approvalsLog = []
+    return
+  }
+  try {
+    state.approvalsLog = (await api.sessionApprovals(id, tail)).approvals ?? []
+  } catch {
+    state.approvalsLog = []
   }
 }
 
@@ -775,6 +793,7 @@ export async function approve(id: string): Promise<void> {
   try {
     await api.decideApproval(id, 'allow')
     state.approvals = state.approvals.filter((a) => a.request_id !== id)
+    void refreshApprovals() // the decision is now on the record
   } catch (e) {
     toast('bad', `approval failed: ${String(e)}`)
   }
@@ -784,6 +803,7 @@ export async function deny(id: string, reason = 'rejected in the UI'): Promise<v
   try {
     await api.decideApproval(id, 'deny', reason)
     state.approvals = state.approvals.filter((a) => a.request_id !== id)
+    void refreshApprovals()
   } catch (e) {
     toast('bad', `rejection failed: ${String(e)}`)
   }

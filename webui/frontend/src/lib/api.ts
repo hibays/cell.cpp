@@ -65,6 +65,17 @@ export interface FileEntry {
   mtime: number
 }
 
+/** One row of the approval audit (docs/RESTful.md §3.6). */
+export interface ApprovalRecord {
+  id: string
+  session: string
+  tool: string
+  args: string
+  decision: string
+  reason: string
+  at: number
+}
+
 /** One file's content for the viewer; `binary` means there is no `content` to show. */
 export interface FileContent {
   path: string
@@ -581,6 +592,16 @@ export class ApiClient {
    * The native shell exports a self-contained HTML instead; this is the fallback
    * that makes the button work there at all.
    */
+  /**
+   * The approval audit written next to the transcript — who allowed or denied
+   * which tool call, with its arguments. Readable on its own, without the log.
+   */
+  sessionApprovals(sessionId: string, tail = 100) {
+    return this.request<{ session: string; approvals: ApprovalRecord[] }>(
+      `/sessions/${encodeURIComponent(sessionId)}/approvals?tail=${tail}`,
+    )
+  }
+
   async exportMarkdown(sessionId: string): Promise<{ markdown: string; count: number }> {
     const r = await this.request<{ markdown: string; count: number }>(
       `/sessions/${encodeURIComponent(sessionId)}/export?format=md`,
