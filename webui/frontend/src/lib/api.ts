@@ -198,6 +198,8 @@ export interface TeamworkJob {
   id: string
   session: string
   status: string
+  /** Set when a cooperative stop parked the job; `resume` picks it up. */
+  stopped?: boolean
   work_type: string
   error: string
   created: string
@@ -542,7 +544,7 @@ export class ApiClient {
   }
 
   // ---- teamwork + compaction ------------------------------------------------
-  /** Teamwork jobs for one session (read-only; control endpoints are roadmap). */
+  /** Teamwork jobs for one session. */
   getSessionTeamworks(sessionId: string) {
     return this.request<TeamworkList>(`/sessions/${encodeURIComponent(sessionId)}/teamworks`)
   }
@@ -636,6 +638,12 @@ export class ApiClient {
   /** Continue a stopped job. */
   resumeTeamworkJob(sessionId: string, jobId: string) {
     return this.request<TeamworkAction>(this.tw(sessionId, jobId, '/resume'), { method: 'POST' })
+  }
+
+  /** Remove a job that is neither running nor completed — completed jobs stay
+   *  protected over REST on purpose (the CLI is the trusted human channel). */
+  removeTeamworkJob(sessionId: string, jobId: string) {
+    return this.request<TeamworkAction>(this.tw(sessionId, jobId, ''), { method: 'DELETE' })
   }
 
   /** Append one child agent to a pending job. */

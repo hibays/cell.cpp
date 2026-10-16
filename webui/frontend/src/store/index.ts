@@ -6,6 +6,7 @@ import { api } from '../lib/api'
 import { classifyError } from '../lib/errors'
 import { createEventBus } from '../lib/events'
 import { applyEvent, emptyLiveTurn, type LiveTurn } from '../lib/liveTurn'
+import { buildJobInput, jobInputError } from '../lib/teamwork'
 import { createFrameScheduler } from '../lib/scheduler'
 import { sortByRecency } from '../lib/sessions'
 import { usageTotals, type UsageTotals } from '../lib/stats'
@@ -268,6 +269,89 @@ export async function setArchived(sid: string, archived: boolean): Promise<void>
     await refreshSessions()
   } catch (e) {
     toast('bad', `${archived ? '归档' : '恢复'}失败：${String(e)}`)
+  }
+}
+
+// ---- teamwork control -------------------------------------------------------
+// The endpoints have existed for a while; the shell could see a job's report but
+// not start one. `run`/`resume` are background on the kernel side, so these
+// return as soon as the job is accepted — progress arrives as notices and the
+// status is polled while a job is running.
+
+async function afterJobChange(): Promise<void> {
+  state.workerReport = null
+  await refreshJobs()
+}
+
+export async function createTeamwork(tasks: string[], mode: 'serial' | 'parallel', runNow = true): Promise<boolean> {
+  const id = state.currentSession
+  if (!id) return false
+  const input = buildJobInput(tasks, mode)
+  const err = jobInputError(tasks, state.config?.teamwork_max_children ?? 8)
+  if (err) {
+    toast('warn', err)
+    return false
+  }
+  try {
+    const created = await api.createTeamworkJob(id, input)
+    await afterJobChange()
+    const jobId = created.id
+    if (runNow && jobId) {
+      await api.runTeamworkJob(id, jobId)
+      toast('ok', `子智能体任务已启动（${input.list?.length ?? 0} 名）`)
+    } else {
+      toast('ok', '子智能体任务已创建（尚未运行）')
+    }
+    await afterJobChange()
+    return true
+  } catch (e) {
+    toast('bad', `创建协作任务失败：${String(e)}`)
+    return false
+  }
+}
+
+export async function controlJob(jobId: string, action: 'run' | 'stop' | 'resume' | 'remove'): Promise<void> {
+  const id = state.currentSession
+  if (!id) return
+  try {
+    if (action === 'remove') await api.removeTeamworkJob(id, jobId)
+    else if (action === 'run') await api.runTeamworkJob(id, jobId)
+    else if (action === 'resume') await api.resumeTeamworkJob(id, jobId)
+    else await api.stopTeamworkJob(id, jobId)
+    const words: Record<string, string> = {
+      run: '已启动',
+      stop: '已请求停止（在下一个边界暂停）',
+      resume: '已继续',
+      remove: '已删除',
+    }
+    toast('ok', words[action] ?? '完成')
+    await afterJobChange()
+  } catch (e) {
+    toast('bad', `${action} 失败：${String(e)}`)
+  }
+}
+
+export async function addJobWorker(jobId: string, works: string): Promise<void> {
+  const id = state.currentSession
+  if (!id || !works.trim()) return
+  try {
+    await api.appendTeamworkWorker(id, jobId, { works: works.trim() })
+    toast('ok', '已加入一名子智能体（运行前可继续添加）')
+    await afterJobChange()
+  } catch (e) {
+    toast('bad', `添加失败：${String(e)}`)
+  }
+}
+
+export async function removeJobWorker(jobId: string, name: string): Promise<void> {
+  const id = state.currentSession
+  if (!id) return
+  try {
+    await api.removeTeamworkWorker(id, jobId, name)
+    toast('ok', `已移除 ${name}`)
+    await afterJobChange()
+  } catch (e) {
+    toast('bad', `移除失败：${String(e)}`)
   }
 }
 
