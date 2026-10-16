@@ -55,10 +55,12 @@ describe('the command table', () => {
 
   test('only commands the shell can actually run are listed', () => {
     // 🚧 in docs/RESTful.md — advertising them would be a lie
-    for (const missing of ['/clear', '/reload', '/ins', '/save']) {
+    for (const missing of ['/reload', '/ins', '/save']) {
       expect(findCommand(missing)).toBeUndefined()
     }
     expect(findCommand('/compact')?.side).toBe('kernel')
+    // /clear arrived with POST /v1/sessions/{id}/clear, so it is runnable now
+    expect(findCommand('/clear')?.side).toBe('kernel')
     expect(findCommand('/export')?.side).toBe('shell')
   })
 
