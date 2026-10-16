@@ -141,6 +141,13 @@ units), `vue-tsc --noEmit`, `vite build` + `embed_webui.mjs`, `cell.cellui_boot`
   (parallel or serial, with the kernel naming the children), per-job controls
   that appear only when the job's state allows them, staffing a pending job
   before it runs, and a status poll that runs only while something is running.
+- **P9 — the audit, readable.** The kernel writes an approval line next to every
+  transcript; the shell now reads it: the trace view carries a 审批 section with
+  the counts (allowed / denied / high-risk), a "只看拒绝" filter, and one row per
+  decision showing the tool, the telling field out of its arguments and the
+  reason. The risk marking calls the *same* `riskOf` the live approval card uses,
+  so the history and the card cannot drift apart. It refreshes after each decision
+  rather than polling, and a session switch clears it.
   With this, every row of the B1–B7 / F1–F11 matrix is either delivered or
   written down as a non-goal with its reason.
 
