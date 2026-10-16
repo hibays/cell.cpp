@@ -11648,6 +11648,17 @@ details{break-inside:avoid}
             wake_local();
             if (out_id)
                 *out_id = m.id;
+            // A notice is queued for polling *and* announced as an event: a shell
+            // watching a turn should see it arrive, not discover it on its next
+            // poll. The event carries its session so the service layer can drop it
+            // when it is not the session that stream belongs to; with no turn
+            // running there is no sink and this is a no-op.
+            cell::events::emit("notice", {{"id", m.id},
+                                          {"session", sid},
+                                          {"from", m.from},
+                                          {"topic", m.topic},
+                                          {"body", m.body},
+                                          {"created_at", m.created_at}});
             cell::sys::logger::instance().info("notice", std::format("sent id={} to={} from={} topic={} chars={}",
                                                                      m.id, sid, m.from, m.topic, m.body.size()));
             return true;
@@ -16733,6 +16744,84 @@ details{break-inside:avoid}
             // carried an empty list
             reply["entries"] = std::move(entries);
             return reply;
+        }
+
+        // One workspace file, for the shell's viewer. The caller has already
+        // resolved it inside the working directory; this caps the size and marks
+        // binary content instead of shipping mojibake, and sanitises to valid
+        // UTF-8 because the body has to survive a JSON round trip.
+        inline nlohmann::json file_content_json(const std::filesystem::path &file, size_t max_bytes)
+        {
+            std::error_code ec;
+            if (std::filesystem::is_directory(file, ec))
+                return nlohmann::json{{"error", "is_directory"}};
+            auto size = (long long)std::filesystem::file_size(file, ec);
+            if (ec)
+                return nlohmann::json{{"error", "unreadable"}};
+            bool truncated = (size < 0 ? 0 : (size_t)size) > max_bytes;
+            std::ifstream in(file, std::ios::binary);
+            if (!in)
+                return nlohmann::json{{"error", "unreadable"}};
+            std::string raw(max_bytes, '\0');
+            in.read(raw.data(), (std::streamsize)max_bytes);
+            raw.resize((size_t)in.gcount());
+            // a NUL byte in the first block means this is not text: say so rather
+            // than render a binary as if it were source
+            bool binary = raw.find('\0') != std::string::npos;
+            std::error_code rec;
+            std::filesystem::path rel = std::filesystem::relative(file, cell::workdir(), rec);
+            std::error_code mec;
+            auto mtime = std::filesystem::last_write_time(file, mec);
+            nlohmann::json out{{"path", rec ? file.filename().generic_string() : rel.generic_string()},
+                               {"name", file.filename().string()},
+                               {"size", size},
+                               {"mtime", mec ? 0LL : unix_seconds(mtime)},
+                               {"truncated", truncated},
+                               {"binary", binary},
+                               {"content", binary ? "" : to_valid_utf8(raw)}};
+            return out;
+        }
+
+        // Tail of the runtime log for the shell's diagnostics pane. Only the last
+        // 512 KiB are read: the file is rotated but can still be megabytes, and a
+        // GUI wants the end of it, not the whole history.
+        inline nlohmann::json log_tail_json(size_t max_lines)
+        {
+            // The logger buffers non-error lines and flushes at 16 KiB or on
+            // close, so a tail read without this first would show an empty file
+            // while the process is running — exactly when the pane is wanted.
+            cell::sys::logger::instance().flush();
+            std::filesystem::path path = cell::root / "logs" / "cell.log";
+            nlohmann::json out{{"path", path.generic_string()}, {"lines", nlohmann::json::array()}, {"truncated", false}};
+            std::error_code ec;
+            auto size = (long long)std::filesystem::file_size(path, ec);
+            if (ec)
+                return out;
+            constexpr long long kWindow = 512 * 1024;
+            long long start = size > kWindow ? size - kWindow : 0;
+            std::ifstream in(path, std::ios::binary);
+            if (!in)
+                return out;
+            in.seekg(start);
+            std::string blob((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+            out["size"] = size;
+            out["truncated"] = start > 0;
+            std::vector<std::string> lines;
+            size_t pos = 0;
+            while (pos <= blob.size())
+            {
+                size_t nl = blob.find('\n', pos);
+                if (nl == std::string::npos)
+                    break;
+                lines.push_back(blob.substr(pos, nl - pos));
+                pos = nl + 1;
+            }
+            if (start > 0 && !lines.empty())
+                lines.erase(lines.begin()); // first line may be cut mid-way
+            size_t from = lines.size() > max_lines ? lines.size() - max_lines : 0;
+            for (size_t i = from; i < lines.size(); i++)
+                out["lines"].push_back(to_valid_utf8(lines[i]));
+            return out;
         }
 
         inline nlohmann::json messages_json(const std::string &sid, size_t after, size_t limit)
@@ -24377,6 +24466,65 @@ int repl::run()
                 res.json(200, cell::stats::load());
                 return;
             }
+            if (seg.size() == 3 && seg[0] == "v1" && seg[1] == "files" && seg[2] == "content" && req.method == "GET")
+            {
+                // The viewer's read side. Same containment rule as the listing: a
+                // read-only endpoint is still an endpoint that would otherwise
+                // hand over any file on the disk.
+                auto it_path = req.query.find("path");
+                std::string rel = it_path == req.query.end() ? "" : it_path->second;
+                if (rel.empty())
+                {
+                    res.error(400, "missing_path", "path is required");
+                    return;
+                }
+                std::filesystem::path file;
+                if (!cell::serve::resolve_within(cell::workdir(), rel, file))
+                {
+                    res.error(400, "path_outside_workdir", "path escapes the working directory");
+                    return;
+                }
+                size_t max_bytes = 256 * 1024;
+                if (auto it = req.query.find("max"); it != req.query.end())
+                {
+                    try
+                    {
+                        max_bytes = std::min<size_t>(1024 * 1024, std::max<size_t>(1024, std::stoul(it->second)));
+                    }
+                    catch (const std::exception &)
+                    {
+                    }
+                }
+                nlohmann::json body = cell::serve::file_content_json(file, max_bytes);
+                if (body.contains("error"))
+                {
+                    if (body["error"] == "is_directory")
+                    {
+                        res.error(400, "is_directory", "path is a directory");
+                        return;
+                    }
+                    res.error(404, "file_unreadable", "cannot read " + rel);
+                    return;
+                }
+                res.json(200, body);
+                return;
+            }
+            if (seg.size() == 2 && seg[0] == "v1" && seg[1] == "logs" && req.method == "GET")
+            {
+                size_t tail = 200;
+                if (auto it = req.query.find("tail"); it != req.query.end())
+                {
+                    try
+                    {
+                        tail = std::min<size_t>(2000, std::max<size_t>(1, std::stoul(it->second)));
+                    }
+                    catch (const std::exception &)
+                    {
+                    }
+                }
+                res.json(200, cell::serve::log_tail_json(tail));
+                return;
+            }
             if (seg.size() == 2 && seg[0] == "v1" && seg[1] == "skills" && req.method == "GET")
             {
                 res.json(200, json{{"skills", cell::serve::skills_json()}});
@@ -24469,9 +24617,16 @@ int repl::run()
                                       // Semantic events (token / reasoning / tool_call /
                                       // tool_result / usage / interrupt) reach the same
                                       // stream as the captured stdout — installed for this
-                                      // turn only, so the CLI never pays for it.
-                                      cell::events::sink() = [ts](nlohmann::json &&ev)
-                                      { ts->push(std::move(ev)); };
+                                      // turn only, so the CLI never pays for it. A notice is
+                                      // emitted for whichever session it targets, so this
+                                      // sink drops the ones that are not this stream's.
+                                      cell::events::sink() = [ts, sid](nlohmann::json &&ev)
+                                      {
+                                          if (ev.value("type", "") == "notice" && ev.contains("data") &&
+                                              ev["data"].value("session", "") != sid)
+                                              return;
+                                          ts->push(std::move(ev));
+                                      };
                                       try
                                       {
                                           h.use(sid);
