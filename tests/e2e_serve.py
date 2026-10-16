@@ -74,10 +74,16 @@ class MockLLM(BaseHTTPRequestHandler):
     def do_POST(self):
         n = int(self.headers.get("Content-Length", 0))
         body = json.loads(self.rfile.read(n) or b"{}")
+        messages = body.get("messages", [])
         last = ""
-        for m in body.get("messages", []):
+        for m in messages:
             if m.get("role") == "user":
-                last = m.get("content", "")
+                c = m.get("content", "")
+                last = c if isinstance(c, str) else json.dumps(c)
+        last_is_tool = bool(messages) and messages[-1].get("role") == "tool"
+        # "[READ]" proposes one read tool call; the second round (the tool result
+        # is the last message) must answer with text instead of proposing it again
+        wants_read = "[READ]" in last and not last_is_tool
         text = f"mock reply to: {last[:80]}"
         # the kernel always requests stream=true — answer in OpenAI SSE chunks
         self.send_response(200)
@@ -86,10 +92,46 @@ class MockLLM(BaseHTTPRequestHandler):
         # missing length as a broken response ("connection closed")
         self.send_header("Connection", "close")
         self.end_headers()
-        first = json.dumps(
-            {"choices": [{"delta": {"role": "assistant", "content": text}}]}
-        )
-        self.wfile.write(f"data: {first}\n\n".encode())
+        if wants_read:
+            chunks = [
+                {
+                    "choices": [
+                        {
+                            "delta": {
+                                "role": "assistant",
+                                "tool_calls": [
+                                    {
+                                        "index": 0,
+                                        "id": "call_read_1",
+                                        "type": "function",
+                                        "function": {"name": "read", "arguments": json.dumps({"path": "probe.txt"})},
+                                    }
+                                ],
+                            }
+                        }
+                    ]
+                },
+                {
+                    "choices": [{"delta": {}, "finish_reason": "tool_calls"}],
+                    "usage": {"prompt_tokens": 9, "completion_tokens": 7, "total_tokens": 16},
+                },
+            ]
+        else:
+            chunks = [
+                {"choices": [{"delta": {"role": "assistant", "content": text}}]},
+                {
+                    "choices": [{"delta": {}, "finish_reason": "stop"}],
+                    # prompt_tokens_details is what the cache counters are read from
+                    "usage": {
+                        "prompt_tokens": 7,
+                        "completion_tokens": 5,
+                        "total_tokens": 12,
+                        "prompt_tokens_details": {"cached_tokens": 5},
+                    },
+                },
+            ]
+        for c in chunks:
+            self.wfile.write(f"data: {json.dumps(c)}\n\n".encode())
         self.wfile.write(b"data: [DONE]\n\n")
 
 
@@ -151,6 +193,11 @@ def run_once(attempt: int) -> bool:
     env = dict(os.environ, CELL_ROOT=str(root), OPENAI_API_KEY="sk-test")
     cfg_dir = root / "config"
     cfg_dir.mkdir(parents=True, exist_ok=True)
+    # The agent's working directory, deliberately OUTSIDE the runtime root: cell
+    # keeps its vault and config under CELL_ROOT, and the sandbox refuses to read
+    # anything inside it — which is exactly right, but it means a fixture that
+    # puts the workspace under CELL_ROOT would see every tool read blocked.
+    work = Path(tempfile.mkdtemp(prefix="cell-e2e-work-"))
     (root / "config.json").write_text(
         json.dumps(
             {
@@ -183,7 +230,7 @@ def run_once(attempt: int) -> bool:
     proc = subprocess.Popen(
         argv,
         env=env,
-        cwd=str(root),
+        cwd=str(work),
         stdout=err_file,  # lldb prints the -k backtraces on stdout
         stderr=err_file,
     )
@@ -214,6 +261,20 @@ def run_once(attempt: int) -> bool:
         out = turn.get("output", "")
         assert "mock reply" in out, f"turn output missing mock reply: {turn}"
         print("turn output:", out[:60])
+
+        # ---- semantic events: what a GUI renders instead of a terminal ----
+        # The turn engine emits these next to the captured stdout; without them
+        # the shell can only re-parse the transcript after the turn is over.
+        kinds = [e.get("type") for e in turn.get("events", [])]
+        assert "token" in kinds, f"no token events: {kinds}"
+        streamed = "".join(e["data"]["text"] for e in turn["events"] if e.get("type") == "token")
+        assert "mock reply" in streamed, f"token events do not carry the answer: {streamed[:120]}"
+        assert "usage" in kinds, f"no usage event: {kinds}"
+        usage = next(e["data"] for e in turn["events"] if e.get("type") == "usage")
+        assert usage["out_tokens"] == 5 and usage["cached_tokens"] == 5, usage
+        assert usage["prompt_tokens"] == 7, usage
+        assert isinstance(usage["decode_ms"], int) and usage["decode_ms"] >= 0, usage
+        print(f"semantic events: {sorted(set(kinds))} · tok={usage['out_tokens']} cached={usage['cached_tokens']}")
 
         msgs = api(base, token, "GET", f"/v1/sessions/{sid}/messages")
         roles = [m["role"] for m in msgs.get("messages", msgs.get("entries", []))]
@@ -284,9 +345,9 @@ def run_once(attempt: int) -> bool:
         # Read-only and rooted at the working directory: a path that leaves it
         # must be refused, or the endpoint would enumerate the whole disk for
         # anyone holding the token.
-        (root / "probe.txt").write_text("hello")
-        (root / "subdir").mkdir(exist_ok=True)
-        (root / ".hidden").write_text("no")
+        (work / "probe.txt").write_text("hello")
+        (work / "subdir").mkdir(exist_ok=True)
+        (work / ".hidden").write_text("no")
         listing = api(base, token, "GET", "/v1/files")
         names = [e["name"] for e in listing["entries"]]
         assert "probe.txt" in names, names
@@ -301,6 +362,24 @@ def run_once(attempt: int) -> bool:
         assert api_code(base, token, "GET", "/v1/files?path=../..") == 400
         assert api_code(base, token, "GET", "/v1/files?path=../../etc") == 400
         print("file listing: entries + workdir containment enforced")
+
+        # ---- tool events: a call and its result, paired by id ----
+        # Tools are off in this fixture, so flip them on for one session; `read`
+        # is an allow-policy tool, which keeps the approval dance out of it.
+        patched = api(base, token, "PATCH", "/v1/config", {"tools": True})
+        assert patched.get("tools") is True, patched
+        tsid = api(base, token, "POST", "/v1/sessions")["id"]
+        tturn = api(base, token, "POST", f"/v1/sessions/{tsid}/turn", {"text": "读一下 [READ]"})
+        tkinds = [e.get("type") for e in tturn.get("events", [])]
+        assert "tool_call" in tkinds and "tool_result" in tkinds, tkinds
+        call = next(e["data"] for e in tturn["events"] if e.get("type") == "tool_call")
+        result = next(e["data"] for e in tturn["events"] if e.get("type") == "tool_result")
+        assert call["name"] == "read" and "probe.txt" in call["args"], call
+        assert result["id"] == call["id"], (call, result)
+        assert result["status"] == "ok", result
+        assert "hello" in result["output"], result
+        assert result["truncated"] is False, result
+        print(f"tool events: {call['name']} -> {result['status']} ({result['seconds']:.2f}s)")
 
         # ---- skills: inventory, body read, and the /skill load twin ----
         # Skills are scanned fresh from <CELL_ROOT>/skills on every call, so the
