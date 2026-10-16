@@ -51,6 +51,10 @@ interface State {
   streaming: boolean
   /** The turn in flight, folded from the kernel's semantic events. */
   live: LiveTurn | null
+  /** The sidebar is showing archived sessions instead of the live ones. */
+  showArchived: boolean
+  /** What has been uploaded into the workspace's .cell-uploads/ so far. */
+  uploads: { name: string; path: string; size: number }[]
   streamStartedAt: number
   streamModel: string
   approvals: Approval[]
@@ -106,6 +110,8 @@ const state = reactive<State>({
   loadingMessages: false,
   streaming: false,
   live: null,
+  showArchived: false,
+  uploads: [],
   streamStartedAt: 0,
   streamModel: '',
   approvals: [],
@@ -168,7 +174,7 @@ export async function boot(): Promise<void> {
     }
     api.base = state.bootstrap.api?.base ?? ''
     api.token = state.bootstrap.api?.token ?? ''
-    await Promise.all([refreshConfig(), refreshSessions(), refreshSkills(), refreshFiles()])
+    await Promise.all([refreshConfig(), refreshSessions(), refreshSkills(), refreshFiles(), refreshUploads()])
     // the landing page is the first thing the user sees; enterApp() moves on
     state.phase = 'landing'
   } catch (e) {
@@ -237,6 +243,65 @@ export function toggleRightbar(v?: boolean): void {
 
 export function openSettings(v: boolean): void {
   state.settingsOpen = v
+}
+
+// ---- archives ---------------------------------------------------------------
+// Archiving hides a session from the default list; it keeps its transcript and
+// its id, so a link to it still opens. The sidebar switches between the two
+// lists rather than mixing them.
+
+export function toggleArchived(): void {
+  state.showArchived = !state.showArchived
+  void refreshSessions()
+}
+
+export async function setArchived(sid: string, archived: boolean): Promise<void> {
+  try {
+    if (archived) await api.archiveSession(sid)
+    else await api.unarchiveSession(sid)
+    if (state.currentSession === sid && archived && !state.showArchived) {
+      // the session on screen just left the list; keep showing it rather than
+      // stranding the user on an empty view
+      state.showArchived = true
+    }
+    toast('ok', archived ? '已归档（记录仍保留，可恢复）' : '已恢复到活跃列表')
+    await refreshSessions()
+  } catch (e) {
+    toast('bad', `${archived ? '归档' : '恢复'}失败：${String(e)}`)
+  }
+}
+
+// ---- uploads ----------------------------------------------------------------
+// An upload is "put these bytes where the agent can read them": the kernel
+// parks them under the workspace's .cell-uploads/ and returns the path, which
+// the composer then attaches like any other reference.
+
+export async function refreshUploads(): Promise<void> {
+  try {
+    state.uploads = (await api.listUploads()).entries
+  } catch {
+    state.uploads = []
+  }
+}
+
+export async function uploadFiles(files: File[] | FileList): Promise<void> {
+  const list = [...files]
+  if (!list.length) return
+  let ok = 0
+  for (const f of list) {
+    try {
+      const buf = await f.arrayBuffer()
+      const r = await api.upload(f.name, buf)
+      attach(r.path)
+      ok++
+    } catch (e) {
+      toast('bad', `${f.name} 上传失败：${String(e)}`)
+    }
+  }
+  if (ok) {
+    toast('ok', `已上传 ${ok} 个文件到工作区的 .cell-uploads/（已作为参考文件附加）`)
+    void refreshUploads()
+  }
 }
 
 // ---- right-hand panel ---------------------------------------------------------

@@ -32,6 +32,7 @@ import {
   store,
   submitOrQueue,
   toast,
+  uploadFiles,
 } from '../store'
 import { argCandidates, findCommand, matchCommands, type CommandDef } from '../lib/commands'
 import { mentionCandidates } from '../lib/mentions'
@@ -43,6 +44,7 @@ const emit = defineEmits<{ export: [] }>()
 
 const text = ref('')
 const box = ref<HTMLTextAreaElement | null>(null)
+const fileInput = ref<HTMLInputElement | null>(null)
 
 type MenuMode = 'none' | 'command' | 'arg' | 'mention' | 'files' | 'model' | 'fence' | 'think'
 const mode = ref<MenuMode>('none')
@@ -186,6 +188,11 @@ function onPick(key: string): void {
     focusBox(caret)
     return
   }
+  if (key === 'upload') {
+    closeMenu()
+    fileInput.value?.click()
+    return
+  }
   if (key.startsWith('file:')) {
     attach(key.slice(5))
     closeMenu()
@@ -293,7 +300,14 @@ async function runCommand(cmd: CommandDef, arg: string): Promise<void> {
 // ---- the pickers -------------------------------------------------------------
 async function openFilePicker(at?: string): Promise<void> {
   if (at === undefined && !store.files.length) await refreshFiles()
-  const items: MenuItem[] = [{ key: 'hdr', label: store.filePath || '工作目录', header: true }]
+  const items: MenuItem[] = [{ key: 'hdr', label: '附加', header: true }]
+  if (store.uploads.length) {
+    items.push({ key: 'hdr:up', label: '已上传', header: true })
+    for (const u of store.uploads.slice(-5))
+      items.push({ key: `file:${u.path}`, label: u.name, hint: u.path, meta: formatCompact(u.size) })
+  }
+  items.push({ key: 'upload', label: '上传文件…', hint: '写入工作区的 .cell-uploads/' })
+  items.push({ key: 'hdr:fs', label: store.filePath || '工作目录', header: true })
   if (store.filePath) items.push({ key: 'dir:up', label: '..', hint: '返回上一级' })
   for (const f of store.files)
     items.push({
@@ -390,6 +404,12 @@ function onKeydown(e: KeyboardEvent): void {
   }
 }
 
+async function onFilesPicked(e: Event): Promise<void> {
+  const input = e.target as HTMLInputElement
+  if (input.files?.length) await uploadFiles(input.files)
+  input.value = '' // picking the same file twice must fire again
+}
+
 function onDrop(e: DragEvent): void {
   // a dropped OS file has no path in the browser, so only text can be attached;
   // dropping a snippet inserts it, dropping something path-shaped attaches it
@@ -446,8 +466,9 @@ onMounted(() => {
       />
     </div>
 
+    <input ref="fileInput" class="hidden-input" type="file" multiple @change="onFilesPicked" />
     <div class="bar">
-      <button class="tool" type="button" title="添加文件引用" @click="openFilePicker()">＋</button>
+      <button class="tool" type="button" title="上传文件或添加文件引用" @click="openFilePicker()">＋</button>
       <button class="pill" type="button" title="权限围栏" @click="openFenceMenu()">🛡 {{ fenceLabel }}</button>
       <button class="pill" type="button" title="切换模型" @click="openModelMenu()">{{ modelLabel }}</button>
       <button class="pill" type="button" title="思考深度" @click="openThinkMenu()">思考 {{ thinkLabel }}</button>
@@ -566,6 +587,10 @@ onMounted(() => {
 
 .spacer {
   flex: 1;
+}
+
+.hidden-input {
+  display: none;
 }
 
 .tool,

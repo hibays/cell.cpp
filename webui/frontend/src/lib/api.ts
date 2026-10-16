@@ -374,8 +374,48 @@ export class ApiClient {
   }
 
   // ---- sessions -------------------------------------------------------------
-  listSessions() {
-    return this.request<{ sessions: SessionSummary[]; current: string }>('/sessions')
+  listSessions(archived = false) {
+    return this.request<{ sessions: SessionSummary[]; current: string }>(
+      archived ? '/sessions?archived=1' : '/sessions',
+    )
+  }
+
+  /** Hide a session from the default list; its transcript and id keep working. */
+  archiveSession(sessionId: string) {
+    return this.request<{ session: string; archived: boolean }>(
+      `/sessions/${encodeURIComponent(sessionId)}/archive`,
+      { method: 'POST' },
+    )
+  }
+
+  /** Put an archived session back into the default list. */
+  unarchiveSession(sessionId: string) {
+    return this.request<{ session: string; archived: boolean }>(
+      `/sessions/${encodeURIComponent(sessionId)}/unarchive`,
+      { method: 'POST' },
+    )
+  }
+
+  /**
+   * Put a file's bytes where the agent can read them: the workspace's
+   * .cell-uploads/, and the path comes back for the composer to attach. (The
+   * runtime root is off limits to the tools, so an upload parked there would be
+   * invisible to the agent it was sent for.)
+   */
+  upload(name: string, bytes: ArrayBuffer | string) {
+    return this.request<{ name: string; path: string; bytes: number }>(
+      `/uploads?name=${encodeURIComponent(name)}`,
+      {
+        method: 'POST',
+        body: typeof bytes === 'string' ? bytes : new Uint8Array(bytes),
+        headers: { 'Content-Type': 'application/octet-stream' },
+      },
+    )
+  }
+
+  /** What has been uploaded so far, for the attach menu. */
+  listUploads() {
+    return this.request<{ dir: string; entries: { name: string; path: string; size: number }[] }>('/uploads')
   }
 
   createSession() {

@@ -8,6 +8,8 @@
 import { computed, onMounted, onUnmounted, ref } from 'vue'
 import {
   newSession,
+  setArchived,
+  toggleArchived,
   openSettings,
   selectSession,
   setSessionQuery,
@@ -84,6 +86,15 @@ onUnmounted(() => {
       <button class="icon" title="设置" @click="openSettings(true)">⚙</button>
     </div>
 
+    <div v-if="!store.sidebarCollapsed" class="list-mode">
+      <button class="seg" :class="{ on: !store.showArchived }" type="button" @click="store.showArchived && toggleArchived()">
+        活跃
+      </button>
+      <button class="seg" :class="{ on: store.showArchived }" type="button" @click="!store.showArchived && toggleArchived()">
+        归档
+      </button>
+    </div>
+
     <div v-if="!store.sidebarCollapsed" class="new-session">
       <button class="primary" @click="newSession()">
         <span class="plus">＋</span> 新会话
@@ -123,18 +134,26 @@ onUnmounted(() => {
             <span class="group-name">{{ g.label }}</span>
             <span class="count">{{ g.sessions.length }}</span>
           </button>
-          <button
+          <div
             v-for="s in rowsOf(g.key, g.sessions)"
             :key="s.id"
             class="row"
             :class="{ active: s.id === store.currentSession }"
             :title="s.cwd ? `${s.title || s.id}\n${s.cwd}` : s.title || s.id"
-            @click="selectSession(s.id)"
           >
-            <span class="dot" :class="{ live: s.id === store.currentSession && store.streaming }" />
-            <span class="row-title">{{ sessionLabel(s) }}</span>
-            <span class="age">{{ relativeTime(s.updated_at) }}</span>
-          </button>
+            <button class="row-main" @click="selectSession(s.id)">
+              <span class="dot" :class="{ live: s.id === store.currentSession && store.streaming }" />
+              <span class="row-title">{{ sessionLabel(s) }}</span>
+              <span class="age">{{ relativeTime(s.updated_at) }}</span>
+            </button>
+            <button
+              class="row-act"
+              :title="store.showArchived ? '恢复到活跃列表' : '归档（记录保留，可恢复）'"
+              @click.stop="setArchived(s.id, !store.showArchived)"
+            >
+              {{ store.showArchived ? '恢复' : '归档' }}
+            </button>
+          </div>
           <button
             v-if="hiddenCount(g.key, g.sessions.length)"
             class="more"
@@ -347,15 +366,66 @@ onUnmounted(() => {
 .row {
   display: flex;
   align-items: center;
-  gap: 7px;
   width: 100%;
   border: 1px solid transparent;
   border-radius: var(--cell-radius-sm);
+}
+
+.row-main {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  flex: 1;
+  min-width: 0;
+  border: 0;
   background: none;
   color: var(--cell-alias-ink);
   font-size: var(--cell-font-size-sm);
   padding: 6px 8px;
   text-align: left;
+}
+
+/* only on hover: the list is for opening sessions, archiving is the exception */
+.row-act {
+  flex: 0 0 auto;
+  border: 0;
+  background: none;
+  color: var(--cell-alias-ink-faint);
+  font-size: var(--cell-font-size-xs);
+  padding: 0 8px;
+  opacity: 0;
+}
+
+.row:hover .row-act,
+.row-act:focus {
+  opacity: 1;
+}
+
+.row-act:hover {
+  color: var(--cell-alias-accent);
+}
+
+.list-mode {
+  display: flex;
+  gap: 4px;
+  padding: 2px 10px 8px;
+}
+
+.seg {
+  flex: 1;
+  border: 1px solid var(--cell-alias-line-soft);
+  border-radius: var(--cell-radius-pill);
+  background: none;
+  color: var(--cell-alias-ink-dim);
+  font-size: var(--cell-font-size-xs);
+  padding: 2px 0;
+}
+
+.seg.on {
+  background: var(--cell-alias-accent-soft);
+  border-color: var(--cell-alias-accent-line);
+  color: var(--cell-alias-accent);
+  font-weight: 600;
 }
 
 .row:hover {
