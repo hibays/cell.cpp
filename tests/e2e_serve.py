@@ -502,6 +502,60 @@ def run_once(attempt: int) -> bool:
         assert "slow" in nturn.get("output", ""), nturn.get("output", "")[:60]
         print("notice event streamed:", notices[0]["topic"], "(cross-session filtered)")
 
+        # ---- per-worker report: the trace view's sub-agent block ----
+        jid = job2.get("job") or job2.get("id") or job2.get("job_id")
+        assert jid, job2
+        rep = api(base, token, "GET", f"/v1/sessions/{fresh}/teamworks/{jid}/report")
+        assert rep["job"] == jid and isinstance(rep["workers"], list), rep
+        assert api_code(base, token, "GET", f"/v1/sessions/{fresh}/teamworks/tw-nope/report") == 404
+        assert api_code(base, token, "GET", "/v1/sessions/ghost-x/teamworks/tw-x/report") == 404
+        added = api(base, token, "POST", f"/v1/sessions/{fresh}/teamworks/{jid}/workers",
+                    {"works": "审一遍 SSE 事件"})
+        assert added.get("ok") is True, added
+        rep2 = api(base, token, "GET", f"/v1/sessions/{fresh}/teamworks/{jid}/report")
+        names = [w["name"] for w in rep2["workers"]]
+        # the kernel assigns worker names (worker_0, …), so the report is checked
+        # by what was appended, not by a name the client asked for
+        assert len(names) == len(rep["workers"]) + 1, (names, rep["workers"])
+        fresh_worker = rep2["workers"][-1]
+        assert fresh_worker["name"] in names, fresh_worker
+        assert fresh_worker["works"] == "审一遍 SSE 事件", fresh_worker
+        # a child that has not run reports zero rounds and no steps, not a guess
+        assert fresh_worker["rounds"] == 0 and fresh_worker["tool_calls"] == 0, fresh_worker
+        assert fresh_worker["status"] in ("pending", "running"), fresh_worker
+        print(f"teamwork report: {jid} -> {names}")
+
+        # ---- clearing a session (the REST twin of /clear) ----
+        csid = api(base, token, "POST", "/v1/sessions")["id"]
+        before = api(base, token, "POST", f"/v1/sessions/{csid}/turn", {"text": "先记一句话"})
+        assert "mock reply" in before.get("output", ""), before
+        cleared = api(base, token, "POST", f"/v1/sessions/{csid}/clear")
+        assert cleared["cleared"] is True and cleared["removed"] > 0, cleared
+        left = api(base, token, "GET", f"/v1/sessions/{csid}/messages").get("messages", [])
+        roles = [m.get("role") for m in left]
+        assert "user" not in roles, f"the transcript survived a clear: {roles}"
+        assert api_code(base, token, "POST", "/v1/sessions/ghost-x/clear") == 404
+        # and the session is still usable afterwards
+        again = api(base, token, "POST", f"/v1/sessions/{csid}/turn", {"text": "还在吗"})
+        assert "mock reply" in again.get("output", ""), again
+        print(f"clear: removed {cleared['removed']} messages, session still usable")
+
+        # a clear while a turn runs is refused, not queued
+        busid = api(base, token, "POST", "/v1/sessions")["id"]
+
+        def slow_turn():
+            try:
+                api(base, token, "POST", f"/v1/sessions/{busid}/turn", {"text": "跑久点 [SLOW]"})
+            except Exception:
+                pass
+
+        th = threading.Thread(target=slow_turn)
+        th.start()
+        time.sleep(0.5)
+        assert api_code(base, token, "POST", f"/v1/sessions/{busid}/clear") == 409
+        th.join(timeout=30)
+        print("clear while streaming: 409")
+
         # ---- handle regression: a worker thread per request must not leak ----
         # The accept loop used to run every connection on a detached thread.
         # Under MinGW/winpthreads detach() never closes the Win32 thread handle,
