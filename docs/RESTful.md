@@ -126,6 +126,7 @@ anywhere: it never resolves to a path.
 | ✅ | `POST /v1/sessions` | creates a fresh current session → `201 {id, cwd, previous}` (equivalent of `/new`; uses the server's working directory) |
 | ✅ | `GET /v1/sessions/{id}/messages?after=N&limit=M` | transcript entries verbatim (`role`/`content`/tool calls/reasoning); 404 when the session has no transcript yet |
 | ✅ | `DELETE /v1/sessions/{id}` | removes the session folder; 409 while a turn runs in it |
+| ✅ | `GET /v1/sessions/{id}/export?format=json\|md` | the transcript for export. `json` → `{session, format, count, messages}`; `md` → `{session, format, count, markdown}` with role headings, reasoning as a quote, tool calls as a list and tool results as fenced blocks (clipped at 60 lines each). The injected system block is left out — it is configuration, not conversation. `400 bad_format` for anything else, `404` for a session with no transcript. The desktop shell exports a self-contained HTML through the bridge instead; this is what a browser has |
 | ✅ | `POST /v1/sessions/{id}/clear` | `/clear` (reset context, keep the file) |
 | 🚧 | `GET /v1/sessions/{id}/archives` | `/saved list` |
 | 🚧 | `POST /v1/sessions/{id}/export` | the self-contained HTML exporter (`/export`) |

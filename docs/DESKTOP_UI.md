@@ -118,9 +118,15 @@ units), `vue-tsc --noEmit`, `vite build` + `embed_webui.mjs`, `cell.cellui_boot`
   `summary_reports`, the child's transcript on request), surfaced as a 子智能体
   block in the trace view; and B7's `/clear` as `POST /v1/sessions/{id}/clear`
   with the CLI's guards — it refuses while a turn or a background job runs — plus
-  the `/clear` command in the composer. **Still open:** session archives, a REST
-  export endpoint, diff review inside the viewer, and uploaded (as opposed to
-  referenced) attachments.
+  the `/clear` command in the composer. - **P6 — the last two gaps.** Diff review inside the file viewer: the changes
+  this session made to *that* file, parsed from the transcript's own `edit` /
+  `write` results (`lib/diffView.ts` + `lib/diffs.ts`) — the kernel made the
+  edits and reported them, and nothing is recomputed by diffing file states. And
+  a REST export (`GET /v1/sessions/{id}/export?format=md`) so the export panel
+  works in a plain browser, which has neither the native save dialog nor a place
+  to reveal a file; batch export still needs the shell and says so.
+  **Still open:** session archives, and uploaded (as opposed to referenced)
+  attachments.
 
 ## 5. Non-goals and constraints
 
