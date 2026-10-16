@@ -10,7 +10,9 @@ const emit = defineEmits<{ (e: 'close'): void }>()
 
 const open = ref(true)
 const busy = ref(false)
-const tab = ref<'settings' | 'agent'>('settings')
+import ProviderPanel from '../components/ProviderPanel.vue'
+
+const tab = ref<'settings' | 'agent' | 'providers'>('settings')
 
 // The fence is one choice, not two independent switches: a preset sets
 // sandbox_mode and autoallow together, so the UI never leaves them in a
@@ -55,6 +57,7 @@ async function patch(patch: Record<string, unknown>): Promise<void> {
         <div class="tabs">
           <button class="tab" :class="{ on: tab === 'settings' }" @click="tab = 'settings'">设置</button>
           <button class="tab" :class="{ on: tab === 'agent' }" @click="tab = 'agent'">Agent 能力</button>
+          <button class="tab" :class="{ on: tab === 'providers' }" @click="tab = 'providers'">模型服务</button>
         </div>
         <button class="x" @click="emit('close')">✕</button>
       </header>
@@ -138,6 +141,11 @@ async function patch(patch: Record<string, unknown>): Promise<void> {
         <p class="note">autoallow 仅在 full-access 下生效；开启后 exec 由模型自行判断是否放行。</p>
       </section>
       <AgentPanel v-else-if="tab === 'agent'" />
+      <ProviderPanel
+        v-else-if="tab === 'providers'"
+        :root="store.bootstrap?.root"
+        :root-writable="store.bootstrap?.root_writable"
+      />
     </div>
   </div>
 </template>

@@ -35,6 +35,7 @@ import {
   uploadFiles,
 } from '../store'
 import { argCandidates, findCommand, matchCommands, type CommandDef } from '../lib/commands'
+import { friendlyError } from '../lib/friendly'
 import { mentionCandidates } from '../lib/mentions'
 import { PRESETS, fromKernelConfig } from '../lib/permissions'
 import { replaceToken, tokenAt, type TriggerToken } from '../lib/trigger'
@@ -293,7 +294,7 @@ async function runCommand(cmd: CommandDef, arg: string): Promise<void> {
         toast('warn', `未知命令：${cmd.name}`)
     }
   } catch (e) {
-    toast('bad', `${cmd.name} 失败：${String(e)}`)
+    toast('bad', `${cmd.name} 失败：${friendlyError(e)}`)
   }
 }
 

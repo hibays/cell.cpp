@@ -250,6 +250,11 @@ export function classifyError(e: unknown): CellErrorView {
   if (e && typeof e === 'object') {
     const o = e as { status?: unknown; code?: unknown }
     if (typeof o.status === 'number') {
+      // The kernel pairs a precise code with a coarse status (502 +
+      // `provider_unreachable`, 400 + `context_window`). Prefer the code when we
+      // know it — mapping by status alone threw that taxonomy away — and fall
+      // back to the status when the code is missing or unfamiliar.
+      if (typeof o.code === 'string' && isKnown(o.code)) return view(o.code)
       const code = statusToCode(o.status)
       const raw = typeof o.code === 'string' && !isKnown(o.code) ? o.code : undefined
       return view(code, raw)

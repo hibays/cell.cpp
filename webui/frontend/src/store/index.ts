@@ -4,6 +4,7 @@
 import { reactive } from 'vue'
 import { api } from '../lib/api'
 import { classifyError } from '../lib/errors'
+import { friendlyError, pollQuiet } from '../lib/friendly'
 import { createEventBus } from '../lib/events'
 import { applyEvent, emptyLiveTurn, type LiveTurn } from '../lib/liveTurn'
 import { buildJobInput, jobInputError } from '../lib/teamwork'
@@ -211,7 +212,7 @@ export async function refreshSessions(): Promise<void> {
     state.sessions = sortByRecency(sessions)
     if (!state.currentSession && current) state.currentSession = current
   } catch (e) {
-    toast('warn', `session list failed: ${String(e)}`)
+    toast('warn', `session list failed: ${friendlyError(e)}`)
   }
 }
 
@@ -255,6 +256,30 @@ export function openSettings(v: boolean): void {
 // its id, so a link to it still opens. The sidebar switches between the two
 // lists rather than mixing them.
 
+/** Delete a session outright. The shell asks twice before calling this — the
+ *  transcript goes with it, which is what makes it different from archiving. */
+export async function removeSession(sid: string): Promise<boolean> {
+  try {
+    await api.deleteSession(sid)
+    toast('ok', '会话已删除（记录不可恢复）')
+    if (state.currentSession === sid) {
+      state.currentSession = null
+      state.messages = []
+      state.jobs = []
+      state.workerReport = null
+      state.approvalsLog = []
+      const next = state.sessions.find((x) => x.id !== sid)
+      if (next) await selectSession(next.id)
+      else await newSession()
+    }
+    await refreshSessions()
+    return true
+  } catch (e) {
+    toast('bad', `删除失败：${friendlyError(e)}`)
+    return false
+  }
+}
+
 export function toggleArchived(): void {
   state.showArchived = !state.showArchived
   void refreshSessions()
@@ -272,7 +297,7 @@ export async function setArchived(sid: string, archived: boolean): Promise<void>
     toast('ok', archived ? '已归档（记录仍保留，可恢复）' : '已恢复到活跃列表')
     await refreshSessions()
   } catch (e) {
-    toast('bad', `${archived ? '归档' : '恢复'}失败：${String(e)}`)
+    toast('bad', `${archived ? '归档' : '恢复'}失败：${friendlyError(e)}`)
   }
 }
 
@@ -309,7 +334,7 @@ export async function createTeamwork(tasks: string[], mode: 'serial' | 'parallel
     await afterJobChange()
     return true
   } catch (e) {
-    toast('bad', `创建协作任务失败：${String(e)}`)
+    toast('bad', `创建协作任务失败：${friendlyError(e)}`)
     return false
   }
 }
@@ -331,7 +356,7 @@ export async function controlJob(jobId: string, action: 'run' | 'stop' | 'resume
     toast('ok', words[action] ?? '完成')
     await afterJobChange()
   } catch (e) {
-    toast('bad', `${action} 失败：${String(e)}`)
+    toast('bad', `${action} 失败：${friendlyError(e)}`)
   }
 }
 
@@ -343,7 +368,7 @@ export async function addJobWorker(jobId: string, works: string): Promise<void> 
     toast('ok', '已加入一名子智能体（运行前可继续添加）')
     await afterJobChange()
   } catch (e) {
-    toast('bad', `添加失败：${String(e)}`)
+    toast('bad', `添加失败：${friendlyError(e)}`)
   }
 }
 
@@ -355,7 +380,7 @@ export async function removeJobWorker(jobId: string, name: string): Promise<void
     toast('ok', `已移除 ${name}`)
     await afterJobChange()
   } catch (e) {
-    toast('bad', `移除失败：${String(e)}`)
+    toast('bad', `移除失败：${friendlyError(e)}`)
   }
 }
 
@@ -383,7 +408,7 @@ export async function uploadFiles(files: File[] | FileList): Promise<void> {
       attach(r.path)
       ok++
     } catch (e) {
-      toast('bad', `${f.name} 上传失败：${String(e)}`)
+      toast('bad', `${f.name} 上传失败：${friendlyError(e)}`)
     }
   }
   if (ok) {
@@ -405,7 +430,7 @@ export async function openFileAt(path: string): Promise<void> {
     state.sideTab = 'files'
   } catch (e) {
     state.openFile = null
-    toast('warn', `无法打开 ${path}：${String(e)}`)
+    toast('warn', `无法打开 ${path}：${friendlyError(e)}`)
   }
 }
 
@@ -414,13 +439,11 @@ export function closeFile(): void {
 }
 
 export async function refreshLogs(tail = 300): Promise<void> {
-  try {
-    const out = await api.logs(tail)
-    state.logLines = out.lines
-    state.logsTruncated = out.truncated
-  } catch (e) {
-    toast('warn', `读取日志失败：${String(e)}`)
-  }
+  // polled every few seconds: a hiccup is retried quietly rather than toasted
+  const out = await pollQuiet(() => api.logs(tail))
+  if (!out) return
+  state.logLines = out.lines
+  state.logsTruncated = out.truncated
 }
 
 /** Re-read the transcript of the session on screen (after a turn, or on demand). */
@@ -442,11 +465,10 @@ export async function refreshJobs(): Promise<void> {
     state.jobs = []
     return
   }
-  try {
-    state.jobs = (await api.getSessionTeamworks(id)).jobs
-  } catch {
-    state.jobs = []
-  }
+  // polled every couple of seconds while a job runs: keep the last list on a
+  // hiccup, because an empty list reads as "no jobs", which is a lie
+  const list = await pollQuiet(() => api.getSessionTeamworks(id))
+  if (list) state.jobs = list.jobs
 }
 
 /** The approval audit for the session on screen. */
@@ -456,11 +478,10 @@ export async function refreshApprovals(tail = 100): Promise<void> {
     state.approvalsLog = []
     return
   }
-  try {
-    state.approvalsLog = (await api.sessionApprovals(id, tail)).approvals ?? []
-  } catch {
-    state.approvalsLog = []
-  }
+  // a failed read leaves the previous list on screen: emptying it would make a
+  // blip look like "no approvals", which is a different and wrong statement
+  const out = await pollQuiet(() => api.sessionApprovals(id, tail))
+  if (out) state.approvalsLog = out.approvals ?? []
 }
 
 /** Load one job's per-worker report (counters plus, on request, transcripts). */
@@ -498,7 +519,7 @@ export async function clearCurrentSession(): Promise<boolean> {
     toast('ok', `已清空会话（移除 ${r.removed} 条消息${r.jobs ? `，${r.jobs} 个协作任务` : ''}）`)
     return true
   } catch (e) {
-    toast('bad', `清空失败：${String(e)}`)
+    toast('bad', `清空失败：${friendlyError(e)}`)
     return false
   }
 }
@@ -576,7 +597,7 @@ export async function setModel(provider: string, model?: string): Promise<void> 
     }
     toast('ok', `模型：${r.current_provider}:${r.current_model}`)
   } catch (e) {
-    toast('bad', `切换模型失败：${String(e)}`)
+    toast('bad', `切换模型失败：${friendlyError(e)}`)
   }
 }
 
@@ -584,7 +605,7 @@ export async function setThink(level: number): Promise<void> {
   try {
     state.config = await api.patchConfig({ think_level: level })
   } catch (e) {
-    toast('bad', `调整思考深度失败：${String(e)}`)
+    toast('bad', `调整思考深度失败：${friendlyError(e)}`)
   }
 }
 
@@ -593,7 +614,7 @@ export async function setFence(mode: string, autoallow: boolean): Promise<void> 
   try {
     state.config = await api.patchConfig({ sandbox_mode: mode, autoallow } as Partial<ConfigSnapshot>)
   } catch (e) {
-    toast('bad', `切换权限失败：${String(e)}`)
+    toast('bad', `切换权限失败：${friendlyError(e)}`)
   }
 }
 
@@ -601,7 +622,7 @@ export async function setTools(on: boolean): Promise<void> {
   try {
     state.config = await api.patchConfig({ tools: on } as Partial<ConfigSnapshot>)
   } catch (e) {
-    toast('bad', `切换工具失败：${String(e)}`)
+    toast('bad', `切换工具失败：${friendlyError(e)}`)
   }
 }
 
@@ -633,7 +654,7 @@ export async function newSession(): Promise<string | null> {
     toast('ok', `new session ${id.slice(-6)}`)
     return id
   } catch (e) {
-    toast('bad', `cannot create session: ${String(e)}`)
+    toast('bad', `cannot create session: ${friendlyError(e)}`)
     return null
   }
 }
@@ -648,7 +669,7 @@ export async function deleteSession(id: string): Promise<void> {
     await refreshSessions()
     toast('ok', 'session deleted')
   } catch (e) {
-    toast('bad', `delete failed: ${String(e)}`)
+    toast('bad', `delete failed: ${friendlyError(e)}`)
   }
 }
 
@@ -722,6 +743,24 @@ function endStream(): void {
   pending = []
 }
 
+/**
+ * Did the turn we just lost actually run? The transcript is the only honest
+ * witness: if the text we sent is the session's last user message and an answer
+ * followed it, the turn landed and only the stream was lost.
+ */
+async function turnLanded(sessionId: string, sent: string): Promise<boolean> {
+  const { messages } = await api.sessionMessages(sessionId).catch(() => ({ messages: [] as unknown[] }))
+  if (!Array.isArray(messages) || !messages.length) return false
+  const rows = messages.filter(
+    (m): m is { role?: string; content?: unknown } => !!m && typeof m === 'object',
+  )
+  if (!rows.length) return false
+  const lastUser = [...rows].reverse().find((m) => m.role === 'user')
+  const body = typeof lastUser?.content === 'string' ? lastUser.content : JSON.stringify(lastUser?.content ?? '')
+  if (!body.includes(sent.slice(0, 40))) return false
+  return rows.some((m) => m.role === 'assistant')
+}
+
 export async function send(text: string): Promise<void> {
   const id = state.currentSession
   if (!id || !text.trim() || state.streaming) return
@@ -733,6 +772,17 @@ export async function send(text: string): Promise<void> {
     const v = classifyError(e)
     if (v.code === 'aborted') {
       state.lastInterrupted = true
+    } else if (v.code === 'transport') {
+      // The connection to the local kernel dropped mid-turn. Whether the turn
+      // ran is a question about the *kernel*, not about this window — so ask it,
+      // instead of reporting a browser error or (worse) resending the message.
+      const landed = await turnLanded(id, text)
+      toast(
+        landed ? 'warn' : 'bad',
+        landed
+          ? '与本地内核的连接中断了，但这一轮已经跑完，记录已重新载入。'
+          : `与本地内核的连接中断了，这一轮可能没有跑完（${friendlyError(e)}）。可以重发一次。`,
+      )
     } else {
       toast(v.retryable ? 'warn' : 'bad', `${v.title} — ${v.hint}`)
     }
@@ -759,7 +809,7 @@ export async function interrupt(): Promise<void> {
     await api.interrupt(state.currentSession)
     state.lastInterrupted = true
   } catch (e) {
-    toast('warn', `interrupt failed: ${String(e)}`)
+    toast('warn', `interrupt failed: ${friendlyError(e)}`)
   }
 }
 
@@ -795,7 +845,7 @@ export async function approve(id: string): Promise<void> {
     state.approvals = state.approvals.filter((a) => a.request_id !== id)
     void refreshApprovals() // the decision is now on the record
   } catch (e) {
-    toast('bad', `approval failed: ${String(e)}`)
+    toast('bad', `approval failed: ${friendlyError(e)}`)
   }
 }
 
@@ -805,7 +855,7 @@ export async function deny(id: string, reason = 'rejected in the UI'): Promise<v
     state.approvals = state.approvals.filter((a) => a.request_id !== id)
     void refreshApprovals()
   } catch (e) {
-    toast('bad', `rejection failed: ${String(e)}`)
+    toast('bad', `rejection failed: ${friendlyError(e)}`)
   }
 }
 

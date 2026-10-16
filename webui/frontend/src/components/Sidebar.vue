@@ -8,6 +8,7 @@
 import { computed, onMounted, onUnmounted, ref } from 'vue'
 import {
   newSession,
+  removeSession,
   setArchived,
   toggleArchived,
   openSettings,
@@ -26,6 +27,9 @@ defineEmits<{ export: [] }>()
 const searchOpen = ref(false)
 const rawQuery = ref('')
 const expanded = ref<Record<string, boolean>>({})
+/** the session whose delete button has been armed, if any — deleting takes the
+ *  transcript with it, so the row asks twice */
+const armed = ref<string | null>(null)
 let debounce: number | undefined
 
 // The filter itself is debounced (harness value, 250 ms): typing must not re-sort
@@ -146,13 +150,25 @@ onUnmounted(() => {
               <span class="row-title">{{ sessionLabel(s) }}</span>
               <span class="age">{{ relativeTime(s.updated_at) }}</span>
             </button>
-            <button
-              class="row-act"
-              :title="store.showArchived ? '恢复到活跃列表' : '归档（记录保留，可恢复）'"
-              @click.stop="setArchived(s.id, !store.showArchived)"
-            >
-              {{ store.showArchived ? '恢复' : '归档' }}
-            </button>
+            <!-- deleting takes the transcript with it, so it asks twice: the
+                 first click arms the row, the second one removes it -->
+            <span v-if="armed === s.id" class="confirm">
+              确认删除
+              <button class="yes" type="button" @click.stop="armed = null; removeSession(s.id)">删除</button>
+              <button class="no" type="button" @click.stop="armed = null">取消</button>
+            </span>
+            <template v-else>
+              <button
+                class="row-act"
+                :title="store.showArchived ? '恢复到活跃列表' : '归档（记录保留，可恢复）'"
+                @click.stop="setArchived(s.id, !store.showArchived)"
+              >
+                {{ store.showArchived ? '恢复' : '归档' }}
+              </button>
+              <button class="row-act danger" type="button" title="删除会话（不可恢复）" @click.stop="armed = s.id">
+                删除
+              </button>
+            </template>
           </div>
           <button
             v-if="hiddenCount(g.key, g.sessions.length)"
@@ -403,6 +419,37 @@ onUnmounted(() => {
 
 .row-act:hover {
   color: var(--cell-alias-accent);
+}
+
+.row-act.danger:hover {
+  color: var(--cell-alias-bad);
+}
+
+.confirm {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: var(--cell-font-size-xs);
+  color: var(--cell-alias-ink-dim);
+  padding-right: 6px;
+}
+
+.confirm .yes,
+.confirm .no {
+  border: 1px solid var(--cell-alias-line);
+  border-radius: var(--cell-radius-xs);
+  background: none;
+  font-size: var(--cell-font-size-xs);
+  padding: 0 5px;
+}
+
+.confirm .yes {
+  border-color: var(--cell-alias-bad);
+  color: var(--cell-alias-bad);
+}
+
+.confirm .no {
+  color: var(--cell-alias-ink-dim);
 }
 
 .list-mode {

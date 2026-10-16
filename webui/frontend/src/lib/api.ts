@@ -20,6 +20,9 @@ export function resolveNative(name: string): ((...args: unknown[]) => Promise<st
 }
 
 export interface Bootstrap {
+  /** Where settings, sessions and the vault live — and whether it is writable. */
+  root?: string
+  root_writable?: boolean
   version: string
   serve_ok: boolean
   serve_error: string
@@ -600,6 +603,14 @@ export class ApiClient {
     return this.request<{ session: string; approvals: ApprovalRecord[] }>(
       `/sessions/${encodeURIComponent(sessionId)}/approvals?tail=${tail}`,
     )
+  }
+
+  /** The self-contained HTML page the CLI writes, for a browser download. */
+  async exportHtml(sessionId: string): Promise<{ html: string; count: number }> {
+    const r = await this.request<{ html: string; count: number }>(
+      `/sessions/${encodeURIComponent(sessionId)}/export?format=html`,
+    )
+    return { html: r.html ?? '', count: r.count ?? 0 }
   }
 
   async exportMarkdown(sessionId: string): Promise<{ markdown: string; count: number }> {

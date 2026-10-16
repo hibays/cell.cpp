@@ -25,14 +25,30 @@ function download(name: string, text: string, mime: string): void {
   setTimeout(() => URL.revokeObjectURL(url), 2000)
 }
 
-async function downloadMarkdown(sid: string): Promise<void> {
-  const r = await api.exportMarkdown(sid)
-  if (!r.count) {
-    toast('warn', '这个会话还没有记录')
-    return
+/**
+ * The browser path: the kernel's own HTML renderer, so a download here is the
+ * same page the shell writes to disk — teamwork pane and all — rather than a
+ * poorer markdown substitute. Markdown stays as the second choice, for a session
+ * the renderer refuses (an empty transcript).
+ */
+async function downloadHtml(sid: string): Promise<void> {
+  try {
+    const r = await api.exportHtml(sid)
+    if (!r.count) {
+      toast('warn', '这个会话还没有记录')
+      return
+    }
+    download(`cell-${sid.slice(-12)}.html`, r.html, 'text/html')
+    toast('ok', `已下载 HTML（${r.count} 条消息）`)
+  } catch {
+    const r = await api.exportMarkdown(sid)
+    if (!r.count) {
+      toast('warn', '这个会话还没有记录')
+      return
+    }
+    download(`cell-${sid.slice(-12)}.md`, r.markdown, 'text/markdown')
+    toast('ok', `已下载 Markdown（${r.count} 条消息）`)
   }
-  download(`cell-${sid.slice(-12)}.md`, r.markdown, 'text/markdown')
-  toast('ok', `已下载 Markdown（${r.count} 条消息）`)
 }
 
 const selected = ref<Set<string>>(new Set())
@@ -60,7 +76,7 @@ async function run(kind: 'current' | 'batch' | 'all', id?: string): Promise<void
         return
       }
       if (!hasShell) {
-        await downloadMarkdown(sid)
+        await downloadHtml(sid)
         return
       }
       const r = await bridge.exportSession(sid)
@@ -95,14 +111,14 @@ async function run(kind: 'current' | 'batch' | 'all', id?: string): Promise<void
     <p class="desc">
       导出自包含 HTML（与 CLI <code>/export</code> 同一渲染器，含 Teamwork 子代理面板）。
       <template v-if="!hasShell">
-        当前没有桌面壳：单会话导出改为下载 Markdown，批量与全量需要桌面壳。
+        当前没有桌面壳：单会话导出改为下载 HTML（与 CLI 同一渲染器），批量与全量需要桌面壳。
       </template>
     </p>
 
     <div class="actions">
       <button class="row primary-row" @click="run('current')">
-        <span class="label">{{ hasShell ? '导出当前会话' : '下载当前会话（Markdown）' }}</span>
-        <span class="hint">{{ hasShell ? '侧栏/聊天中正在进行的会话' : '经 REST 导出，浏览器直接下载' }}</span>
+        <span class="label">{{ hasShell ? '导出当前会话' : '下载当前会话（HTML）' }}</span>
+        <span class="hint">{{ hasShell ? '侧栏/聊天中正在进行的会话' : '经 REST 导出，与 CLI 同一渲染器' }}</span>
       </button>
       <button class="row" :disabled="!selected.size" @click="run('batch')">
         <span class="label">批量导出所选（{{ selected.size }}）</span>
