@@ -148,6 +148,40 @@ units), `vue-tsc --noEmit`, `vite build` + `embed_webui.mjs`, `cell.cellui_boot`
   reason. The risk marking calls the *same* `riskOf` the live approval card uses,
   so the history and the card cannot drift apart. It refreshes after each decision
   rather than polling, and a session switch clears it.
+- **P10 — the last three.** *Deleting* a session: the sidebar's row action arms
+  first and deletes on the second click, because deleting takes the transcript
+  with it — which is exactly what separates it from archiving — and the shell
+  moves to another session rather than stranding you on an empty view. *Exporting
+  from a browser*: `GET …/export?format=html` serves the kernel's own renderer, so
+  a browser downloads the same self-contained page (teamwork pane included) that
+  the shell writes to disk; markdown stays as the fallback for a transcript the
+  renderer refuses. *Concurrent sessions*: the core still runs one turn at a time
+  — the turn engine reads one shared history object throughout, so real
+  parallelism would mean threading a session handle through it — but a second
+  `POST …/turn` now **waits its turn** instead of returning 409, with the wait
+  bounded at 180 s and reported back as `waited_ms`.
+- **P11 — wiring up what the kernel already had.** Three complaints from using
+  the shell, each a real gap rather than a missing feature:
+  * *"It asks for my endpoint again on every launch."* The runtime root defaults
+    to a directory beside the executable, which is read-only when cellui lives in
+    Program Files — and the config write failed **silently** (the route answered
+    201 regardless). Now: cellui probes the root at startup and falls back to a
+    per-user location, the config routes answer `500 config_unwritable` with the
+    path instead of pretending, `GET /v1/health` reports `root` + `root_writable`,
+    and the settings panel shows both — a red line naming the cause, not a form
+    that reappears every morning.
+  * *"Sometimes it says `failed to fetch`."* That was `String(e)` leaking the
+    browser's own message into a toast. Every user-facing failure now goes
+    through `lib/friendly.ts` (a sentence with a next step, in the shell's voice),
+    the background pollers retry once quietly instead of toasting, and a turn
+    whose stream dropped asks the *kernel* whether it ran before reporting
+    anything — so a lost connection never turns into a resend or a lost answer.
+    While fixing that, `classifyError` now prefers the kernel's precise code over
+    the coarse HTTP status, which had been discarding the whole taxonomy.
+  * *"Providers are too weak."* The kernel has served create/update/delete/select
+    and model probing all along; the shell could only reach them through the
+    one-shot onboarding form. Settings now has a 模型服务 tab with the whole
+    surface — list, add, probe models, rotate a key, switch, delete.
   With this, every row of the B1–B7 / F1–F11 matrix is either delivered or
   written down as a non-goal with its reason.
 

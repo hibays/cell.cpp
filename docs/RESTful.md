@@ -40,8 +40,13 @@ cell serve: discovery file: /path/to/bin/.cell/server.json
   that touches session/config state (turns, compaction, teamwork control, skill
   *loading*, …) is queued onto the core thread and the worker waits for the
   response.
-* **One turn runs at a time** (the core is single-threaded). A second
-  `POST …/turn` while one is running returns `409 busy`.
+* **One turn runs at a time** (the core is single-threaded, on purpose: the turn
+  engine reads one shared history object throughout). A second `POST …/turn`
+  therefore *waits its turn* on a condition variable rather than being refused —
+  refusing loses the message the user typed — and the reply carries `waited_ms`
+  so "instant" and "queued" are distinguishable. The wait is bounded (180 s);
+  past that it is still a `409 busy`. Quick state-changing endpoints (`clear`,
+  `archive`, `compact`, skill loads) keep failing fast instead of queueing.
 * Turn output is streamed at **text level** (`output` events carrying the same
   bytes the terminal would show). Token-level `token`/`reasoning` events,
   `tool_call`/`tool_result` events and per-round `usage` events arrive with the
@@ -95,9 +100,15 @@ anywhere: it never resolves to a path.
 
 ### 3.1 Meta
 
+Every mutation that persists configuration (`POST`/`DELETE /v1/providers`,
+`POST /v1/providers/{name}/select`, `PATCH /v1/config`) checks the write first:
+a failure answers **`500 config_unwritable`** with `{root}` instead of the usual
+`2xx`, because a setting that was accepted and then lost is worse than one that
+was refused.
+
 | Status | Endpoint | Notes |
 | --- | --- | --- |
-| ✅ | `GET /v1/health` | **no auth**; `{status, version, uptime_s, provider, model, session, sandbox_mode, turn_active}` — snapshot refreshed by the core thread |
+| ✅ | `GET /v1/health` | liveness plus `{root, root_writable}` — where settings/sessions/vault live and whether that place accepts a write. A root that cannot be written is why a client would re-ask for its endpoint on every launch, so it is reported rather than discovered | **no auth**; `{status, version, uptime_s, provider, model, session, sandbox_mode, turn_active}` — snapshot refreshed by the core thread |
 | ✅ | `GET /v1/version` | `{version}` |
 | ✅ | `POST /v1/shutdown` | graceful stop; the core loop drains, the server closes, exit code 0 |
 
@@ -126,7 +137,7 @@ anywhere: it never resolves to a path.
 | ✅ | `POST /v1/sessions` | creates a fresh current session → `201 {id, cwd, previous}` (equivalent of `/new`; uses the server's working directory) |
 | ✅ | `GET /v1/sessions/{id}/messages?after=N&limit=M` | transcript entries verbatim (`role`/`content`/tool calls/reasoning); 404 when the session has no transcript yet |
 | ✅ | `DELETE /v1/sessions/{id}` | removes the session folder; 409 while a turn runs in it |
-| ✅ | `GET /v1/sessions/{id}/export?format=json\|md` | the transcript for export. `json` → `{session, format, count, messages}`; `md` → `{session, format, count, markdown}` with role headings, reasoning as a quote, tool calls as a list and tool results as fenced blocks (clipped at 60 lines each). The injected system block is left out — it is configuration, not conversation. `400 bad_format` for anything else, `404` for a session with no transcript. The desktop shell exports a self-contained HTML through the bridge instead; this is what a browser has |
+| ✅ | `GET /v1/sessions/{id}/export?format=json\|md\|html` | the transcript for export. `json` → `{session, format, count, messages}`; `md` → `{session, format, count, markdown}` with role headings, reasoning as a quote, tool calls as a list and tool results as fenced blocks (clipped at 60 lines each), the injected system block left out; `html` → `{session, format, count, jobs, html}` — **the same self-contained page the CLI `/export` writes, teamwork pane and all**, rendered into the runtime's tmp area and read back, so a browser downloads the full export rather than a poorer substitute. `422 export_failed` when the renderer refuses (an empty transcript), `400 bad_format` for anything else, `404` for a session with no transcript |
 | ✅ | `POST /v1/sessions/{id}/archive` / `unarchive` | hide a session from the default list and bring it back. Archiving is *only* hiding: the transcript, the id and every session-scoped route keep working, and the marker is a file inside the session directory. Rows carry `archived`; `GET /v1/sessions?archived=1` lists them. `409` while a turn or a background job is on that session, `404` unknown |
 | ✅ | `GET /v1/sessions/{id}/approvals?tail=N` | the approval audit written next to the transcript: `{session, approvals:[{id, session, tool, args, decision, reason, at}]}`, oldest first, last `N` (default 100) |
 | ✅ | `POST /v1/uploads?name=` | put bytes where the agent can read them: the body lands in the workspace's `.cell-uploads/<name>` and `{name, path, bytes}` comes back for the composer to attach. The name is a *name* — separators and control characters are dropped, a leading dot is refused, Windows device names get a prefix, and a colliding name gets a numeric suffix (an upload is not an edit). 8 MiB per file, `400` on an empty body. Deliberately **not** in `CELL_ROOT`: the tools refuse to read the runtime root, so a file parked there would be invisible to the agent it was sent for |
