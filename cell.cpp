@@ -16668,7 +16668,7 @@ details{break-inside:avoid}
                 .count();
         }
 
-        inline nlohmann::json sessions_json()
+        inline nlohmann::json sessions_json(bool include_archived = false)
         {
             cell::async_io::flush(); // listings must reflect queued session writes
             nlohmann::json out = nlohmann::json::array();
@@ -16708,6 +16708,14 @@ details{break-inside:avoid}
                     auto mtime = std::filesystem::last_write_time(tf, fec);
                     if (!fec)
                         e["updated_at"] = unix_seconds(mtime);
+                    // Archived sessions keep their transcript and stay addressable;
+                    // they just leave the default list. The marker is a file inside
+                    // the session directory, so archiving is reversible and survives
+                    // a restart.
+                    bool archived = std::filesystem::exists(f.path() / "archived", fec);
+                    e["archived"] = archived;
+                    if (archived && !include_archived)
+                        continue;
                     try
                     {
                         std::ifstream fin(tf);
@@ -16926,6 +16934,84 @@ details{break-inside:avoid}
             size_t from = lines.size() > max_lines ? lines.size() - max_lines : 0;
             for (size_t i = from; i < lines.size(); i++)
                 out["lines"].push_back(to_valid_utf8(lines[i]));
+            return out;
+        }
+
+        // An upload's filename is a *name*, not a path: separators are dropped,
+        // control characters go, a leading dot is refused (so nothing lands
+        // hidden in the user's workspace), and the Windows device names get a
+        // prefix — they would otherwise be unopenable.
+        inline std::string safe_upload_name(const std::string &raw)
+        {
+            std::string name;
+            for (char c : raw)
+            {
+                if (c == '/' || c == '\\' || c == ':' || c == '*' || c == '?' || c == '"' || c == '<' ||
+                    c == '>' || c == '|')
+                    continue;
+                if (static_cast<unsigned char>(c) < 0x20)
+                    continue;
+                name += c;
+            }
+            while (!name.empty() && (name.front() == ' ' || name.front() == '.'))
+                name.erase(name.begin());
+            if (name.size() > 120)
+                name.resize(120);
+            if (name.empty())
+                name = "upload.txt";
+            std::string stem = name;
+            if (auto dot = stem.find('.'); dot != std::string::npos)
+                stem.resize(dot);
+            std::string lower = cell::box::to_lower(stem);
+            for (const char *device : {"con", "prn", "aux", "nul", "com1", "com2", "com3", "com4", "com5",
+                                       "com6", "com7", "com8", "com9", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5",
+                                       "lpt6", "lpt7", "lpt8", "lpt9"})
+                if (lower == device)
+                    return "_" + name;
+            return name;
+        }
+
+        // Uploads live in the *workspace*, not in the runtime root: the tools
+        // refuse to read inside CELL_ROOT (it holds the vault and the keys), so a
+        // file parked there would be invisible to the agent it was sent for.
+        // The directory is dot-prefixed so it stays out of the project's own
+        // file listings, and the shell surfaces it explicitly instead.
+        inline std::filesystem::path uploads_dir()
+        {
+            return cell::workdir() / ".cell-uploads";
+        }
+
+        inline nlohmann::json uploads_json()
+        {
+            std::filesystem::path dir = uploads_dir();
+            nlohmann::json entries = nlohmann::json::array();
+            nlohmann::json out{{"dir", ".cell-uploads"}, {"entries", entries}, {"truncated", false}};
+            std::error_code ec;
+            if (!std::filesystem::is_directory(dir, ec))
+                return out;
+            std::vector<nlohmann::json> rows;
+            for (auto &e : std::filesystem::directory_iterator(dir, ec))
+            {
+                if (ec)
+                    break;
+                if (!e.is_regular_file(ec))
+                    continue;
+                std::error_code fec, mec;
+                auto size = (long long)std::filesystem::file_size(e.path(), fec);
+                auto mtime = std::filesystem::last_write_time(e.path(), mec);
+                rows.push_back(nlohmann::json{{"name", e.path().filename().string()},
+                                              {"path", std::format(".cell-uploads/{}", e.path().filename().string())},
+                                              {"size", fec ? 0 : size},
+                                              {"mtime", mec ? 0LL : unix_seconds(mtime)}});
+            }
+            std::sort(rows.begin(), rows.end(), [](const nlohmann::json &a, const nlohmann::json &b)
+                      { return a["name"].get<std::string>() < b["name"].get<std::string>(); });
+            out["truncated"] = rows.size() > 200;
+            for (size_t i = 0; i < std::min(rows.size(), (size_t)200); i++)
+                entries.push_back(std::move(rows[i]));
+            // the reply was built before the rows existed, and the initializer
+            // list copied `entries`: without this assignment it stays empty
+            out["entries"] = std::move(entries);
             return out;
         }
 
@@ -24629,17 +24715,130 @@ int repl::run()
                 bool allow = body->value("decision", "") == "allow";
                 std::string why = body->value("reason", "");
                 std::string err;
+                // captured before the decision: afterwards the approval is gone
+                std::string tool, args;
+                for (const auto &a : serve_bridge.pending_approvals())
+                    if (a.is_object() && a.value("request_id", "") == seg[2])
+                    {
+                        tool = a.value("tool", "");
+                        args = a.value("args", "");
+                        break;
+                    }
                 if (serve_bridge.decide(seg[2], allow, why, err))
+                {
+                    // An audit line next to the transcript, so a session's approval
+                    // history is readable on its own — the log file has it too, but
+                    // a log is for the machine and this is for the person.
+                    try
+                    {
+                        std::filesystem::path log = cell::session_dir(h.now().id()) / "approvals.jsonl";
+                        std::ofstream out(log, std::ios::app);
+                        if (out)
+                            out << nlohmann::json{{"id", seg[2]},
+                                       {"session", h.now().id()},
+                                       {"tool", tool},
+                                                {"args", cell::serve::to_valid_utf8(cell::text::utf8_safe(args))},
+                                       {"decision", allow ? "allow" : "deny"},
+                                                {"reason", cell::serve::to_valid_utf8(cell::text::utf8_safe(why))},
+                                                {"at", (long long)std::time(nullptr)}}
+                                           .dump()
+                                    << "\n";
+                    }
+                    catch (const std::exception &e)
+                    {
+                        cell::sys::logger::instance().warn("approval", std::format("audit write failed: {}", e.what()));
+                    }
                     res.json(200, json{{"request_id", seg[2]}, {"decision", allow ? "allow" : "deny"}});
+                }
                 else
                     res.error(404, "not_found", err);
+                return;
+            }
+            if (seg.size() == 4 && seg[0] == "v1" && seg[1] == "sessions" && seg[3] == "approvals" && req.method == "GET")
+            {
+                // the audit trail written next to the transcript
+                std::string sid = seg[2];
+                size_t tail = query_size("tail");
+                if (tail == 0)
+                    tail = 100;
+                nlohmann::json rows = nlohmann::json::array();
+                std::error_code ec;
+                std::filesystem::path log = cell::session_dir(sid) / "approvals.jsonl";
+                if (std::filesystem::exists(log, ec))
+                {
+                    std::ifstream in(log);
+                    std::vector<std::string> lines;
+                    std::string ln;
+                    while (std::getline(in, ln))
+                        if (!ln.empty())
+                            lines.push_back(ln);
+                    size_t from = lines.size() > tail ? lines.size() - tail : 0;
+                    for (size_t i = from; i < lines.size(); i++)
+                    {
+                        auto parsed = nlohmann::json::parse(lines[i], nullptr, false);
+                        if (!parsed.is_discarded())
+                            rows.push_back(parsed);
+                    }
+                }
+                res.json(200, json{{"session", sid}, {"approvals", rows}});
                 return;
             }
             if (seg.size() == 2 && seg[0] == "v1" && seg[1] == "notices" && req.method == "GET")
             {
                 auto it = req.query.find("session");
                 std::string sid = it == req.query.end() ? std::string() : it->second;
-                res.json(200, json{{"pending", cell::serve::notices_json(sid)}});
+                auto itf = req.query.find("follow");
+                bool follow = itf != req.query.end() && (itf->second == "1" || itf->second == "true");
+                if (!follow)
+                {
+                    res.json(200, json{{"pending", cell::serve::notices_json(sid)}});
+                    return;
+                }
+                // follow=true: the same notices as an SSE stream, for a shell that
+                // wants them pushed rather than polled. Bounded on both ends — a max
+                // lifetime the client re-connects after, and a max number emitted —
+                // so a forgotten connection cannot hold a worker for ever. scan()
+                // only reads, so ids already sent are remembered to avoid a repeat.
+                std::string stream_sid = sid.empty() ? h.now().id() : sid;
+                long long seconds = 120;
+                if (auto itm = req.query.find("seconds"); itm != req.query.end())
+                {
+                    try
+                    {
+                        seconds = std::min<long long>(900, std::max<long long>(1, std::stoll(itm->second)));
+                    }
+                    catch (const std::exception &)
+                    {
+                    }
+                }
+                if (!res.open_stream() || !res.stream_write(": cell " CELL_VERSION " notice stream\n\n"))
+                    return;
+                auto deadline = cell::sys::detail::clock::now() + std::chrono::seconds(seconds);
+                std::unordered_set<std::string> seen;
+                long long emitted = 0;
+                while (cell::sys::detail::clock::now() < deadline && emitted < 200)
+                {
+                    for (const auto &n : cell::notice::scan(stream_sid))
+                    {
+                        if (seen.contains(n.id))
+                            continue;
+                        seen.insert(n.id);
+                        auto line = json{{"type", "notice"},
+                                         {"data", {{"id", n.id},
+                                                   {"session", stream_sid},
+                                                   {"from", n.from},
+                                                   {"topic", n.topic},
+                                                   {"body", n.body},
+                                                   {"created_at", n.created_at}}}}
+                                        .dump();
+                        if (!res.stream_write("data: " + line + "\n\n"))
+                            return; // the client is gone
+                        emitted++;
+                    }
+                    std::this_thread::sleep_for(std::chrono::milliseconds(250));
+                }
+                res.stream_write("data: " +
+                                 json{{"type", "notice_end"}, {"data", {{"emitted", emitted}}}}.dump() + "\n\n");
                 return;
             }
             if (seg.size() == 2 && seg[0] == "v1" && seg[1] == "notices" && req.method == "POST")
@@ -24701,6 +24900,60 @@ int repl::run()
                     return;
                 }
                 res.json(200, body);
+                return;
+            }
+            if (seg.size() == 2 && seg[0] == "v1" && seg[1] == "uploads" && req.method == "POST")
+            {
+                // An upload is "put these bytes where the agent can read them":
+                // the body lands under the workspace's .cell-uploads/ and the path
+                // comes back for the composer to attach like any other reference.
+                // That is deliberately not a promise to store it somewhere else —
+                // anywhere inside CELL_ROOT would be unreadable by the tools.
+                constexpr size_t kUploadMax = 8u * 1024 * 1024;
+                if (req.body.empty())
+                {
+                    res.error(400, "empty_upload", "no bytes in the request body");
+                    return;
+                }
+                if (req.body.size() > kUploadMax)
+                {
+                    res.error(413, "upload_too_large",
+                              std::format("{} bytes exceeds the {} byte limit", req.body.size(), kUploadMax));
+                    return;
+                }
+                auto it = req.query.find("name");
+                std::string raw = it == req.query.end() ? std::string("upload.txt") : it->second;
+                std::string name = cell::serve::safe_upload_name(raw);
+                std::filesystem::path dir = cell::serve::uploads_dir();
+                std::error_code ec;
+                std::filesystem::create_directories(dir, ec);
+                if (ec)
+                {
+                    res.error(500, "uploads_unwritable", ec.message());
+                    return;
+                }
+                // a colliding name gets a numeric suffix rather than being
+                // overwritten: an upload is not an edit
+                std::filesystem::path target = dir / name;
+                for (int n = 2; n < 100 && std::filesystem::exists(target, ec); n++)
+                    target = dir / (std::format("{}-{}", name.substr(0, name.find('.') == std::string::npos ? name.size() : name.find('.')), n) +
+                                    (name.find('.') == std::string::npos ? "" : name.substr(name.find('.'))));
+                std::ofstream out(target, std::ios::binary | std::ios::trunc);
+                if (!out)
+                {
+                    res.error(500, "upload_failed", "cannot write " + target.filename().string());
+                    return;
+                }
+                out.write(req.body.data(), (std::streamsize)req.body.size());
+                out.close();
+                res.json(200, json{{"name", target.filename().string()},
+                                   {"path", std::format(".cell-uploads/{}", target.filename().string())},
+                                   {"bytes", (long long)req.body.size()}});
+                return;
+            }
+            if (seg.size() == 2 && seg[0] == "v1" && seg[1] == "uploads" && req.method == "GET")
+            {
+                res.json(200, cell::serve::uploads_json());
                 return;
             }
             if (seg.size() == 2 && seg[0] == "v1" && seg[1] == "logs" && req.method == "GET")
@@ -25060,8 +25313,13 @@ int repl::run()
             }
             else if (seg.size() == 2 && seg[0] == "v1" && seg[1] == "sessions" && req.method == "GET")
             {
-                on_core(r, [&](core_reply &rep)
-                        { rep.body = json{{"sessions", cell::serve::sessions_json()}, {"current", h.now().id()}}.dump(); });
+                // ?archived=1 lists the archived ones too; without it they are out
+                // of the way, which is the whole point of archiving
+                bool with_archived = false;
+                if (auto it = req.query.find("archived"); it != req.query.end() && (it->second == "1" || it->second == "true"))
+                    with_archived = true;
+                on_core(r, [&, with_archived](core_reply &rep)
+                        { rep.body = json{{"sessions", cell::serve::sessions_json(with_archived)}, {"current", h.now().id()}}.dump(); });
             }
             else if (seg.size() == 2 && seg[0] == "v1" && seg[1] == "sessions" && req.method == "POST")
             {
@@ -25152,6 +25410,55 @@ int repl::run()
                     }
                     rep.body = body.dump();
                 });
+            }
+            else if ((seg.size() == 4 && seg[0] == "v1" && seg[1] == "sessions" &&
+                          (seg[3] == "archive" || seg[3] == "unarchive")) &&
+                     req.method == "POST")
+            {
+                // Archiving hides a session from the default list and nothing else:
+                // its transcript stays, it stays addressable, and unarchiving is the
+                // same route with the marker removed. A turn or a background job on
+                // that session is a 409 — archiving mid-run would leave the run
+                // writing into a session the shell has just hidden.
+                std::string sid = seg[2];
+                bool archive = seg[3] == "archive";
+                if (!std::filesystem::exists(cell::session_dir(sid) / "messages.jsonl"))
+                {
+                    res.error(404, "session_not_found", "no session with id " + sid);
+                    return;
+                }
+                if (archive && serve_bridge.turn_active.load() && h.now().id() == sid)
+                {
+                    res.error(409, "busy", "a turn is running on this session");
+                    return;
+                }
+                if (archive)
+                {
+                    std::string running;
+                    nlohmann::json store = cell::teamwork::load_store(sid);
+                    if (auto jobs = store.find("jobs"); jobs != store.end() && jobs->is_object())
+                        for (auto &[jid, jb] : jobs->items())
+                            if (jb.value("status", "") == "running")
+                            {
+                                running = jid;
+                                break;
+                            }
+                    if (!running.empty())
+                    {
+                        res.error(409, "teamwork_running", "stop " + running + " before archiving");
+                        return;
+                    }
+                    std::error_code rec;
+                    std::ofstream(cell::session_dir(sid) / "archived") << cell::serve::to_valid_utf8(
+                        std::format("archived_at={}\n", (long long)std::time(nullptr)));
+                }
+                else
+                {
+                    std::error_code rec;
+                    std::filesystem::remove(cell::session_dir(sid) / "archived", rec);
+                }
+                res.json(200, json{{"session", sid}, {"archived", archive}});
+                return;
             }
             else if (seg.size() == 4 && seg[0] == "v1" && seg[1] == "sessions" && seg[3] == "export" && req.method == "GET")
             {
