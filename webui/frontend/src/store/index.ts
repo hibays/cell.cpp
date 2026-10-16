@@ -5,6 +5,7 @@ import { reactive } from 'vue'
 import { api } from '../lib/api'
 import { classifyError } from '../lib/errors'
 import { createEventBus } from '../lib/events'
+import { applyEvent, emptyLiveTurn, type LiveTurn } from '../lib/liveTurn'
 import { createFrameScheduler } from '../lib/scheduler'
 import { sortByRecency } from '../lib/sessions'
 import { usageTotals, type UsageTotals } from '../lib/stats'
@@ -17,6 +18,7 @@ import type {
   FileEntry,
   ProviderEntry,
   SessionSummary,
+  TurnEvent,
 } from '../lib/api'
 
 export type Phase = 'booting' | 'landing' | 'onboarding' | 'app'
@@ -42,7 +44,8 @@ interface State {
   messages: UiMessage[]
   loadingMessages: boolean
   streaming: boolean
-  streamText: string
+  /** The turn in flight, folded from the kernel's semantic events. */
+  live: LiveTurn | null
   streamStartedAt: number
   streamModel: string
   approvals: Approval[]
@@ -87,7 +90,7 @@ const state = reactive<State>({
   messages: [],
   loadingMessages: false,
   streaming: false,
-  streamText: '',
+  live: null,
   streamStartedAt: 0,
   streamModel: '',
   approvals: [],
@@ -394,15 +397,21 @@ export async function deleteSession(id: string): Promise<void> {
   }
 }
 
-// A turn can emit hundreds of deltas per second; assigning each straight into
+// A turn can emit hundreds of deltas per second; folding each straight into
 // reactive state means a render per token and a page that stops taking input.
-// Deltas are buffered and published at most once per frame window instead.
-let streamBuffer = ''
+// The high-frequency events (text and reasoning deltas, accounting) are queued
+// and applied at most once per frame; everything structural — a tool starting or
+// finishing, an interrupt — applies immediately, because those are the moments
+// the user is watching for.
+let pending: TurnEvent[] = []
 const publishStream = createFrameScheduler(
   () => {
-    if (!streamBuffer) return
-    state.streamText += streamBuffer
-    streamBuffer = ''
+    if (!state.live) {
+      pending = []
+      return
+    }
+    for (const e of pending) applyEvent(state.live, e)
+    pending = []
   },
   {
     raf: (cb) => window.requestAnimationFrame(cb),
@@ -413,11 +422,6 @@ const publishStream = createFrameScheduler(
 // Turn events are routed through a callback registry rather than one inline
 // switch, so a new kernel event is a new subscription instead of a new branch.
 const events = createEventBus()
-
-events.on('output', (e) => {
-  streamBuffer += e.data.text
-  publishStream.request()
-})
 
 events.on('approval_request', (e) => onApproval(e.data))
 
@@ -431,20 +435,37 @@ events.on('turn_start', (e) => {
   state.streamModel = e.data.model
 })
 
+const BATCHED = new Set(['token', 'reasoning', 'usage', 'output'])
+events.onAny((e) => {
+  if (!state.live) return
+  if (BATCHED.has(e.type)) {
+    pending.push(e)
+    publishStream.request()
+    return
+  }
+  applyEvent(state.live, e)
+})
+
+/** Begin a turn: a fresh live turn is what every later event folds into. */
+function beginStream(): void {
+  state.live = emptyLiveTurn()
+  pending = []
+  state.streaming = true
+  state.streamStartedAt = Date.now()
+  state.lastInterrupted = false
+}
+
 /** End a turn: drop any unpublished buffer, it is superseded by the transcript. */
 function endStream(): void {
   publishStream.cancel()
-  streamBuffer = ''
+  pending = []
 }
 
 export async function send(text: string): Promise<void> {
   const id = state.currentSession
   if (!id || !text.trim() || state.streaming) return
   state.messages.push({ key: `m${msgSeq++}`, role: 'user', text })
-  state.streaming = true
-  state.streamText = ''
-  state.streamStartedAt = Date.now()
-  state.lastInterrupted = false
+  beginStream()
   try {
     await api.streamTurn(id, text, (e) => events.emitRaw(e))
   } catch (e) {
@@ -461,7 +482,7 @@ export async function send(text: string): Promise<void> {
     const { messages } = await api.sessionMessages(id).catch(() => ({ messages: [] }))
     state.messages = normalizeTranscript(messages)
     state.streaming = false
-    state.streamText = ''
+    state.live = null
     state.approvals = []
     void refreshUsage()
     // the row label and its age come from the kernel, so the sidebar only
@@ -484,10 +505,7 @@ export async function interrupt(): Promise<void> {
 export async function resume(): Promise<void> {
   const id = state.currentSession
   if (!id || state.streaming) return
-  state.streaming = true
-  state.streamText = ''
-  state.streamStartedAt = Date.now()
-  state.lastInterrupted = false
+  beginStream()
   try {
     await api.streamResume(id, (e) => events.emitRaw(e))
   } catch (e) {
@@ -498,7 +516,7 @@ export async function resume(): Promise<void> {
     const { messages } = await api.sessionMessages(id).catch(() => ({ messages: [] }))
     state.messages = normalizeTranscript(messages)
     state.streaming = false
-    state.streamText = ''
+    state.live = null
     state.approvals = []
     void refreshUsage()
     void refreshSessions()

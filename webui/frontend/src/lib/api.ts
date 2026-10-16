@@ -105,12 +105,39 @@ export interface Approval {
   args: string
 }
 
+/**
+ * What one LLM request cost, as the kernel measured it. `decode_ms` runs from
+ * the first token, so `out_tokens / decode_ms` is a decode rate; `request_ms`
+ * includes the prompt upload and would flatter it.
+ */
+export interface UsageEvent {
+  in_tokens: number
+  out_tokens: number
+  total_tokens: number
+  cached_tokens: number
+  prompt_tokens: number
+  request_ms: number
+  decode_ms: number
+}
+
 export type TurnEvent =
   | { type: 'turn_start'; data: { session: string; model: string } }
   | { type: 'output'; data: { text: string } }
   | { type: 'approval_request'; data: Approval }
   | { type: 'turn_done'; data: { rc: number; interrupted: boolean } }
   | { type: 'error'; data: { code: string; message: string } }
+  // semantic events: the answer as it arrives, the tool calls as they happen,
+  // and what each request cost — the shell renders structure from these instead
+  // of re-reading the transcript once the turn is over
+  | { type: 'token'; data: { text: string } }
+  | { type: 'reasoning'; data: { text: string } }
+  | { type: 'tool_call'; data: { id: string; name: string; args: string } }
+  | {
+      type: 'tool_result'
+      data: { id: string; name: string; status: string; seconds: number; output: string; truncated: boolean }
+    }
+  | { type: 'usage'; data: UsageEvent }
+  | { type: 'interrupt'; data: { partial_chars: number } }
 
 export interface TurnResult {
   rc: number

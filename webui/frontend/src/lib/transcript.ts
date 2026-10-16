@@ -14,7 +14,8 @@ export interface UiToolCall {
   id: string
   name: string
   args: string
-  status: 'running' | 'ok' | 'blocked' | 'denied'
+  /** `failed` covers the kernel's failed / unknown / exception statuses. */
+  status: 'running' | 'ok' | 'failed' | 'blocked' | 'denied'
   output: string
   seconds?: number
 }

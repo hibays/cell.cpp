@@ -35,6 +35,14 @@ const KNOWN_TYPES: ReadonlySet<string> = new Set([
   'approval_request',
   'error',
   'turn_done',
+  // semantic events (see lib/liveTurn.ts): a kernel that does not emit them yet
+  // simply never sends them, and anything genuinely unknown is still dropped
+  'token',
+  'reasoning',
+  'tool_call',
+  'tool_result',
+  'usage',
+  'interrupt',
 ])
 
 const str = (v: unknown): string => (typeof v === 'string' ? v : '')
@@ -75,6 +83,39 @@ export function parseEvent(raw: unknown): TurnEvent | null {
       return { type, data: { code: str(data['code']), message: str(data['message']) } }
     case 'turn_done':
       return { type, data: { rc: num(data['rc']), interrupted: bool(data['interrupted']) } }
+    case 'token':
+      return { type, data: { text: str(data['text']) } }
+    case 'reasoning':
+      return { type, data: { text: str(data['text']) } }
+    case 'tool_call':
+      return { type, data: { id: str(data['id']), name: str(data['name']), args: str(data['args']) } }
+    case 'tool_result':
+      return {
+        type,
+        data: {
+          id: str(data['id']),
+          name: str(data['name']),
+          status: str(data['status']),
+          seconds: num(data['seconds']),
+          output: str(data['output']),
+          truncated: bool(data['truncated']),
+        },
+      }
+    case 'usage':
+      return {
+        type,
+        data: {
+          in_tokens: num(data['in_tokens']),
+          out_tokens: num(data['out_tokens']),
+          total_tokens: num(data['total_tokens']),
+          cached_tokens: num(data['cached_tokens']),
+          prompt_tokens: num(data['prompt_tokens']),
+          request_ms: num(data['request_ms']),
+          decode_ms: num(data['decode_ms']),
+        },
+      }
+    case 'interrupt':
+      return { type, data: { partial_chars: num(data['partial_chars']) } }
     default:
       return null
   }

@@ -14,6 +14,8 @@ const statusLabel = computed(() => {
       return '被沙箱阻止'
     case 'denied':
       return '已拒绝'
+    case 'failed':
+      return '失败'
     default:
       return '完成'
   }

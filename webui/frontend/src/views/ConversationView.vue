@@ -8,6 +8,7 @@ import { interrupt, newSession, resume, selectSession, send, store, toast } from
 import MessageItem from '../components/MessageItem.vue'
 import Composer from '../components/Composer.vue'
 import ApprovalCard from '../components/ApprovalCard.vue'
+import { liveText } from '../lib/liveTurn'
 import { createScrollAnchor } from '../lib/scrollAnchor'
 import { computeWindow } from '../lib/window'
 import type { UiMessage } from '../lib/transcript'
@@ -66,14 +67,21 @@ function measure(): void {
 
 const chips = ['介绍一下这个仓库', '解释 cell.cpp 的架构', '帮我写一个 CMake 选项']
 
-// The live turn is a message like any other: same renderer, same action-bar
-// rules, but the markdown goes through the block cache (lib/streamMarkdown)
-// so finished paragraphs are not re-rendered per token.
-const streamMessage = computed<UiMessage>(() => ({
-  key: 'streaming',
-  role: 'assistant',
-  text: store.streamText,
-}))
+// The live turn is a message like any other: same renderer, same tool cards,
+// same block cache for markdown — the difference is that it comes from the
+// kernel's semantic events (lib/liveTurn) instead of the transcript, so
+// reasoning and tool calls appear while the turn runs.
+const streamMessage = computed<UiMessage>(() => {
+  const live = store.live
+  if (!live) return { key: 'streaming', role: 'assistant', text: '' }
+  return {
+    key: 'streaming',
+    role: 'assistant',
+    text: liveText(live),
+    reasoning: live.reasoning || undefined,
+    tools: live.tools.length ? live.tools : undefined,
+  }
+})
 
 function readScroller(): void {
   const el = scroller.value
@@ -114,7 +122,7 @@ function jumpToLatest(): void {
 }
 
 watch(
-  () => [store.streamText.length, store.messages.length] as const,
+  () => [streamMessage.value.text.length, streamMessage.value.tools?.length ?? 0, store.messages.length] as const,
   async () => {
     if (anchor.stick) await scrollToBottom()
     else {
@@ -181,7 +189,7 @@ onUnmounted(() => observer?.disconnect())
         />
         <div :style="{ height: `${win.padBottom}px` }" />
         <MessageItem
-          v-if="store.streaming && store.streamText"
+          v-if="store.streaming && (streamMessage.text || streamMessage.tools?.length)"
           :message="streamMessage"
           streaming
           @copy="toast('ok', $event)"

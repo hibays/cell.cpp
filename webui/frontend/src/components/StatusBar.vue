@@ -12,7 +12,8 @@ import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { api } from '../lib/api'
 import { store } from '../store'
 import { cacheHitRatio, transcriptStats } from '../lib/stats'
-import { formatCompact, formatPercent } from '../lib/format'
+import { emptyLiveTurn, liveCacheHit, liveText, liveTokensPerSecond } from '../lib/liveTurn'
+import { formatCompact, formatPercent, formatRate } from '../lib/format'
 import { createConnection, type ConnectionState } from '../lib/connection'
 import { classifyError, type CellErrorView } from '../lib/errors'
 import { fromKernelConfig, PRESETS } from '../lib/permissions'
@@ -53,6 +54,17 @@ const sessionUsage = computed(() => store.usage?.session ?? null)
 const cacheHit = computed(() => {
   const u = sessionUsage.value
   return u ? cacheHitRatio(u) : undefined
+})
+
+// While a turn runs the live figures win: they describe the request that is
+// happening, and the session counters only move when it lands.
+const liveEmpty = emptyLiveTurn()
+const liveRate = computed(() => (store.live ? liveTokensPerSecond(store.live) : undefined))
+const liveHit = computed(() => (store.live ? liveCacheHit(store.live) : undefined))
+const shownHit = computed(() => (store.streaming ? liveHit.value : cacheHit.value))
+const shownTokens = computed(() => {
+  if (store.streaming && store.live?.usage) return store.live.usage.totalTokens
+  return sessionUsage.value?.totalTokens
 })
 
 /** Install-wide totals, for the tooltip — the strip itself is session-scoped. */
@@ -132,15 +144,16 @@ onUnmounted(() => {
 
     <span v-if="store.streaming" class="item live">
       <span class="pulse" />
-      输出中 · {{ elapsed }}s · {{ formatCompact(store.streamText.length) }} 字
+      输出中 · {{ elapsed }}s · {{ formatCompact(liveText(store.live ?? liveEmpty).length) }} 字
+      <span v-if="liveRate !== undefined" class="dim">· {{ formatRate(liveRate) }}</span>
     </span>
 
     <span class="item" title="本会话的轮次与工具调用步数">
       {{ stats.turns }} 轮 {{ stats.steps }} 步
     </span>
     <span class="item" :title="installHint">
-      {{ sessionUsage ? formatCompact(sessionUsage.totalTokens) : '—' }} tok
-      <span class="dim">缓存命中 {{ cacheHit === undefined ? '—' : formatPercent(cacheHit) }}</span>
+      {{ shownTokens === undefined ? '—' : formatCompact(shownTokens) }} tok
+      <span class="dim">缓存命中 {{ shownHit === undefined ? '—' : formatPercent(shownHit) }}</span>
     </span>
     <span v-if="health" class="item mono dim" :title="`版本 ${health.version} · 会话 ${store.currentSession ?? '—'}`">
       {{ health.version }} · {{ store.currentSession?.slice(-6) ?? '—' }}
