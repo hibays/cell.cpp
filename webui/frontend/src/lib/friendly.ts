@@ -24,6 +24,8 @@ const BY_CODE: Record<string, string> = {
   bad_request: '请求被内核拒绝了。',
   forbidden: '这个操作需要更高权限。',
   internal: '内核内部错误。',
+  turn_error:
+    '可以重发一次；若还是失败，去「设置 → 模型服务」检查端点、密钥和模型名（本地服务如 Ollama 的兼容地址通常带 /v1，且不需要密钥）。',
 }
 
 /**

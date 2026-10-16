@@ -100,7 +100,10 @@ async function probe(): Promise<void> {
       <div v-if="models.length" class="models">
         <span v-for="m in models" :key="m" class="chip" @click="model = m">{{ m }}</span>
       </div>
-      <p v-else-if="probing === false && base" class="hint">提示：本地网关（Ollama / vLLM）通常无需密钥。</p>
+      <p class="hint">
+        本地服务（<code>127.0.0.1</code> / <code>localhost</code>，如 Ollama、vLLM）不需要密钥，Key 留空即可。
+        OpenAI 兼容地址要带到 <code>/v1</code>：Ollama 是 <code>http://127.0.0.1:11434/v1</code>，只填到端口会得到 404。
+      </p>
     </div>
   </div>
 </template>

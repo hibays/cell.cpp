@@ -176,6 +176,11 @@ async function removeProvider(p: ProviderEntry): Promise<void> {
         </select>
       </div>
       <input v-model="base" placeholder="端点，如 https://api.deepseek.com/v1" />
+      <p class="hint">
+        本地服务（<code>127.0.0.1</code> / <code>localhost</code>，如 Ollama、llama.cpp、vLLM）<strong>不需要密钥</strong>，留空即可。
+        OpenAI 兼容服务的地址要带到 <code>/v1</code>：Ollama 填
+        <code>http://127.0.0.1:11434/v1</code>，只填到端口会得到 404。
+      </p>
       <div class="grid">
         <input v-model="proxy" placeholder="代理（可选），如 http://127.0.0.1:7890" />
         <input v-model="model" placeholder="模型（可选）" />
@@ -358,5 +363,21 @@ async function removeProvider(p: ProviderEntry): Promise<void> {
   font-size: var(--cell-font-size-xs);
   color: var(--cell-alias-ink-faint);
   margin: 0;
+}
+
+.hint {
+  margin: 0;
+  font-size: var(--cell-font-size-xs);
+  color: var(--cell-alias-ink-faint);
+  line-height: 1.7;
+}
+
+.hint code {
+  font-family: var(--cell-mono);
+  color: var(--cell-alias-ink-dim);
+}
+
+.hint strong {
+  color: var(--cell-alias-ink-dim);
 }
 </style>

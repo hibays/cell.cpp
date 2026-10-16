@@ -5744,6 +5744,11 @@ namespace cell
             inline bool color_force = true;
             inline bool color_enabled = false;
             inline bool verbose_enabled = false;
+            // While stdio is captured (one serve turn, or a oneshot run) the
+            // logger must not mirror to the console: those bytes are written to
+            // fd 2, which is the capture pipe, so they would land in the text
+            // the client reads as the turn's output. The log file keeps them.
+            inline bool console_muted = false;
             using clock = std::chrono::steady_clock;
 
             void init_console()
@@ -5887,7 +5892,7 @@ namespace cell
                 // Inside the mutex: two threads logging at once used to interleave
                 // their console lines, which shows up in the log as garbled
                 // timestamps followed by stray bytes.
-                if (console)
+                if (console && !detail::console_muted)
                 {
                     // leading newline to avoid log appearing right after unfinished streaming content
                     std::fputc('\n', stderr);
@@ -6403,6 +6408,46 @@ namespace cell
                     style = "openai-responses";
                 else
                     style = "openai";
+            }
+
+            // host part of the base url, without scheme, port, userinfo or path;
+            // "" when the base is not a url we can reason about
+            std::string base_host() const
+            {
+                std::string b = base;
+                auto scheme = b.find("://");
+                if (scheme == std::string::npos)
+                    return "";
+                b = b.substr(scheme + 3);
+                auto cut = b.find_first_of("/?#");
+                if (cut != std::string::npos)
+                    b = b.substr(0, cut);
+                auto at = b.rfind('@');
+                if (at != std::string::npos)
+                    b = b.substr(at + 1);
+                if (!b.empty() && b.front() == '[') // [::1]:8080
+                {
+                    auto close = b.find(']');
+                    if (close != std::string::npos)
+                        return b.substr(1, close - 1);
+                }
+                auto colon = b.rfind(':');
+                if (colon != std::string::npos)
+                    b = b.substr(0, colon);
+                return b;
+            }
+
+            // Loopback endpoints (Ollama, llama.cpp server, a local vLLM)
+            // authenticate nobody: a missing key must not stop a turn there,
+            // because that is the one setup where requiring one is simply wrong.
+            // True for localhost, 127.0.0.0/8 and ::1.
+            bool base_is_loopback() const
+            {
+                std::string h = base_host();
+                lower_ascii(h);
+                if (h == "localhost" || h == "::1")
+                    return true;
+                return h.starts_with("127.");
             }
 
             // candidate GET endpoints for the model list, in probe order; the
@@ -14486,7 +14531,8 @@ details{break-inside:avoid}
                 return result;
             }
             encrypt::secure_string key = rt.resolve_key(provider);
-            if (key.empty())
+            // a loopback child provider (local Ollama/vLLM) needs no key either
+            if (key.empty() && !provider.base_is_loopback())
             {
                 result.summary = std::format("No API key is available for {}.", provider.name);
                 return result;
@@ -16404,6 +16450,10 @@ details{break-inside:avoid}
                     return nullptr;
                 }
                 cap->read_fd_ = fds[0];
+                // from here on every console byte the logger writes lands in this
+                // capture: silence it, the log file already has those lines
+                cap->mute_prev_ = cell::sys::detail::console_muted;
+                cell::sys::detail::console_muted = true;
                 // The reader is joinable, not detached. Two reasons: detaching never
                 // closes the underlying thread handle under MinGW/winpthreads (one
                 // leaked handle per captured turn, measured), and the lifetime has
@@ -16427,6 +16477,7 @@ details{break-inside:avoid}
                 {
                     ended_ = true;
                     std::fflush(nullptr);
+                    cell::sys::detail::console_muted = mute_prev_;
                     if (saved_out_ >= 0)
                     {
                         fd_dup2(saved_out_, 1);
@@ -16483,6 +16534,7 @@ details{break-inside:avoid}
             std::mutex end_mx_;  // serializes end()'s join against a concurrent end()
             std::thread reader_; // joined by end(): never detached (handle leak)
             bool ended_ = false; // guarded by end_mx_
+            bool mute_prev_ = false; // logger console state restored by end()
             int saved_out_ = -1, saved_err_ = -1, read_fd_ = -1;
         };
 
@@ -20279,6 +20331,26 @@ static int run_selftest()
         R.expect(mc_openai.size() == 1 && mc_openai[0].first == "https://api.anthropic.com/models" && !mc_openai[0].second,
                  "model list candidates: openai style has no fallback");
     }
+    // loopback endpoints (Ollama, llama.cpp, a local vLLM) need no api key, so
+    // the turn must not be refused there — this is the rule that decides it
+    {
+        cell::config::provider_entry lb;
+        auto loop = [](cell::config::provider_entry &p, const std::string &base)
+        {
+            p.base = base;
+            return p.base_is_loopback();
+        };
+        R.expect(loop(lb, "http://127.0.0.1:11434") && loop(lb, "http://127.0.0.1:11434/v1") &&
+                     loop(lb, "http://localhost:8080") && loop(lb, "http://[::1]:8080/v1") &&
+                     loop(lb, "http://127.5.6.7") && loop(lb, "https://user:pw@localhost:1/x"),
+                 "provider base_is_loopback: loopback hosts");
+        R.expect(!loop(lb, "https://api.openai.com/v1") && !loop(lb, "https://api.moonshot.cn/v1") &&
+                     !loop(lb, "http://192.168.1.9:8000/v1") && !loop(lb, "not-a-url") && !loop(lb, ""),
+                 "provider base_is_loopback: remote and unparseable hosts");
+        R.expect(lb.base_host() == "", "provider base_host: an unparseable base has no host");
+        lb.base = "http://h:8080/p";
+        R.expect(lb.base_host() == "h", "provider base_host strips scheme, port and path");
+    }
     cell::box::write((cell::root / "config.json").string(), "{\"provider\":\"anthropic\",\"model\":\"legacy\",\"base\":\"http://z\",\"session\":\"s1\"}");
     auto legacy_res = cell::config::load();
     R.expect(legacy_res.has_value() && legacy_res->providers.size() == 1 && legacy_res->providers[0].style == "anthropic" && legacy_res->providers[0].name == "anthropic", "config legacy flat load");
@@ -21743,7 +21815,7 @@ int repl::run()
         if (!p || cfg.current_model.empty())
             return "internal error: no provider";
         cell::encrypt::secure_string key = resolve_key(*p);
-        if (key.empty())
+        if (key.empty() && !p->base_is_loopback())
             return "internal error: no API key";
         const nlohmann::json messages = nlohmann::json::array({
             {{"role", "system"}, {"content", "You are an action safety gate. Determine whether this tool action is safe and legal to execute. If ALLOW, reply with exactly one word: ALLOW. If DENY, reply with a short explanation of why this action is unsafe (1-2 sentences)."}},
@@ -22223,7 +22295,7 @@ int repl::run()
         if (!p || model.empty())
             return "";
         cell::encrypt::secure_string key = resolve_key(*p);
-        if (key.empty())
+        if (key.empty() && !p->base_is_loopback())
             return "";
         nlohmann::json prompt = nlohmann::json::array();
         const std::string safe_body = cell::text::utf8_safe(body);
@@ -22495,11 +22567,17 @@ int repl::run()
                                      cell::async_io::flush(); // persist queued writes before terminating
                                  });
         bool running = true;
+        // Why the last turn failed, in one line — the shell's `error` event
+        // carries it, because a turn that produced no answer must not look like
+        // a turn that finished. Empty when the turn ended naturally.
+        std::string turn_error;
         // One agent turn: fold pending notices in, add the user message (a
         // /reload resumes the interrupted turn without one), then run the
         // LLM/tool rounds to completion. The old llm_start / llm_round goto
         // labels are gone: the command handlers and the main loop call this.
-        auto run_turn = [&](bool resume_turn, const std::string &input)
+        // Returns 0 when the turn ran to its natural end, 1 when it aborted
+        // (no model, no key, provider error, round limit, user cancel).
+        auto run_turn = [&](bool resume_turn, const std::string &input) -> int
         {
             if (!resume_turn)
             {
@@ -22534,6 +22612,7 @@ int repl::run()
                 {
                     log.warn("llm", std::format("turn aborted at the {} round limit", kMaxRoundsPerTurn));
                     cell::sys::error("[aborted] this turn hit the {} round limit - the model kept requesting tools", kMaxRoundsPerTurn);
+                    turn_error = std::format("turn aborted at the {} round limit", kMaxRoundsPerTurn);
                     natural_end = false;
                     break;
                 }
@@ -22541,15 +22620,19 @@ int repl::run()
                 if (!p || cfg.current_model.empty())
                 {
                     cell::sys::error("no model configured - add a provider with /provide add openai:URL, then pick a model with /models and /model NAME");
+                    turn_error = "no model configured: add a provider, then pick a model";
                     done = true;
                     natural_end = false;
                     break;
                 }
                 cell::encrypt::secure_string key = resolve_key(*p);
-                if (key.empty())
+                // a loopback endpoint (Ollama, llama.cpp, a local vLLM) needs no
+                // key — demanding one there blocks the most common local setup
+                if (key.empty() && !p->base_is_loopback())
                 {
-                    cell::sys::error("no api key for {}: set the {} env var, or use /provide add {}:URL key:KEY",
-                                     p->name, p->style == "anthropic" ? "ANTHROPIC_API_KEY" : "OPENAI_API_KEY", p->style);
+                    cell::sys::error("no api key for {} ({}): set the {} env var, or use /provide add {}:URL key:KEY",
+                                     p->name, p->base, p->style == "anthropic" ? "ANTHROPIC_API_KEY" : "OPENAI_API_KEY", p->style);
+                    turn_error = std::format("no api key for provider {} ({})", p->name, p->base);
                     done = true;
                     natural_end = false;
                     break;
@@ -22827,6 +22910,14 @@ int repl::run()
                         log.error("llm", std::format("request_failed model={} round={} ctx_msgs={} time={:.2f}s err={} attempts={}", cfg.model_label(), rounds, (long long)h.now().msg().size(), final_sec, err.empty() ? "n/a" : err, attempt + 1));
                         cell::sys::println();
                         cell::sys::error("[llm error after {} attempt(s)] {}", attempt + 1, err.empty() ? "request failed" : err);
+                        // one line for the shell's error event, plus the fix for
+                        // the most common cause: an OpenAI-compatible server
+                        // (Ollama, vLLM, LM Studio) serves under /v1, and a base
+                        // url without it answers 404
+                        turn_error = std::format("llm request failed after {} attempt(s): {}", attempt + 1,
+                                                 err.empty() ? "request failed" : err);
+                        if (http_status == 404)
+                            turn_error += " - a 404 usually means the base URL is wrong: OpenAI-compatible servers serve under /v1 (Ollama: http://127.0.0.1:11434/v1)";
                         cell::chat::record_interrupt(h.now(), reply,
                                                      std::format("LLM client error after {} attempt(s): {}", attempt + 1,
                                                                  trunc(err.empty() ? "request failed" : err, 300)));
@@ -23128,10 +23219,12 @@ int repl::run()
                     // refusals end the run (user decline only, autoallow reject
                     // returns error message and continues)
                     bool approval_refused = false;
+                    std::string rejected_tool;
                     for (size_t i = 0; i < tool_calls.size(); i++)
                         if (res[i].blocked && res[i].rejected_for == cell::tools::rejection_reason::user)
                         {
                             approval_refused = true;
+                            rejected_tool = res[i].name;
                             cell::sys::error("[tool call rejected: {} - stopping this run]", res[i].name);
                             break;
                         }
@@ -23141,6 +23234,11 @@ int repl::run()
                                      cache_counts ? std::optional<long long>(cache_counts->second) : std::nullopt);
                     if (approval_refused)
                     {
+                        // a declined tool call stops the run: name it, or the
+                        // shell's error event can only say "did not complete"
+                        turn_error = rejected_tool.empty()
+                                          ? "stopped: a tool call was rejected"
+                                          : std::format("stopped: the {} tool call was rejected", rejected_tool);
                         done = true;
                         natural_end = false; // user decline / autoallow deny aborts the turn
                     }
@@ -23186,6 +23284,7 @@ int repl::run()
             cell::config::save(cfg);
             if (!interactive)
                 running = false;
+            return natural_end ? 0 : 1;
         };
 
     // ---- slash-command table ------------------------------------------------
@@ -25261,7 +25360,7 @@ int repl::run()
                     cap_err);
                                           if (!cap)
                                               ts->push(json{{"type", "error"}, {"data", {{"code", "capture_failed"}, {"message", cap_err}}}});
-                                          run_turn(resume, text);
+                                          rc = run_turn(resume, text);
                                           if (cap)
                                               cap->end();
                                           cell::async_io::flush(); // durability: the GUI may read right after turn_done
@@ -25272,6 +25371,16 @@ int repl::run()
                                           rc = 1;
                                       }
                                       bool interrupted = cell::serve::take_cancel_seen();
+                                      // A turn that aborted (no key, provider
+                                      // error, round limit) is not a turn that
+                                      // finished: without this event the shell
+                                      // had no way to tell the two apart and
+                                      // showed an empty "done". A user cancel is
+                                      // reported through `interrupted` instead.
+                                      if (rc != 0 && !interrupted)
+                                          ts->push(json{{"type", "error"},
+                                                        {"data", {{"code", "turn_error"},
+                                                                  {"message", turn_error.empty() ? "the turn did not complete" : turn_error}}}});
                                       cell::events::sink() = nullptr; // nothing may bridge into a finished turn
                                       serve_bridge.set_current(nullptr);
                                       serve_bridge.turn_active.store(false);

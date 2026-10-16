@@ -10,6 +10,7 @@ import { applyEvent, emptyLiveTurn, type LiveTurn } from '../lib/liveTurn'
 import { buildJobInput, jobInputError } from '../lib/teamwork'
 import { createFrameScheduler } from '../lib/scheduler'
 import { sortByRecency } from '../lib/sessions'
+import { turnFailureBubble, watchTurnFailures } from '../lib/turnFail'
 import { usageTotals, type UsageTotals } from '../lib/stats'
 import { applyTheme, resolveTheme, saveTheme, type ThemeName } from '../lib/theme'
 import { normalizeTranscript, type UiMessage } from '../lib/transcript'
@@ -761,13 +762,19 @@ async function turnLanded(sessionId: string, sent: string): Promise<boolean> {
   return rows.some((m) => m.role === 'assistant')
 }
 
+/**
+ * The bubble a failed turn leaves behind lives in lib/turnFail.ts (pure, tested
+ * there); this file only decides when to show it.
+ */
+
 export async function send(text: string): Promise<void> {
   const id = state.currentSession
   if (!id || !text.trim() || state.streaming) return
   state.messages.push({ key: `m${msgSeq++}`, role: 'user', text })
   beginStream()
+  const watch = watchTurnFailures((e) => events.emitRaw(e))
   try {
-    await api.streamTurn(id, text, (e) => events.emitRaw(e))
+    await api.streamTurn(id, text, watch.onEvent)
   } catch (e) {
     const v = classifyError(e)
     if (v.code === 'aborted') {
@@ -792,6 +799,9 @@ export async function send(text: string): Promise<void> {
     endStream()
     const { messages } = await api.sessionMessages(id).catch(() => ({ messages: [] }))
     state.messages = normalizeTranscript(messages)
+    // a failed turn leaves no assistant record on disk: without this the reload
+    // above would show the user's message followed by nothing
+    if (watch.failures.length) state.messages.push(turnFailureBubble(watch.failures, `m${msgSeq++}`))
     state.streaming = false
     state.live = null
     state.approvals = []
@@ -817,8 +827,9 @@ export async function resume(): Promise<void> {
   const id = state.currentSession
   if (!id || state.streaming) return
   beginStream()
+  const watch = watchTurnFailures((e) => events.emitRaw(e))
   try {
-    await api.streamResume(id, (e) => events.emitRaw(e))
+    await api.streamResume(id, watch.onEvent)
   } catch (e) {
     const v = classifyError(e)
     toast(v.retryable ? 'warn' : 'bad', `${v.title} — ${v.hint}`)
@@ -826,6 +837,7 @@ export async function resume(): Promise<void> {
     endStream()
     const { messages } = await api.sessionMessages(id).catch(() => ({ messages: [] }))
     state.messages = normalizeTranscript(messages)
+    if (watch.failures.length) state.messages.push(turnFailureBubble(watch.failures, `m${msgSeq++}`))
     state.streaming = false
     state.live = null
     state.approvals = []

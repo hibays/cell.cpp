@@ -73,6 +73,18 @@ class MockLLM(BaseHTTPRequestHandler):
         self.wfile.write(payload)
 
     def do_POST(self):
+        if self.path != "/v1/chat/completions":
+            # a base url without /v1 lands here. Answer like the real servers
+            # do (Ollama, vLLM, LM Studio all 404 outside /v1) — the kernel must
+            # report that as a failed turn, not as a finished empty one.
+            body = json.dumps({"error": {"message": "404 page not found",
+                                         "type": "invalid_request_error"}}).encode()
+            self.send_response(404)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         n = int(self.headers.get("Content-Length", 0))
         body = json.loads(self.rfile.read(n) or b"{}")
         messages = body.get("messages", [])
@@ -254,6 +266,98 @@ def wait_healthy(base: str, token: str, proc: subprocess.Popen, timeout: float =
         except Exception:
             time.sleep(0.2)
     raise RuntimeError("serve never became healthy")
+
+
+def serve_token(root: Path, timeout: float = 10.0) -> str:
+    """The bearer token the kernel wrote into <CELL_ROOT>/server.json."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        sj = root / "server.json"
+        if sj.exists():
+            return json.loads(sj.read_text())["token"]
+        time.sleep(0.1)
+    raise RuntimeError("server.json never appeared")
+
+
+def keyless_gates(llm_port: int, bin_path: Path, label: str) -> None:
+    """The Ollama / llama.cpp setup: a loopback provider with no key anywhere.
+
+    The reported bug was exactly this shape — a local server, no key, and a
+    shell that answered nothing while still reporting the turn as done. Two
+    independent things must hold, and they need a kernel of their own:
+    OPENAI_API_KEY is the documented key fallback, so an instance that has it
+    in its environment cannot prove the loopback exemption at all.
+
+      1. no key + a correct /v1 base  -> the turn runs (rc 0, real tokens)
+      2. no key + a base without /v1  -> the turn FAILS, honestly:
+         an error event with code turn_error and turn_done rc != 0, carrying
+         the /v1 hint — never a silent rc 0 with an empty transcript.
+
+    Both gates were verified red against the pre-fix binary (it aborted at the
+    key check and still reported rc 0 with no error event).
+    """
+    root = Path(tempfile.mkdtemp(prefix="cell-e2e-keyless-"))
+    work = Path(tempfile.mkdtemp(prefix="cell-e2e-keyless-work-"))
+    port = free_port()
+    env = {k: v for k, v in os.environ.items() if k != "OPENAI_API_KEY"}
+    env["CELL_ROOT"] = str(root)
+    err_file = open(root / "kernel-stderr.log", "wb")
+    proc = subprocess.Popen(
+        [str(bin_path), "--serve", "--port", str(port), "--host", "127.0.0.1"],
+        env=env, cwd=str(work), stdout=err_file, stderr=err_file,
+    )
+    try:
+        base = f"http://127.0.0.1:{port}"
+        wait_healthy(base, "", proc)
+        token = serve_token(root)
+
+        # gate 1: keyless loopback, correct base -> the turn must simply run
+        created = api(base, token, "POST", "/v1/providers",
+                      {"name": "local", "style": "openai",
+                       "base": f"http://127.0.0.1:{llm_port}/v1",
+                       "model": "mock-model"})
+        assert created.get("name") == "local", created
+        sid = api(base, token, "POST", "/v1/sessions")["id"]
+        ok = api(base, token, "POST", f"/v1/sessions/{sid}/turn", {"text": "hello local"})
+        assert ok.get("rc") == 0, f"keyless loopback turn failed: {ok}"
+        assert "mock reply" in ok.get("output", ""), ok
+        kinds = [e.get("type") for e in ok.get("events", [])]
+        assert "token" in kinds and "usage" in kinds, kinds
+        print(f"keyless loopback ({label}): turn ran without any key, rc=0")
+
+        # gate 2: same provider, base missing /v1 -> 404 -> an honest failure
+        moved = api(base, token, "POST", "/v1/providers",
+                    {"name": "local", "style": "openai",
+                     "base": f"http://127.0.0.1:{llm_port}"})
+        assert moved.get("base") == f"http://127.0.0.1:{llm_port}", moved
+        sid2 = api(base, token, "POST", "/v1/sessions")["id"]
+        bad = api(base, token, "POST", f"/v1/sessions/{sid2}/turn", {"text": "hello wrong base"})
+        assert bad.get("rc") != 0, f"a failed turn must not report success: {bad}"
+        assert bad.get("interrupted") is False, bad
+        errors = [e["data"] for e in bad.get("events", []) if e.get("type") == "error"]
+        assert errors, f"no error event for a failed turn: {bad.get('events')}"
+        assert errors[0]["code"] == "turn_error", errors
+        # the message names the fix for the most common cause of a 404
+        assert "/v1" in errors[0]["message"], errors[0]
+        assert "mock reply" not in bad.get("output", ""), bad
+        done = next(e["data"] for e in bad["events"] if e.get("type") == "turn_done")
+        assert done["rc"] != 0 and done["interrupted"] is False, done
+        print(f"keyless loopback ({label}): 404 base -> error{{turn_error}} + turn_done rc={done['rc']}")
+
+        api(base, token, "POST", "/v1/shutdown")
+        proc.wait(timeout=15)
+    except Exception:
+        try:
+            err_file.flush()
+            tail = (root / "kernel-stderr.log").read_text(errors="replace")[-4000:]
+            print("  --- keyless kernel stderr tail ---\n" + tail)
+        except Exception as e2:
+            print(f"  (no kernel stderr: {e2})")
+        if proc.poll() is None:
+            proc.kill()
+        raise
+    finally:
+        err_file.close()
 
 
 def run_once(attempt: int) -> bool:
@@ -752,6 +856,10 @@ def run_once(attempt: int) -> bool:
         else:
             print("handles: not checked on this platform "
                   "(POSIX detach() leaks nothing; the windows-msys2 job runs it)")
+
+        # ---- the keyless loopback provider (Ollama-shaped), on its own
+        # kernel so the OPENAI_API_KEY fallback cannot mask the exemption ----
+        keyless_gates(llm_port, BIN, "cell " + str(health.get("version", "")))
 
         api(base, token, "POST", "/v1/shutdown")
         proc.wait(timeout=15)

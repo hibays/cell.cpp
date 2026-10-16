@@ -122,6 +122,17 @@ was refused.
 | ✅ | `POST /v1/providers/{name}/select` | `{model?}` → becomes the current provider/model |
 | ✅ | `GET /v1/providers/{name}/models` | live probe (same code path as `/models`); 502 when unreachable |
 
+**Keys and loopback.** A provider needs a key *unless* its `base` host is a
+loopback address (`localhost`, `127.0.0.0/8`, `::1`): Ollama, llama.cpp server
+and a local vLLM authenticate nobody, so demanding a key there blocks the most
+common local setup. `POST /v1/providers` therefore accepts a keyless entry and a
+turn on one runs; a **non**-loopback provider with no key anywhere (its vault
+entry, the `OPENAI_API_KEY`/`ANTHROPIC_API_KEY` env fallback, the generic vault
+entry) aborts the turn with `turn_error` (§3.5). And note where those local
+servers keep their OpenAI-compatible surface: under `/v1`. A base of
+`http://127.0.0.1:11434` answers `404`, which arrives as the same `turn_error` —
+carrying the `/v1` hint in the message.
+
 ### 3.3 Configuration
 
 | Status | Endpoint | Notes |
@@ -161,8 +172,28 @@ Request body:
 * otherwise → one JSON response after the turn finishes:
   `{rc, interrupted, output, events:[…]}` where `output` is the concatenated text.
 
+`rc` is the turn's verdict, not the HTTP status — this route answers `200` for a
+turn that failed, because the failure belongs in the payload: `0` the turn ran to
+its natural end, `1` it aborted (no model, no key for a non-loopback provider, a
+provider error, the round limit). An aborted turn writes **no assistant message**
+to the transcript, so a client that only re-reads `/messages` afterwards would
+render the user's message followed by nothing — exactly as if the turn had
+finished. Both response shapes therefore report the abort immediately before the
+terminal frame:
+
+```json
+{"type":"error","data":{"code":"turn_error","message":"llm request failed after 1 attempt(s): HTTP 404 - a 404 usually means the base URL is wrong: OpenAI-compatible servers serve under /v1 (Ollama: http://127.0.0.1:11434/v1)"}}
+{"type":"turn_done","data":{"rc":1,"interrupted":false}}
+```
+
+`interrupted` is the one abort that is **not** a failure: a user cancel, carried
+by the same `rc:1` — check the flag before rendering an error. The desktop shell
+turns a `turn_error` into a failure bubble inside the conversation, precisely
+because the transcript reload cannot show one.
+
 Response headers for SSE: `Content-Type: text/event-stream`, `Connection: close`,
-no caching. The stream ends with `turn_done` (or `error`).
+no caching. The stream always ends with `turn_done`; a failed turn puts the
+`error` frame immediately before it.
 
 | Status | Endpoint | Notes |
 | --- | --- | --- |
@@ -259,8 +290,8 @@ Each event is one `data: <json>` line; the JSON is `{"type": …, "data": {…}}
 | ✅ | `turn_start` | `{session, model}` | a turn begins |
 | ✅ | `output` | `{text}` | a chunk of the CLI text stream (tokens, tool banners, final reply) — arbitrary byte chunks |
 | ✅ | `approval_request` | `{request_id, tool, args}` | a `Policy::Ask` tool waits for `POST /v1/approvals/{id}` |
-| ✅ | `turn_done` | `{rc, interrupted}` | terminal: turn finished (`rc` 0/1, `interrupted` reflects a cancel) |
-| ✅ | `error` | `{code, message}` | terminal: internal failure inside the turn |
+| ✅ | `turn_done` | `{rc, interrupted}` | terminal: the turn's verdict — `rc` 0 finished, 1 aborted (no model/key, provider error, round limit); `interrupted` marks a user cancel, the one abort that is not a failure (§3.5) |
+| ✅ | `error` | `{code, message}` | on an aborted turn, immediately before `turn_done`: `turn_error` names the cause (and for a 404, the `/v1` fix). Also raised for capture/internal failures inside a turn |
 | ✅ | `token` | `{text}` | one assistant text delta, as decoded from the provider stream. A GUI renders this instead of the raw `output` capture |
 | ✅ | `reasoning` | `{text}` | one chain-of-thought delta (OpenAI `reasoning_content`, Anthropic thinking) |
 | ✅ | `tool_call` | `{id, name, args}` | the model proposed a tool call, before any sandbox decision |
