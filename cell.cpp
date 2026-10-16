@@ -15758,6 +15758,11 @@ details{break-inside:avoid}
                     if (e == EINTR)
                         continue;
 #endif
+                    // The other silent close: a send that fails took the response
+                    // with it and said nothing, which is indistinguishable from a
+                    // route that never ran.
+                    cell::sys::logger::instance().error(
+                        "serve", std::format("send_failed remaining={} err={}", len, socket_error_text(e)));
                     return false;
                 }
                 data += n;
