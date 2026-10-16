@@ -16943,6 +16943,95 @@ details{break-inside:avoid}
             return out;
         }
 
+        // Markdown export of a transcript. Deliberately plain: an export is for
+        // reading and grepping, not for looking like the shell. The injected
+        // system block is left out — it is configuration rather than
+        // conversation, and it is often thousands of characters of prompt.
+        inline std::string messages_markdown(const nlohmann::json &msgs)
+        {
+            // Content arrives as a string, as an OpenAI part array, or as an
+            // Anthropic one; all three shapes have to read as plain text.
+            auto text_of = [](const nlohmann::json &content) -> std::string
+            {
+                if (content.is_string())
+                    return content.get<std::string>();
+                if (!content.is_array())
+                    return "";
+                std::string out;
+                for (auto &part : content)
+                {
+                    if (!part.is_object())
+                        continue;
+                    for (const char *key : {"text", "thinking", "content"})
+                    {
+                        if (part.contains(key) && part[key].is_string())
+                        {
+                            out += part[key].get<std::string>();
+                            out += "\n";
+                            break;
+                        }
+                    }
+                }
+                return out;
+            };
+            // A tool result can be megabytes; an export keeps the head of it and
+            // says where it stopped.
+            auto clip = [](const std::string &body, size_t max_lines) -> std::string
+            {
+                size_t lines = 0;
+                for (size_t i = 0; i < body.size(); i++)
+                    if (body[i] == '\n' && ++lines >= max_lines)
+                        return body.substr(0, i) + "\n… [truncated]\n";
+                return body;
+            };
+            std::string out;
+            for (auto &m : msgs)
+            {
+                std::string role = m.value("role", "");
+                if (role == "system")
+                    continue;
+                if (role == "tool")
+                {
+                    std::string body = clip(text_of(m.contains("content") ? m["content"] : m), 60);
+                    out += "```\n" + body + (body.empty() || body.back() == '\n' ? "" : "\n") + "```\n\n";
+                    continue;
+                }
+                out += role == "user" ? "### 你\n\n" : "### cell\n\n";
+                std::string reason = m.contains("reasoning") && m["reasoning"].is_string()
+                                         ? m["reasoning"].get<std::string>()
+                                         : (m.contains("reasoning_content") && m["reasoning_content"].is_string()
+                                                ? m["reasoning_content"].get<std::string>()
+                                                : "");
+                if (!reason.empty())
+                {
+                    out += "> ";
+                    for (char c : reason)
+                    {
+                        out += c;
+                        if (c == '\n')
+                            out += "> ";
+                    }
+                    out += "\n\n";
+                }
+                std::string body = text_of(m.contains("content") ? m["content"] : m);
+                if (!body.empty())
+                    out += (body.back() == '\n' ? body : body + "\n") + "\n";
+                if (auto tcs = m.find("tool_calls"); tcs != m.end() && tcs->is_array())
+                    for (auto &tc : *tcs)
+                    {
+                        std::string name = tc.contains("function") ? tc["function"].value("name", "") : "";
+                        std::string args = tc.contains("function") ? tc["function"].value("arguments", "") : "";
+                        if (args.size() > 120)
+                            args = args.substr(0, 120) + "…";
+                        out += std::format("- `{}` {}\n", name, args);
+                    }
+                if (m.contains("tool_call_id"))
+                    out += std::format("- ↳ result for `{}`\n", m["tool_call_id"].get<std::string>());
+                out += "\n";
+            }
+            return out;
+        }
+
         inline nlohmann::json skills_json()
         {
             nlohmann::json out = nlohmann::json::array();
@@ -25062,6 +25151,40 @@ int repl::run()
                         return;
                     }
                     rep.body = body.dump();
+                });
+            }
+            else if (seg.size() == 4 && seg[0] == "v1" && seg[1] == "sessions" && seg[3] == "export" && req.method == "GET")
+            {
+                // The transcript as JSON or Markdown. The desktop shell has a
+                // native save dialog and uses it; a browser does not, so this is
+                // what makes "export" work there instead of erroring out.
+                std::string sid = seg[2];
+                std::string fmt = "json";
+                if (auto it = req.query.find("format"); it != req.query.end() && !it->second.empty())
+                    fmt = it->second;
+                on_core(r, [&, sid, fmt](core_reply &rep)
+                {
+                    if (!std::filesystem::exists(cell::session_dir(sid) / "messages.jsonl"))
+                    {
+                        rep.status = 404;
+                        rep.body = json{{"error", {{"code", "session_not_found"}, {"message", "no session with id " + sid}}}}.dump();
+                        return;
+                    }
+                    nlohmann::json msgs = cell::serve::messages_json(sid, 0, 0);
+                    if (fmt == "md" || fmt == "markdown")
+                    {
+                        std::string md = std::format("# cell session {}\\n\\n", sid) +
+                                         cell::serve::messages_markdown(msgs);
+                        rep.body = json{{"session", sid}, {"format", "md"}, {"count", (int)msgs.size()}, {"markdown", md}}.dump();
+                        return;
+                    }
+                    if (fmt != "json")
+                    {
+                        rep.status = 400;
+                        rep.body = json{{"error", {{"code", "bad_format"}, {"message", "format must be json or md"}}}}.dump();
+                        return;
+                    }
+                    rep.body = json{{"session", sid}, {"format", "json"}, {"count", (int)msgs.size()}, {"messages", msgs}}.dump();
                 });
             }
             else if (seg.size() == 4 && seg[0] == "v1" && seg[1] == "sessions" && seg[3] == "clear" && req.method == "POST")
