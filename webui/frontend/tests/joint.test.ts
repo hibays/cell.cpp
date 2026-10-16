@@ -127,6 +127,20 @@ describe('kernel joint workflow (CELL_BIN)', () => {
       const turn = await api(base, token, 'POST', `/v1/sessions/${sid}/turn`, { text: 'hi' })
       expect('rc' in turn || 'error' in turn || 'output' in turn).toBe(true)
 
+      // The sidebar groups sessions by workspace and shows a title plus a
+      // relative age, so the list must carry `title` and `updated_at` — the id
+      // alone cannot express either. Both are derived by the kernel: the title
+      // from the first user turn, the timestamp from the transcript's mtime.
+      const listed = (await api(base, token, 'GET', '/v1/sessions')) as unknown as {
+        sessions: Array<Record<string, unknown>>
+      }
+      const row = listed.sessions.find((s) => s.id === sid)
+      expect(row).toBeTruthy()
+      expect(typeof row!.title).toBe('string')
+      expect(row!.title).toBe('hi')
+      expect(typeof row!.updated_at).toBe('number')
+      expect(row!.updated_at as number).toBeGreaterThan(0)
+
       await api(base, token, 'POST', '/v1/shutdown')
       await new Promise<void>((res) => proc.once('exit', () => res()))
     } finally {
