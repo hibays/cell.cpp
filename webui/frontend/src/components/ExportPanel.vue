@@ -1,7 +1,39 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue'
+import { api } from '../lib/api'
 import { bridge, errorMessage } from '../lib/bridge'
 import { store, toast } from '../store'
+
+/**
+ * Two exports, because there are two hosts. The native shell writes a
+ * self-contained HTML through the bridge and reveals it in the file manager;
+ * a browser has neither, so the kernel's `GET /sessions/{id}/export?format=md`
+ * feeds a download instead. Batch and "all" need the shell: they write one file
+ * per session on disk, and a download prompt per session would be worse than
+ * saying so.
+ */
+const hasShell = bridge.available() // decided once: the shell never appears mid-session
+
+function download(name: string, text: string, mime: string): void {
+  const blob = new Blob([text], { type: `${mime};charset=utf-8` })
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = name
+  a.click()
+  // the object URL keeps the blob alive until it is revoked
+  setTimeout(() => URL.revokeObjectURL(url), 2000)
+}
+
+async function downloadMarkdown(sid: string): Promise<void> {
+  const r = await api.exportMarkdown(sid)
+  if (!r.count) {
+    toast('warn', '这个会话还没有记录')
+    return
+  }
+  download(`cell-${sid.slice(-12)}.md`, r.markdown, 'text/markdown')
+  toast('ok', `已下载 Markdown（${r.count} 条消息）`)
+}
 
 const selected = ref<Set<string>>(new Set())
 
@@ -27,6 +59,10 @@ async function run(kind: 'current' | 'batch' | 'all', id?: string): Promise<void
         toast('warn', '没有活动会话')
         return
       }
+      if (!hasShell) {
+        await downloadMarkdown(sid)
+        return
+      }
       const r = await bridge.exportSession(sid)
       if (r.ok) {
         toast('ok', `已导出：${r.path}`)
@@ -37,6 +73,10 @@ async function run(kind: 'current' | 'batch' | 'all', id?: string): Promise<void
     const ids = kind === 'all' ? allIds.value : [...selected.value]
     if (ids.length === 0) {
       toast('warn', kind === 'batch' ? '请先勾选要导出的会话' : '没有可导出的会话')
+      return
+    }
+    if (!hasShell) {
+      toast('warn', '批量导出需要桌面壳（每个会话一个文件并打开文件夹）')
       return
     }
     const results = await bridge.exportBatch(ids)
@@ -52,12 +92,17 @@ async function run(kind: 'current' | 'batch' | 'all', id?: string): Promise<void
 <template>
   <div class="export">
     <h3>导出</h3>
-    <p class="desc">导出自包含 HTML（与 CLI <code>/export</code> 同一渲染器，含 Teamwork 子代理面板）。</p>
+    <p class="desc">
+      导出自包含 HTML（与 CLI <code>/export</code> 同一渲染器，含 Teamwork 子代理面板）。
+      <template v-if="!hasShell">
+        当前没有桌面壳：单会话导出改为下载 Markdown，批量与全量需要桌面壳。
+      </template>
+    </p>
 
     <div class="actions">
       <button class="row primary-row" @click="run('current')">
-        <span class="label">导出当前会话</span>
-        <span class="hint">侧栏/聊天中正在进行的会话</span>
+        <span class="label">{{ hasShell ? '导出当前会话' : '下载当前会话（Markdown）' }}</span>
+        <span class="hint">{{ hasShell ? '侧栏/聊天中正在进行的会话' : '经 REST 导出，浏览器直接下载' }}</span>
       </button>
       <button class="row" :disabled="!selected.size" @click="run('batch')">
         <span class="label">批量导出所选（{{ selected.size }}）</span>

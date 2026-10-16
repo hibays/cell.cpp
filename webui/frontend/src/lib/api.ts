@@ -534,13 +534,16 @@ export class ApiClient {
     )
   }
 
-  /** The transcript as JSON, for a browser that has no native export. */
-  async exportSession(sessionId: string): Promise<{ json: string; messages: number }> {
-    const r = await this.request<{ messages: unknown[] }>(
-      `/sessions/${encodeURIComponent(sessionId)}/messages?limit=0`,
+  /**
+   * The transcript as markdown, for a browser that has no native save dialog.
+   * The native shell exports a self-contained HTML instead; this is the fallback
+   * that makes the button work there at all.
+   */
+  async exportMarkdown(sessionId: string): Promise<{ markdown: string; count: number }> {
+    const r = await this.request<{ markdown: string; count: number }>(
+      `/sessions/${encodeURIComponent(sessionId)}/export?format=md`,
     )
-    const messages = r.messages ?? []
-    return { json: JSON.stringify({ session: sessionId, messages }, null, 2), messages: messages.length }
+    return { markdown: r.markdown ?? '', count: r.count ?? 0 }
   }
 
   /** Manually compact a session's context. 409 while a turn runs, 404 unknown. */
