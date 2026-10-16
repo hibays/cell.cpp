@@ -7,11 +7,11 @@
 // live stream. Tool steps reuse ToolCallCard so diffs, exit codes and output
 // clipping have exactly one renderer.
 import { computed, ref } from 'vue'
-import { store } from '../store'
+import { loadWorkerReport, store } from '../store'
 import ToolCallCard from '../components/ToolCallCard.vue'
 import { buildTurns, turnStatus, type TraceStep } from '../lib/trace'
 import type { UiToolCall } from '../lib/transcript'
-import { relativeTime, truncate } from '../lib/format'
+import { formatCompact, relativeTime, truncate } from '../lib/format'
 import { renderMarkdown } from '../lib/markdown'
 
 const turns = computed(() => buildTurns(store.messages))
@@ -34,6 +34,17 @@ function asTool(s: TraceStep): UiToolCall {
 
 const STATUS_TEXT = { running: '进行中', blocked: '被阻止', ok: '完成' } as const
 
+// ---- sub-agents -------------------------------------------------------------
+// The trace of *this* conversation is the turns above; the children a teamwork
+// job ran are their own traces, loaded on demand from the kernel's per-worker
+// report rather than folded in here.
+const agentsOpen = ref(false)
+const childCount = computed(() => store.jobs.reduce((n, j) => n + (j.workers?.length ?? 0), 0))
+
+function openReport(jobId: string): void {
+  void loadWorkerReport(jobId, true)
+}
+
 function stepLabel(s: TraceStep): string {
   if (s.kind === 'tool') return s.name ?? 'tool'
   if (s.kind === 'reasoning') return '推理'
@@ -51,6 +62,38 @@ function stepLabel(s: TraceStep): string {
     </div>
 
     <div class="list">
+      <!-- children: this session's teamwork jobs and what each one reported -->
+      <section v-if="store.jobs.length" class="turn">
+        <header class="turn-head" @click="agentsOpen = !agentsOpen">
+          <span class="caret">{{ agentsOpen ? '▾' : '▸' }}</span>
+          <span class="idx">子智能体</span>
+          <span class="chip">{{ store.jobs.length }} 个任务 · {{ childCount }} 名</span>
+        </header>
+        <div v-if="agentsOpen" class="jobs">
+          <button v-for="j in store.jobs" :key="j.id" class="job" type="button" @click="openReport(j.id)">
+            <span class="job-id">{{ j.id }}</span>
+            <span class="dim">{{ j.work_type }} · {{ j.status }} · {{ j.workers?.length ?? 0 }} 名</span>
+          </button>
+          <div v-if="store.workerReport" class="report">
+            <p class="dim">报告：{{ store.workerReport.job }}</p>
+            <div v-for="w in store.workerReport.workers" :key="w.name" class="worker">
+              <span class="w-name">{{ w.name }}</span>
+              <span class="dim">
+                {{ w.status }} · {{ w.rounds }} 轮 · {{ w.tool_calls }} 步
+                <template v-if="w.total_tokens"> · {{ formatCompact(w.total_tokens) }} tok</template>
+                <template v-if="w.reviews_approved || w.reviews_denied">
+                  · 审阅 {{ w.reviews_approved ?? 0 }}/{{ w.reviews_denied ?? 0 }}
+                </template>
+              </span>
+              <p v-if="w.works" class="w-works">{{ w.works }}</p>
+              <p v-if="w.summary" class="w-summary">{{ w.summary }}</p>
+              <p v-if="w.has_transcript && !w.messages" class="dim">transcript 已落盘（{{ formatCompact(w.transcript_bytes ?? 0) }} 字节）</p>
+            </div>
+          </div>
+          <p v-if="store.workerReportError" class="dim">报告读取失败：{{ store.workerReportError }}</p>
+        </div>
+      </section>
+
       <section v-for="t in turns" :key="t.key" class="turn">
         <header class="turn-head" @click="toggle(t.key)">
           <span class="caret">{{ folded[t.key] ? '▸' : '▾' }}</span>
@@ -251,6 +294,60 @@ function stepLabel(s: TraceStep): string {
 
 .md :deep(p) {
   margin: 0.3em 0;
+}
+
+.jobs {
+  padding: 8px 12px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.job {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  width: 100%;
+  border: 1px solid var(--cell-alias-line-soft);
+  border-radius: var(--cell-radius-sm);
+  background: var(--cell-alias-bg-base);
+  color: var(--cell-alias-ink);
+  font-size: var(--cell-font-size-xs);
+  padding: 5px 8px;
+  text-align: left;
+}
+
+.job:hover {
+  border-color: var(--cell-alias-accent-line);
+}
+
+.job-id {
+  font-family: var(--cell-mono);
+}
+
+.report {
+  border-left: 2px solid var(--cell-alias-line);
+  padding-left: 10px;
+  margin: 2px 0 4px;
+}
+
+.worker {
+  margin: 6px 0;
+}
+
+.w-name {
+  font-family: var(--cell-mono);
+  font-size: var(--cell-font-size-xs);
+  margin-right: 8px;
+}
+
+.w-works,
+.w-summary {
+  margin: 2px 0;
+  font-size: var(--cell-font-size-xs);
+  color: var(--cell-alias-ink-dim);
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 
 .empty,

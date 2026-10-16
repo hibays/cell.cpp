@@ -28,6 +28,7 @@ export const COMMANDS: CommandDef[] = [
   { name: '/sandbox', desc: '切换沙箱与权限预设', arg: { kind: 'sandbox' }, side: 'kernel' },
   { name: '/tool', desc: '开关工具调用', arg: { kind: 'toggle' }, side: 'kernel' },
   { name: '/usages', desc: '查看本机用量与缓存命中', side: 'shell' },
+  { name: '/clear', desc: '清空当前会话（记录、中断点与协作任务）', side: 'kernel' },
   { name: '/new', desc: '新建会话', side: 'shell' },
   { name: '/export', desc: '导出当前会话', side: 'shell' },
   { name: '/help', desc: '查看命令与快捷键', side: 'shell' },

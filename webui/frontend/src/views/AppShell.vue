@@ -74,6 +74,11 @@ const subtitle = computed(() => {
 
 const cwd = computed(() => store.sessions.find((s) => s.id === store.currentSession)?.cwd ?? '')
 
+/** How many child agents this session's jobs cover, for the header chip. */
+const childAgents = computed(() =>
+  store.jobs.reduce((n, j) => n + (j.workers?.length ?? 0), 0),
+)
+
 let ro: ResizeObserver | null = null
 let raf = 0
 
@@ -121,9 +126,14 @@ onUnmounted(() => {
             <p v-if="subtitle" class="sub">{{ subtitle }}</p>
           </div>
 
-          <span v-if="store.jobs.workers" class="chip" title="协作任务中的子智能体">
-            {{ store.jobs.workers }} 个子智能体
-          </span>
+          <button
+            v-if="childAgents"
+            class="chip clickable"
+            title="协作任务中的子智能体（切到轨迹页看它们的报告）"
+            @click="setView('trace')"
+          >
+            {{ childAgents }} 个子智能体
+          </button>
           <span v-if="store.config" class="chip">{{ store.config.sandbox_mode }}</span>
           <span v-if="store.config" class="chip">
             think {{ store.config.think_levels[store.config.think_level] }}
@@ -290,6 +300,15 @@ onUnmounted(() => {
 
 .spacer {
   flex: 1;
+}
+
+.chip.clickable {
+  cursor: pointer;
+}
+
+.chip.clickable:hover {
+  border-color: var(--cell-alias-accent-line);
+  color: var(--cell-alias-ink);
 }
 
 .chip {

@@ -20,6 +20,7 @@ import { api } from '../lib/api'
 import {
   attach,
   clearAttachments,
+  clearCurrentSession,
   clearQueued,
   detach,
   interrupt,
@@ -267,6 +268,11 @@ async function runCommand(cmd: CommandDef, arg: string): Promise<void> {
         )
         return
       }
+      case '/clear':
+        // the kernel refuses while a turn or a background job runs; so do we
+        if (store.streaming) return toast('warn', '这一轮还在跑，结束后再清空')
+        await clearCurrentSession()
+        return
       case '/new':
         await newSession()
         return

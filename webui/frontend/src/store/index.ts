@@ -19,6 +19,8 @@ import type {
   FileEntry,
   ProviderEntry,
   SessionSummary,
+  TeamworkJob,
+  TeamworkReport,
   TurnEvent,
 } from '../lib/api'
 
@@ -77,8 +79,8 @@ interface State {
   /** Tail of the runtime log for the diagnostics tab. */
   logLines: string[]
   logsTruncated: boolean
-  /** Teamwork footprint of the session on screen (the header's agent chip). */
-  jobs: { count: number; workers: number }
+  /** The session's teamwork jobs (the header's chip counts their children). */
+  jobs: TeamworkJob[]
   // ---- composer ----
   /** Messages typed while a turn was running; sent one by one when it ends. */
   queued: string[]
@@ -89,6 +91,9 @@ interface State {
   filePath: string
   /** Skills available for /skill and @-mentions. */
   skills: { name: string; description: string }[]
+  /** A child agent's report, loaded on demand from the trace view. */
+  workerReport: TeamworkReport | null
+  workerReportError: string
 }
 
 const state = reactive<State>({
@@ -122,12 +127,14 @@ const state = reactive<State>({
   openFile: null,
   logLines: [],
   logsTruncated: false,
-  jobs: { count: 0, workers: 0 },
+  jobs: [],
   queued: [],
   attachments: [],
   files: [],
   filePath: '',
   skills: [],
+  workerReport: null,
+  workerReportError: '',
 })
 
 let toastSeq = 1
@@ -279,17 +286,53 @@ export async function reloadMessages(): Promise<void> {
 export async function refreshJobs(): Promise<void> {
   const id = state.currentSession
   if (!id) {
-    state.jobs = { count: 0, workers: 0 }
+    state.jobs = []
     return
   }
   try {
-    const list = await api.getSessionTeamworks(id)
-    state.jobs = {
-      count: list.jobs.length,
-      workers: list.jobs.reduce((n, j) => n + (j.workers?.length ?? 0), 0),
-    }
+    state.jobs = (await api.getSessionTeamworks(id)).jobs
   } catch {
-    state.jobs = { count: 0, workers: 0 }
+    state.jobs = []
+  }
+}
+
+/** Load one job's per-worker report (counters plus, on request, transcripts). */
+export async function loadWorkerReport(jobId: string, transcript = true): Promise<void> {
+  const id = state.currentSession
+  if (!id) return
+  state.workerReportError = ''
+  try {
+    state.workerReport = await api.teamworkReport(id, jobId, transcript)
+  } catch (e) {
+    state.workerReport = null
+    state.workerReportError = String(e)
+  }
+}
+
+/**
+ * Clear the session's context — the REST twin of the CLI's /clear. The
+ * transcript goes, the recorded reads go, and its teamwork store with them; the
+ * kernel refuses while a turn or a background job is running, and so do we.
+ */
+export async function clearCurrentSession(): Promise<boolean> {
+  const id = state.currentSession
+  if (!id) return false
+  if (state.streaming) {
+    toast('warn', '这一轮还在跑，结束后再清空')
+    return false
+  }
+  try {
+    const r = await api.clearSession(id)
+    state.messages = []
+    state.lastInterrupted = false
+    state.jobs = []
+    void refreshUsage()
+    void refreshJobs()
+    toast('ok', `已清空会话（移除 ${r.removed} 条消息${r.jobs ? `，${r.jobs} 个协作任务` : ''}）`)
+    return true
+  } catch (e) {
+    toast('bad', `清空失败：${String(e)}`)
+    return false
   }
 }
 

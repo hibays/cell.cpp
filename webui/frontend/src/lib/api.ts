@@ -208,6 +208,36 @@ export interface TeamworkJob {
   workers: TeamworkWorker[]
 }
 
+/** One child agent's report: what it did, and on request its transcript. */
+export interface WorkerReport {
+  name: string
+  works: string
+  provider: string
+  model: string
+  status: string
+  rounds: number
+  tool_calls: number
+  summary?: string
+  reviews_approved?: number
+  reviews_denied?: number
+  input_tokens?: number
+  output_tokens?: number
+  total_tokens?: number
+  has_transcript?: boolean
+  transcript_bytes?: number
+  messages?: number
+  transcript?: unknown[]
+}
+
+export interface TeamworkReport {
+  session: string
+  job: string
+  status: string
+  work_type: string
+  created: string
+  workers: WorkerReport[]
+}
+
 export interface TeamworkList {
   session?: string
   jobs: TeamworkJob[]
@@ -480,6 +510,37 @@ export class ApiClient {
   /** Teamwork jobs across every session. */
   getTeamworks() {
     return this.request<TeamworkList>('/teamworks')
+  }
+
+  /**
+   * Per-worker report for one job. The counters come from the run itself; the
+   * transcript is included only when asked for, because a worker can be big.
+   */
+  teamworkReport(sessionId: string, jobId: string, transcript = false) {
+    return this.request<TeamworkReport>(
+      `/sessions/${encodeURIComponent(sessionId)}/teamworks/${encodeURIComponent(jobId)}/report` +
+        (transcript ? '?transcript=1' : ''),
+    )
+  }
+
+  /**
+   * Clear a session's context: transcript, interrupt state, recorded reads and
+   * its teamwork store. 409 while a turn or a background job is running.
+   */
+  clearSession(sessionId: string) {
+    return this.request<{ session: string; cleared: boolean; removed: number; jobs: number }>(
+      `/sessions/${encodeURIComponent(sessionId)}/clear`,
+      { method: 'POST' },
+    )
+  }
+
+  /** The transcript as JSON, for a browser that has no native export. */
+  async exportSession(sessionId: string): Promise<{ json: string; messages: number }> {
+    const r = await this.request<{ messages: unknown[] }>(
+      `/sessions/${encodeURIComponent(sessionId)}/messages?limit=0`,
+    )
+    const messages = r.messages ?? []
+    return { json: JSON.stringify({ session: sessionId, messages }, null, 2), messages: messages.length }
   }
 
   /** Manually compact a session's context. 409 while a turn runs, 404 unknown. */
