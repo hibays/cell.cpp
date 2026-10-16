@@ -32,6 +32,30 @@ def free_port() -> int:
     return p
 
 
+def handle_count(pid: int) -> int:
+    """How many OS handles a process holds, or 0 when it cannot be read.
+
+    Windows only, and not by accident: POSIX reclaims a detached thread together
+    with the thread, while on MinGW/winpthreads std::thread::detach() never
+    closes the underlying Win32 thread handle (join() does). A worker thread per
+    connection therefore leaks one handle per request there and nothing at all
+    elsewhere — which is why the handle gate below is exercised by the
+    windows-msys2 CI job and is an honest no-op on Linux.
+    """
+    if sys.platform != "win32":
+        return 0
+    import ctypes
+
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    h = k32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+    if not h:
+        return 0
+    n = ctypes.c_ulong(0)
+    ok = k32.GetProcessHandleCount(h, ctypes.byref(n))
+    k32.CloseHandle(h)
+    return n.value if ok else 0
+
+
 class MockLLM(BaseHTTPRequestHandler):
     """Minimal OpenAI-compatible /v1/chat/completions (non-stream JSON)."""
 
@@ -317,6 +341,31 @@ def run_once(attempt: int) -> bool:
         assert prompt_text and prompt_text in sys_text, "system prompt missing after a skill load into a fresh session"
         assert "Do the e2e thing." in sys_text, "skill body lost on a fresh session"
         print("fresh session (no dir yet): skill load + job + compact + prompt intact")
+
+        # ---- handle regression: a worker thread per request must not leak ----
+        # The accept loop used to run every connection on a detached thread.
+        # Under MinGW/winpthreads detach() never closes the Win32 thread handle,
+        # so the kernel leaked exactly one handle per HTTP request — 600 requests
+        # grew the handle count by 600, and the GUI polls this server forever.
+        # The slack below only covers lazy one-off initialisation; a regression
+        # adds one handle per request, so these requests either stay flat or blow
+        # straight past the slack. Verified red against the pre-fix binary
+        # (60 requests -> +60) and green after it.
+        probe, slack = 60, 15
+        if sys.platform == "win32":
+            before = handle_count(proc.pid)
+            for _ in range(probe):
+                api(base, token, "GET", "/v1/health")
+            after = handle_count(proc.pid)
+            assert before and after, "handle count unavailable on Windows"
+            print(f"handles: {before} -> {after} over {probe} requests")
+            assert after - before <= slack, (
+                f"handle leak: {after - before:+d} handles over {probe} requests "
+                f"({before} -> {after}) — is a worker thread being detached per "
+                f"request? keep it joinable and reap it instead")
+        else:
+            print("handles: not checked on this platform "
+                  "(POSIX detach() leaks nothing; the windows-msys2 job runs it)")
 
         api(base, token, "POST", "/v1/shutdown")
         proc.wait(timeout=15)
