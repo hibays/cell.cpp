@@ -231,6 +231,53 @@ namespace cellui
         }
     }
 
+    // Settings must survive a restart, and the default runtime root is a
+    // directory *next to the executable* — read-only when cellui.exe was installed
+    // into Program Files (or lives on a shared drive). Probing it and falling back
+    // to a per-user location is the difference between "configure me once" and
+    // "configure me again on every launch".
+    static void ensure_writable_root()
+    {
+        if (std::getenv("CELL_ROOT"))
+            return; // the caller chose the root; not ours to second-guess
+        std::error_code ec;
+        std::filesystem::path here = std::filesystem::path(cell::plat::executable_dir()) / ".cell";
+        std::filesystem::create_directories(here, ec);
+        // a directory can exist and still refuse writes, so probe with a real file
+        std::filesystem::path probe = here / ".cellui-write-probe";
+        {
+            std::ofstream f(probe, std::ios::app);
+            if (f)
+                f << "x";
+        }
+        bool writable = std::filesystem::exists(probe, ec);
+        std::filesystem::remove(probe, ec);
+        if (writable)
+            return;
+        std::filesystem::path base;
+#ifdef _WIN32
+        if (const char *p = std::getenv("LOCALAPPDATA"); p && *p)
+            base = p;
+        else
+            base = std::filesystem::temp_directory_path(ec);
+#else
+        if (const char *h = std::getenv("HOME"); h && *h)
+            base = h;
+        else
+            base = std::filesystem::temp_directory_path(ec);
+#endif
+        std::filesystem::path fallback = base / "cell";
+        std::filesystem::create_directories(fallback, ec);
+#ifdef _WIN32
+        _putenv_s("CELL_ROOT", fallback.string().c_str());
+#else
+        ::setenv("CELL_ROOT", fallback.string().c_str(), 1);
+#endif
+        std::fprintf(stderr,
+                     "cellui: %s is not writable — settings, sessions and the vault now live in %s\n",
+                     here.string().c_str(), fallback.string().c_str());
+    }
+
     static void bind_bootstrap(webui_event_t *e)
     {
         // Everything the front-end needs to talk to the in-process agent.
@@ -239,6 +286,12 @@ namespace cellui
             {"serve_ok", g_state.serve_ok.load()},
             {"serve_error", g_state.serve_error},
             {"uptime_s", (long long)std::time(nullptr) - g_state.started_at},
+            // where settings, sessions and the vault live — and whether anything
+            // can actually be written there. A shell that cannot save its settings
+            // should say so instead of asking the user to configure it again on
+            // every launch.
+            {"root", cell::root.string()},
+            {"root_writable", cell::root_writable()},
             {"platform",
              {
 #ifdef _WIN32
@@ -544,6 +597,10 @@ namespace cellui
             passthrough.push_back("--host");
             passthrough.push_back(host);
         }
+
+        // before anything touches cell::root: it is initialised on first use, and
+        // the fallback has to be in place by then
+        ensure_writable_root();
 
         // start the agent service layer in this process
         std::thread serve_thread;

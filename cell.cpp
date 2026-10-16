@@ -2061,6 +2061,26 @@ namespace cell
         workdir_cache() = p;
         return p;
     }
+    // Whether the runtime root can actually be written. A directory can exist and
+    // still refuse writes — an install under Program Files is the usual reason —
+    // and a config that cannot be saved is a setting the user re-enters on every
+    // launch. Probed with a real file, because an existing directory proves
+    // nothing about write access.
+    static bool root_writable()
+    {
+        std::error_code ec;
+        std::filesystem::create_directories(root, ec);
+        std::filesystem::path probe = root / ".cell-write-probe";
+        {
+            std::ofstream f(probe, std::ios::app);
+            if (f)
+                f << "x";
+        }
+        bool ok = std::filesystem::exists(probe, ec);
+        std::filesystem::remove(probe, ec);
+        return ok;
+    }
+
     static void reset_workdir_cache() { workdir_cache().reset(); }
     // cached lowercase-normalized workdir string (hot path: is_in_workspace)
     static const std::string &workdir_norm()
@@ -16523,6 +16543,16 @@ details{break-inside:avoid}
             std::mutex sm;
             std::shared_ptr<turn_stream> current; // stream of the running turn
 
+            // One turn runs at a time on the core thread. A *second* request waits
+            // for its turn instead of being refused: refusing loses the message the
+            // user typed, and the shell already has a queue of its own. A condition
+            // variable is the honest tool here — claim, wait, run, release — because
+            // a second atomic flag would have to be re-set by waiters and could be
+            // left stuck by a timeout.
+            std::mutex turn_mx;
+            std::condition_variable turn_cv;
+            bool turn_running = false;
+
             std::string next_id(const char *prefix)
             {
                 return std::format("{}-{:x}-{:x}", prefix, (unsigned long long)std::time(nullptr), seq.fetch_add(1));
@@ -16647,6 +16677,31 @@ details{break-inside:avoid}
                 {"session_id", s.session_id}};
         }
 
+        // Persist the config, and turn a failed write into an answer the client
+        // can act on. Silently dropping a provider registration is exactly how a
+        // shell ends up asking for the endpoint again on every launch.
+        inline bool persist_config(cell::config::settings &cfg)
+        {
+            if (cell::config::save(cfg))
+                return true;
+            cell::sys::logger::instance().error("config",
+                                                 std::format("cannot write {}", (cell::root / "config.json").string()));
+            return false;
+        }
+
+        inline std::string config_unwritable_error()
+        {
+            // `json` is only an alias inside the dispatcher; this helper is a
+            // namespace-level function, so spell the type out
+            return nlohmann::json{
+                       {"error",
+                        {{"code", "config_unwritable"},
+                         {"message", std::format("cannot write {} — settings would not survive a restart",
+                                                 (cell::root / "config.json").string())},
+                         {"root", cell::root.string()}}}}
+                .dump();
+        }
+
         inline nlohmann::json provider_json(const cell::config::provider_entry &p, bool is_current)
         {
             return nlohmann::json{
@@ -16659,13 +16714,24 @@ details{break-inside:avoid}
         }
 
         // The session catalogue: the same scan /sessions performs, in JSON.
-        // Unix seconds for a filesystem timestamp (file_clock's epoch is
-        // unspecified; to_sys() is the standard bridge).
+        // Unix seconds for a filesystem timestamp, portably.
+        //
+        // The standard bridge is file_clock::to_sys(), and GCC's file_time_type
+        // does have it. MSVC's does not: its file_time_type is measured on the
+        // filesystem's own clock (`filesystem::_File_time_clock`), which exposes
+        // only the leap-second-aware to_utc/from_utc — so to_sys() is a compile
+        // error there, which is exactly how this broke the MSVC job.
+        //
+        // Calibrating against the same clock's now() costs two clock reads and
+        // works on every implementation: the two now()s are microseconds apart,
+        // orders of magnitude below the one-second resolution we need.
         inline long long unix_seconds(std::filesystem::file_time_type t)
         {
-            return (long long)std::chrono::duration_cast<std::chrono::seconds>(
-                       std::chrono::file_clock::to_sys(t).time_since_epoch())
-                .count();
+            const auto file_now = std::filesystem::file_time_type::clock::now();
+            const auto sys_now = std::chrono::system_clock::now();
+            const auto skew = t - file_now;
+            const auto when = sys_now + std::chrono::duration_cast<std::chrono::system_clock::duration>(skew);
+            return (long long)std::chrono::duration_cast<std::chrono::seconds>(when.time_since_epoch()).count();
         }
 
         inline nlohmann::json sessions_json(bool include_archived = false)
@@ -24683,6 +24749,11 @@ int repl::run()
                                    {"model", snap["model"]},
                                    {"session", snap["session"]},
                                    {"sandbox_mode", snap["sandbox_mode"]},
+                                   // where the state lives and whether settings can
+                                   // be written at all: a client that cannot save
+                                   // should say so instead of asking again later
+                                   {"root", cell::root.string()},
+                                   {"root_writable", cell::root_writable()},
                                    {"turn_active", serve_bridge.turn_active.load()}});
                 return;
             }
@@ -25045,15 +25116,33 @@ int repl::run()
                     res.error(400, "bad_request", "text (or resume:true) is required");
                     return;
                 }
-                if (serve_bridge.turn_active.exchange(true))
+                // Wait in line for the core (bounded — a wedged turn must not pin
+                // HTTP workers for ever), then claim it atomically.
+                constexpr int kTurnWaitSec = 180;
+                auto wait_from = cell::sys::detail::clock::now();
                 {
-                    res.error(409, "busy", "another turn is already running");
-                    return;
+                    std::unique_lock<std::mutex> lk(serve_bridge.turn_mx);
+                    if (serve_bridge.turn_running &&
+                        !serve_bridge.turn_cv.wait_for(lk, std::chrono::seconds(kTurnWaitSec),
+                                                       [&] { return !serve_bridge.turn_running; }))
+                    {
+                        res.error(409, "busy",
+                                  std::format("a turn is still running after waiting {}s", kTurnWaitSec));
+                        return;
+                    }
+                    serve_bridge.turn_running = true;
                 }
+                serve_bridge.turn_active.store(true);
+                long long waited_ms = cell::sys::elapsed_ms(wait_from);
                 auto ts = std::make_shared<cell::serve::turn_stream>();
                 if (want_stream && (!res.open_stream() || !res.stream_write(": cell " CELL_VERSION " turn stream\n\n")))
                 {
                     serve_bridge.turn_active.store(false);
+                    {
+                        std::lock_guard<std::mutex> g(serve_bridge.turn_mx);
+                        serve_bridge.turn_running = false;
+                    }
+                    serve_bridge.turn_cv.notify_all();
                     return;
                 }
                 serve_bridge.post([&, ts, sid, text, resume]()
@@ -25104,6 +25193,11 @@ int repl::run()
                                       cell::events::sink() = nullptr; // nothing may bridge into a finished turn
                                       serve_bridge.set_current(nullptr);
                                       serve_bridge.turn_active.store(false);
+                                      {
+                                          std::lock_guard<std::mutex> g(serve_bridge.turn_mx);
+                                          serve_bridge.turn_running = false;
+                                      }
+                                      serve_bridge.turn_cv.notify_all(); // a waiting session gets its turn
                                       ts->push(json{{"type", "turn_done"}, {"data", {{"rc", rc}, {"interrupted", interrupted}}}});
                                       ts->finish(rc, interrupted);
                                   });
@@ -25136,7 +25230,14 @@ int repl::run()
                         res.stream_close();
                     return;
                 }
-                res.json(200, json{{"rc", ts->rc}, {"interrupted", ts->interrupted}, {"output", captured}, {"events", collected}});
+                // `waited_ms` is non-zero when this turn had to line up behind
+                // another one: the difference between "instant" and "queued" should
+                // be visible to whoever asked
+                res.json(200, json{{"rc", ts->rc},
+                                   {"interrupted", ts->interrupted},
+                                   {"waited_ms", waited_ms},
+                                   {"output", captured},
+                                   {"events", collected}});
                 return;
             }
 
@@ -25155,6 +25256,14 @@ int repl::run()
                 json patch = *body;
                 on_core(r, [&, patch](core_reply &rep)
                         {
+                            // check before applying: a setting that cannot be saved
+                            // is better refused loudly than accepted and forgotten
+                            if (!cell::root_writable())
+                            {
+                                rep.status = 500;
+                                rep.body = cell::serve::config_unwritable_error();
+                                return;
+                            }
                             std::string err;
                             if (!apply_config_patch(patch, err))
                             {
@@ -25220,7 +25329,14 @@ int repl::run()
                                 cfg.current_model = b["model"].get<std::string>();
                             if (cfg.current_provider.empty())
                                 cfg.current_provider = p->name;
-                            cell::config::save(cfg);
+                            if (!cell::serve::persist_config(cfg))
+                            {
+                                // answering 201 here would tell the shell the
+                                // settings were saved when they were not
+                                rep.status = 500;
+                                rep.body = cell::serve::config_unwritable_error();
+                                return;
+                            }
                             snapshot_push(cfg.session_id);
                             rep.status = (idx >= 0) ? 200 : 201;
                             rep.body = cell::serve::provider_json(*p, true).dump();
@@ -25257,7 +25373,12 @@ int repl::run()
                                     cfg.current_model.clear();
                                 }
                             }
-                            cell::config::save(cfg);
+                            if (!cell::serve::persist_config(cfg))
+                            {
+                                rep.status = 500;
+                                rep.body = cell::serve::config_unwritable_error();
+                                return;
+                            }
                             rep.body = json{{"removed", name}, {"remaining", cfg.providers.size()}}.dump();
                         });
             }
@@ -25279,7 +25400,12 @@ int repl::run()
                             cell::config::select_provider(cfg, name);
                             if (b.contains("model") && b["model"].is_string() && !b["model"].get<std::string>().empty())
                                 cfg.current_model = b["model"].get<std::string>();
-                            cell::config::save(cfg);
+                            if (!cell::serve::persist_config(cfg))
+                            {
+                                rep.status = 500;
+                                rep.body = cell::serve::config_unwritable_error();
+                                return;
+                            }
                             snapshot_push(cfg.session_id);
                             rep.body = json{{"current_provider", cfg.current_provider}, {"current_model", cfg.current_model}}.dump();
                         });
@@ -25478,6 +25604,46 @@ int repl::run()
                         return;
                     }
                     nlohmann::json msgs = cell::serve::messages_json(sid, 0, 0);
+                    if (fmt == "html")
+                    {
+                        // the same self-contained page the CLI writes, teamwork pane
+                        // and all — a browser has no save dialog, so this is what
+                        // makes the full export reachable there
+                        // the renderer writes a file (the CLI hands it a path), so
+                        // render into the runtime's tmp area with the teamwork pane
+                        // the CLI builds, read the bytes back and remove the file
+                        std::filesystem::path target = cell::root / "tmp" / std::format("export-{}.html", cell::utc_stamp());
+                        std::error_code fec;
+                        std::filesystem::create_directories(target.parent_path(), fec);
+                        cell::chat::export_context export_ctx;
+                        cell::teamwork::collect_export_jobs(sid, export_ctx.jobs);
+                        std::string herr;
+                        if (!cell::chat::export_transcript_html(msgs, sid, target, herr, &export_ctx))
+                        {
+                            rep.status = 422;
+                            rep.body = json{{"error", {{"code", "export_failed"}, {"message", herr}}}}.dump();
+                            return;
+                        }
+                        std::string html_out;
+                        {
+                            std::ifstream in(target, std::ios::binary);
+                            if (in)
+                                html_out.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+                        }
+                        std::filesystem::remove(target, fec);
+                        if (html_out.empty())
+                        {
+                            rep.status = 500;
+                            rep.body = json{{"error", {{"code", "export_failed"}, {"message", "rendered page could not be read back"}}}}.dump();
+                            return;
+                        }
+                        rep.body = json{{"session", sid},
+                                        {"format", "html"},
+                                        {"count", (int)msgs.size()},
+                                        {"jobs", (int)export_ctx.jobs.size()},
+                                        {"html", html_out}}.dump();
+                        return;
+                    }
                     if (fmt == "md" || fmt == "markdown")
                     {
                         std::string md = std::format("# cell session {}\\n\\n", sid) +
@@ -25488,7 +25654,7 @@ int repl::run()
                     if (fmt != "json")
                     {
                         rep.status = 400;
-                        rep.body = json{{"error", {{"code", "bad_format"}, {"message", "format must be json or md"}}}}.dump();
+                        rep.body = json{{"error", {{"code", "bad_format"}, {"message", "format must be json, md or html"}}}}.dump();
                         return;
                     }
                     rep.body = json{{"session", sid}, {"format", "json"}, {"count", (int)msgs.size()}, {"messages", msgs}}.dump();
