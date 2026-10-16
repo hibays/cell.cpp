@@ -54,6 +54,25 @@ export interface UsageRecord {
   output_chars?: number
 }
 
+/** One entry of a directory listing (paths are relative to the workdir). */
+export interface FileEntry {
+  name: string
+  path: string
+  dir: boolean
+  /** Bytes, or -1 when it cannot be read. */
+  size: number
+  /** Unix seconds, 0 when unknown. */
+  mtime: number
+}
+
+export interface FileListing {
+  cwd: string
+  /** The listed directory, relative to the workdir ("." for the root). */
+  path: string
+  entries: FileEntry[]
+  truncated: boolean
+}
+
 export interface ProviderEntry {
   name: string
   api_style: string
@@ -523,6 +542,15 @@ export class ApiClient {
     return this.request<{ provider: string; models: string[] }>(
       `/providers/${encodeURIComponent(name)}/models`,
     )
+  }
+
+  // ---- files -----------------------------------------------------------------
+  // Read-only listing rooted at the session's working directory, for the
+  // composer's @-mentions and its attachment picker. Paths come back relative to
+  // that root, which is the form a prompt can carry.
+  listFiles(path = '') {
+    const q = path ? `?path=${encodeURIComponent(path)}` : ''
+    return this.request<FileListing>(`/files${q}`)
   }
 
   // ---- skills ----------------------------------------------------------------

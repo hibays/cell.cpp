@@ -4,12 +4,15 @@
 // Extracted from the old single-file shell so the frame (AppShell) can switch
 // between this and the trace view without either owning the other's chrome.
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
-import { interrupt, newSession, resume, selectSession, send, store } from '../store'
+import { interrupt, newSession, resume, selectSession, send, store, toast } from '../store'
 import MessageItem from '../components/MessageItem.vue'
 import Composer from '../components/Composer.vue'
 import ApprovalCard from '../components/ApprovalCard.vue'
 import { createScrollAnchor } from '../lib/scrollAnchor'
 import { computeWindow } from '../lib/window'
+import type { UiMessage } from '../lib/transcript'
+
+const emit = defineEmits<{ export: [] }>()
 
 const scroller = ref<HTMLDivElement | null>(null)
 
@@ -62,6 +65,15 @@ function measure(): void {
 }
 
 const chips = ['介绍一下这个仓库', '解释 cell.cpp 的架构', '帮我写一个 CMake 选项']
+
+// The live turn is a message like any other: same renderer, same action-bar
+// rules, but the markdown goes through the block cache (lib/streamMarkdown)
+// so finished paragraphs are not re-rendered per token.
+const streamMessage = computed<UiMessage>(() => ({
+  key: 'streaming',
+  role: 'assistant',
+  text: store.streamText,
+}))
 
 function readScroller(): void {
   const el = scroller.value
@@ -165,12 +177,15 @@ onUnmounted(() => observer?.disconnect())
           :key="m.key"
           :message="m"
           :data-mk="win.start + i"
+          @copy="toast('ok', $event)"
         />
         <div :style="{ height: `${win.padBottom}px` }" />
-        <div v-if="store.streaming" class="streaming">
-          <pre class="stream-text">{{ store.streamText }}</pre>
-          <span class="cursor" />
-        </div>
+        <MessageItem
+          v-if="store.streaming && store.streamText"
+          :message="streamMessage"
+          streaming
+          @copy="toast('ok', $event)"
+        />
         <ApprovalCard v-for="a in store.approvals" :key="a.request_id" :approval="a" />
         <div v-if="!store.messages.length && !store.streaming" class="welcome">
           <h2>开始吧</h2>
@@ -188,7 +203,7 @@ onUnmounted(() => observer?.disconnect())
     </button>
 
     <div class="composer-wrap">
-      <Composer />
+      <Composer @export="emit('export')" />
       <div class="quick">
         <button v-if="store.lastInterrupted && !store.streaming" class="q" @click="resume()">
           ↻ 继续上次中断
@@ -239,31 +254,6 @@ onUnmounted(() => observer?.disconnect())
   max-width: var(--cell-content-width);
   margin: 0 auto;
   padding: 20px 22px 26px;
-}
-
-.streaming {
-  padding: 10px 0;
-}
-
-.stream-text {
-  display: inline;
-  margin: 0;
-  font-family: inherit;
-  font-size: var(--cell-font-size-body);
-  line-height: var(--cell-line-height);
-  white-space: pre-wrap;
-  word-break: break-word;
-  color: var(--cell-alias-ink);
-}
-
-.streaming .cursor {
-  display: inline-block;
-  width: 8px;
-  height: 15px;
-  background: var(--cell-alias-accent);
-  border-radius: 2px;
-  animation: cell-blink 1s steps(2) infinite;
-  vertical-align: text-bottom;
 }
 
 .welcome {

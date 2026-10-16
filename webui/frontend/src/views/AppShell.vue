@@ -166,7 +166,7 @@ onUnmounted(() => {
 
         <!-- both views stay mounted: the conversation owns scroll position and
              its row-height cache, and remounting it would throw both away -->
-        <ConversationView v-show="store.view === 'chat'" />
+        <ConversationView v-show="store.view === 'chat'" @export="exportOpen = true" />
         <TraceView v-show="store.view === 'trace'" />
       </main>
 

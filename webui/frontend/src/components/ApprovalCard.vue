@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed } from 'vue'
+import { computed, onMounted, onUnmounted } from 'vue'
 import type { Approval } from '../lib/api'
 import { approve, deny, store } from '../store'
 
@@ -21,6 +21,28 @@ const risk = computed<'high' | 'normal'>(() => {
 })
 
 const queue = computed(() => store.approvals.findIndex((a) => a.request_id === props.approval.request_id) + 1)
+/** Only the head of the queue answers the keyboard. */
+const isHead = computed(() => store.approvals[0]?.request_id === props.approval.request_id)
+
+// Y / N, since the card prints them: the old card advertised a shortcut that
+// did nothing. Typing targets are left alone (the sidebar search is a live
+// input; the composer itself is disabled while a decision is pending).
+function onKey(e: KeyboardEvent): void {
+  if (!isHead.value || e.metaKey || e.ctrlKey || e.altKey) return
+  const el = e.target as HTMLElement | null
+  if (el && (el.tagName === 'TEXTAREA' || el.tagName === 'INPUT' || el.isContentEditable)) return
+  const k = e.key.toLowerCase()
+  if (k === 'y') {
+    e.preventDefault()
+    void approve(props.approval.request_id)
+  } else if (k === 'n') {
+    e.preventDefault()
+    void deny(props.approval.request_id)
+  }
+}
+
+onMounted(() => window.addEventListener('keydown', onKey))
+onUnmounted(() => window.removeEventListener('keydown', onKey))
 </script>
 
 <template>

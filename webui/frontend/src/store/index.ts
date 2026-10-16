@@ -14,6 +14,7 @@ import type {
   Approval,
   Bootstrap,
   ConfigSnapshot,
+  FileEntry,
   ProviderEntry,
   SessionSummary,
 } from '../lib/api'
@@ -65,6 +66,16 @@ interface State {
   settingsOpen: boolean
   /** Teamwork footprint of the session on screen (the header's agent chip). */
   jobs: { count: number; workers: number }
+  // ---- composer ----
+  /** Messages typed while a turn was running; sent one by one when it ends. */
+  queued: string[]
+  /** Path references attached to the next message. */
+  attachments: string[]
+  /** Working-directory listing for the @-mention palette and the attach picker. */
+  files: FileEntry[]
+  filePath: string
+  /** Skills available for /skill and @-mentions. */
+  skills: { name: string; description: string }[]
 }
 
 const state = reactive<State>({
@@ -95,6 +106,11 @@ const state = reactive<State>({
   rightbarWidth: 420,
   settingsOpen: false,
   jobs: { count: 0, workers: 0 },
+  queued: [],
+  attachments: [],
+  files: [],
+  filePath: '',
+  skills: [],
 })
 
 let toastSeq = 1
@@ -128,7 +144,7 @@ export async function boot(): Promise<void> {
     }
     api.base = state.bootstrap.api?.base ?? ''
     api.token = state.bootstrap.api?.token ?? ''
-    await Promise.all([refreshConfig(), refreshSessions()])
+    await Promise.all([refreshConfig(), refreshSessions(), refreshSkills(), refreshFiles()])
     // the landing page is the first thing the user sees; enterApp() moves on
     state.phase = 'landing'
   } catch (e) {
@@ -226,6 +242,108 @@ export async function refreshJobs(): Promise<void> {
     }
   } catch {
     state.jobs = { count: 0, workers: 0 }
+  }
+}
+
+// ---- composer ----------------------------------------------------------------
+// The queue is deliberately one turn deep in behaviour: cell runs one turn at a
+// time (a second POST is a 409), so anything typed while a turn is running waits
+// and is sent when it ends, in order.
+
+export function attach(path: string): void {
+  const p = path.trim()
+  if (p && !state.attachments.includes(p)) state.attachments.push(p)
+}
+
+export function detach(path: string): void {
+  state.attachments = state.attachments.filter((p) => p !== path)
+}
+
+export function clearAttachments(): void {
+  state.attachments = []
+}
+
+/** Send now, or queue when a turn is already running. Returns true when queued. */
+export function submitOrQueue(text: string): boolean {
+  const t = text.trim()
+  if (!t) return false
+  if (state.streaming) {
+    state.queued.push(t)
+    return true
+  }
+  void send(t)
+  return false
+}
+
+export function dropQueued(index: number): void {
+  state.queued.splice(index, 1)
+}
+
+export function clearQueued(): void {
+  state.queued = []
+}
+
+/** Start the next queued message; called when a turn finishes. */
+export function drainQueue(): void {
+  if (state.streaming) return
+  const next = state.queued.shift()
+  if (next) void send(next)
+}
+
+export async function refreshFiles(path = ''): Promise<void> {
+  try {
+    const listing = await api.listFiles(path)
+    state.files = listing.entries
+    state.filePath = listing.path === '.' ? '' : listing.path
+  } catch {
+    state.files = []
+  }
+}
+
+export async function refreshSkills(): Promise<void> {
+  try {
+    const { skills } = await api.skills()
+    state.skills = skills.map((s) => ({ name: s.name, description: s.description }))
+  } catch {
+    state.skills = []
+  }
+}
+
+export async function setModel(provider: string, model?: string): Promise<void> {
+  try {
+    const r = await api.selectProvider(provider, model)
+    if (state.config) {
+      state.config.current_provider = r.current_provider
+      state.config.current_model = r.current_model
+    }
+    toast('ok', `模型：${r.current_provider}:${r.current_model}`)
+  } catch (e) {
+    toast('bad', `切换模型失败：${String(e)}`)
+  }
+}
+
+export async function setThink(level: number): Promise<void> {
+  try {
+    state.config = await api.patchConfig({ think_level: level })
+  } catch (e) {
+    toast('bad', `调整思考深度失败：${String(e)}`)
+  }
+}
+
+/** Permission fence: the sandbox mode plus its auto-allow flag, always together. */
+export async function setFence(mode: string, autoallow: boolean): Promise<void> {
+  try {
+    state.config = await api.patchConfig({ sandbox_mode: mode, autoallow } as Partial<ConfigSnapshot>)
+  } catch (e) {
+    toast('bad', `切换权限失败：${String(e)}`)
+  }
+}
+
+export async function setTools(on: boolean): Promise<void> {
+  try {
+    state.config = await api.patchConfig({ tools: on } as Partial<ConfigSnapshot>)
+  } catch (e) {
+    toast('bad', `切换工具失败：${String(e)}`)
   }
 }
 
@@ -349,6 +467,7 @@ export async function send(text: string): Promise<void> {
     // the row label and its age come from the kernel, so the sidebar only
     // becomes accurate after the turn has landed
     void refreshSessions()
+    drainQueue()
   }
 }
 
@@ -383,6 +502,7 @@ export async function resume(): Promise<void> {
     state.approvals = []
     void refreshUsage()
     void refreshSessions()
+    drainQueue()
   }
 }
 

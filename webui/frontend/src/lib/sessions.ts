@@ -22,7 +22,7 @@ export interface SessionGroup {
 
 /** Most recent first; sessions without a timestamp sink to the bottom. */
 export function sortByRecency(list: SessionSummary[]): SessionSummary[] {
-  return [...list].sort((a, b) => {
+  return list.toSorted((a, b) => {
     const at = a.updated_at || 0
     const bt = b.updated_at || 0
     if (at !== bt) return bt - at
@@ -77,9 +77,11 @@ export function groupSessions(
     g.sessions.push(s)
   }
   const groups = [...byKey.values()]
-  groups.sort((a, b) => (b.sessions[0]?.updated_at ?? 0) - (a.sessions[0]?.updated_at ?? 0))
-  // the loose group never wins a tie against a real workspace
-  return groups.sort((a, b) => {
+  // newest group first, and the loose group never wins a tie against a real
+  // workspace ("其他" belongs at the bottom)
+  return groups.toSorted((a, b) => {
+    const byAge = (b.sessions[0]?.updated_at ?? 0) - (a.sessions[0]?.updated_at ?? 0)
+    if (byAge !== 0) return byAge
     if (!a.cwd !== !b.cwd) return a.cwd ? -1 : 1
     return 0
   })
