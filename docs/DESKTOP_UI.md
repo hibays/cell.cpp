@@ -37,7 +37,7 @@ Anatomy of the target screen, top to bottom:
 | **B2** | session metadata in `GET /v1/sessions`: `title`, `updated_at`, `messages`, `cwd` | `id`, `cwd`, `messages`, `snippet` | grouping + relative age + search in the sidebar; without `updated_at` the list cannot be ordered or grouped by recency |
 | **B3** | teamwork detail: `GET /v1/teamworks/{job}/report`, per-worker status/rounds/tools | jobs list + reports only through the CLI/`tw` tool | the "N 个子智能体" chip and the trace view's sub-agent section |
 | **B4** | per-turn stats: turns, steps (tool calls), decode tok/s, ttft, token totals, cache hit | `/v1/usages` aggregates only | the telemetry strip |
-| **B5** | `GET /v1/files?path=` (workspace listing) | ✗ | `@` file mentions and a right-side file panel |
+| **B5** | `GET /v1/files?path=` (workspace listing) | ✅ done (P2) | `@` file mentions and the attachment picker |
 | **B6** | `GET /v1/logs?tail=N` (documented 🚧) | ✗ | a right bar for diagnostics; low priority |
 | **B7** | `GET /v1/sessions/{id}/clear`, `archives`, `export` (documented 🚧) | ✗ | session hygiene in the sidebar |
 
@@ -52,12 +52,12 @@ sub-agent view; B5–B7 are later.
 | **F2** | three-column CSS grid shell (`sidebar / main / rightbar`) with rAF-throttled drag handles, collapsed rail (<1024 px) and persisted widths | 1 |
 | **F3** | sidebar: workspace grouping, 250 ms-debounced search, relative age, state dot, per-group fold quota, "new session", settings/plugins at the bottom | 1 |
 | **F4** | view tabs `对话 / 轨迹`: the trace view is a per-turn ledger (turns → steps → tool calls/diffs/sub-agents) built from B1 | 1 (v1 from transcript), 3 (live) |
-| **F5** | composer: multi-line input, `+` attachments, `/` command palette, `@` mentions, model / permission / think selectors, submit-state machine, queue vs steer | 2 |
+| **F5** | composer: multi-line input, `+` attachments, `/` command palette, `@` mentions, model / permission / think selectors, one-turn send queue | 2 |
 | **F6** | telemetry strip: turns, steps, tok/s, token totals, cache-hit %, context ring | 1 (usage), 3 (live per-turn) |
 | **F7** | streaming markdown: freeze completed blocks, re-render only the tail, publish on rAF | 2 |
 | **F8** | semantic-anchor scrolling: capture anchor on read gestures, reserve space below, toggle `overflow-anchor` while following | 1 (extend `scrollAnchor.ts`) |
 | **F9** | code highlighting, sized for the inline bundle | 2 |
-| **F10** | message action bar (copy / feedback / timestamp) and attachment/file cards with a preview tab | 2 |
+| **F10** | message action bar (copy / feedback / timestamp) and code-block copy; file cards with a preview tab are P4 | 2 |
 | **F11** | approval takes over the composer, `Y` / `N` keys, risk line | 2 |
 
 ## 3. What we borrow from the harness (with the numbers)
@@ -87,16 +87,22 @@ Each phase ships with the repo's existing gates green — `bun test` (front-end
 units), `vue-tsc --noEmit`, `vite build` + `embed_webui.mjs`, `cell.cellui_boot`
 (SPA marker + icon id inside the binary), `ctest` (`selftest`, `e2e_serve`).
 
-- **P1 — shell & navigation (this iteration).** F1 tokens, F2 grid shell, F3
-  sidebar, F4 tabs v1, F6 usage strip, F8 anchor extension, plus kernel **B2**
+- **P1 — shell & navigation (done).** F1 tokens, F2 grid shell, F3 sidebar, F4
+  tabs v1, F6 usage strip, F8 anchor extension, plus kernel **B2**
   (`title` / `updated_at`).
-- **P2 — input & content.** F5 composer (attachments, `/`, `@`, selectors),
-  F7 streaming markdown, F9 highlighting, F10 action bar + file cards, F11
-  approval takeover.
+- **P2 — input & content (done).** F5 composer (attachments, `/` commands with
+  argument completion, `@` mentions, model / permission / think selectors, a
+  one-turn send queue), F7 streaming markdown with a frozen-block cache, F9
+  highlighting, F10 message action bar + code copy, F11 approval takeover with
+  `Y` / `N`; plus kernel **B5** (read-only file listing, sandboxed to the
+  working directory) which is what makes `@` files and the attachment picker
+  real rather than decorative.
 - **P3 — semantic stream.** Kernel **B1** (structured events) + B4 (per-turn
   stats) + B3 (sub-agent detail); the trace view becomes live and the telemetry
   strip shows tok/s and cache hit for the running turn.
-- **P4 — depth.** B5 files panel, B6 logs tail, B7 session hygiene, diff review.
+- **P4 — depth.** B6 logs tail, B7 session hygiene (`/clear`, archives, export),
+  diff review, a files panel in the right bar, uploaded (as opposed to
+  referenced) attachments.
 
 ## 5. Non-goals and constraints
 
