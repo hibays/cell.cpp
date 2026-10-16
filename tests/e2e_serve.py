@@ -84,6 +84,7 @@ class MockLLM(BaseHTTPRequestHandler):
         # "[READ]" proposes one read tool call; the second round (the tool result
         # is the last message) must answer with text instead of proposing it again
         wants_read = "[READ]" in last and not last_is_tool
+        wants_slow = "[SLOW]" in last
         text = f"mock reply to: {last[:80]}"
         # the kernel always requests stream=true — answer in OpenAI SSE chunks
         self.send_response(200)
@@ -92,6 +93,20 @@ class MockLLM(BaseHTTPRequestHandler):
         # missing length as a broken response ("connection closed")
         self.send_header("Connection", "close")
         self.end_headers()
+        if wants_slow:
+            # one delta every 250 ms: keeps a turn in flight long enough for the
+            # test to post a notice and watch it arrive as a stream event
+            for i in range(8):
+                self.wfile.write(
+                    f"data: {json.dumps({'choices': [{'delta': {'content': f'slow{i} '}}]})}\n\n".encode()
+                )
+                self.wfile.flush()
+                time.sleep(0.25)
+            self.wfile.write(
+                f"data: {json.dumps({'choices': [{'delta': {}, 'finish_reason': 'stop'}], 'usage': {'prompt_tokens': 4, 'completion_tokens': 8, 'total_tokens': 12}})}\n\n".encode()
+            )
+            self.wfile.write(b"data: [DONE]\n\n")
+            return
         if wants_read:
             chunks = [
                 {
@@ -363,6 +378,27 @@ def run_once(attempt: int) -> bool:
         assert api_code(base, token, "GET", "/v1/files?path=../../etc") == 400
         print("file listing: entries + workdir containment enforced")
 
+        # ---- file content: the viewer's read side ----
+        content = api(base, token, "GET", "/v1/files/content?path=probe.txt")
+        assert content["content"] == "hello" and content["name"] == "probe.txt", content
+        assert content["binary"] is False and content["truncated"] is False, content
+        assert api_code(base, token, "GET", "/v1/files/content") == 400  # missing path
+        assert api_code(base, token, "GET", "/v1/files/content?path=../x") == 400
+        assert api_code(base, token, "GET", "/v1/files/content?path=subdir") == 400  # a directory is not text
+        assert api_code(base, token, "GET", "/v1/files/content?path=nope.txt") == 404
+        (work / "big.txt").write_text("x" * 5000)
+        big = api(base, token, "GET", "/v1/files/content?path=big.txt&max=1024")
+        assert big["truncated"] is True and len(big["content"]) == 1024, (big["truncated"], len(big["content"]))
+        (work / "bin.dat").write_bytes(b"\x00\x01\x02abc")
+        assert api(base, token, "GET", "/v1/files/content?path=bin.dat")["binary"] is True
+        print("file content: read, size cap, binary marking, refusals")
+
+        # ---- log tail ----
+        logs = api(base, token, "GET", "/v1/logs?tail=50")
+        assert logs["lines"], logs
+        assert api(base, token, "GET", "/v1/logs?tail=3")["lines"].__len__() <= 3
+        print("log tail:", len(logs["lines"]), "lines")
+
         # ---- tool events: a call and its result, paired by id ----
         # Tools are off in this fixture, so flip them on for one session; `read`
         # is an allow-policy tool, which keeps the approval dance out of it.
@@ -380,6 +416,7 @@ def run_once(attempt: int) -> bool:
         assert "hello" in result["output"], result
         assert result["truncated"] is False, result
         print(f"tool events: {call['name']} -> {result['status']} ({result['seconds']:.2f}s)")
+
 
         # ---- skills: inventory, body read, and the /skill load twin ----
         # Skills are scanned fresh from <CELL_ROOT>/skills on every call, so the
@@ -442,6 +479,28 @@ def run_once(attempt: int) -> bool:
         assert prompt_text and prompt_text in sys_text, "system prompt missing after a skill load into a fresh session"
         assert "Do the e2e thing." in sys_text, "skill body lost on a fresh session"
         print("fresh session (no dir yet): skill load + job + compact + prompt intact")
+
+        # ---- a notice reaches the running turn as an event ----
+        # Two notices mid-turn: one for this session (must arrive) and one for
+        # another session (must not — the sink filters by session id).
+        nsid = api(base, token, "POST", "/v1/sessions")["id"]
+        other = api(base, token, "POST", "/v1/sessions")["id"]
+
+        def post_notices():
+            time.sleep(0.6)
+            api(base, token, "POST", "/v1/notices", {"session": nsid, "topic": "progress", "body": "worker finished"})
+            api(base, token, "POST", "/v1/notices", {"session": other, "topic": "noise", "body": "not this stream"})
+
+        t = threading.Thread(target=post_notices)
+        t.start()
+        nturn = api(base, token, "POST", f"/v1/sessions/{nsid}/turn", {"text": "慢慢来 [SLOW]"})
+        t.join(timeout=20)
+        notices = [e["data"] for e in nturn.get("events", []) if e.get("type") == "notice"]
+        assert notices and notices[0]["body"] == "worker finished", notices
+        assert notices[0]["session"] == nsid and notices[0]["topic"] == "progress", notices
+        assert all(n["session"] == nsid for n in notices), f"cross-session notice leaked: {notices}"
+        assert "slow" in nturn.get("output", ""), nturn.get("output", "")[:60]
+        print("notice event streamed:", notices[0]["topic"], "(cross-session filtered)")
 
         # ---- handle regression: a worker thread per request must not leak ----
         # The accept loop used to run every connection on a detached thread.
