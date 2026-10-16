@@ -16982,29 +16982,11 @@ details{break-inside:avoid}
         // Tail of the runtime log for the shell's diagnostics pane. Only the last
         // 512 KiB are read: the file is rotated but can still be megabytes, and a
         // GUI wants the end of it, not the whole history.
-        inline nlohmann::json log_tail_json(size_t max_lines)
+        inline nlohmann::json log_tail_json_inner(size_t max_lines)
         {
             // The logger buffers non-error lines and flushes at 16 KiB or on
             // close, so a tail read without this first would show an empty file
             // while the process is running — exactly when the pane is wanted.
-            try
-            {
-                return log_tail_json_inner(max_lines);
-            }
-            catch (const std::exception &e)
-            {
-                // A pane that cannot read the log should say so; it must not take
-                // the request down with it.
-                nlohmann::json out{{"path", (cell::root / "logs" / "cell.log").generic_string()},
-                                   {"lines", nlohmann::json::array()},
-                                   {"truncated", false},
-                                   {"error", e.what()}};
-                return out;
-            }
-        }
-
-        inline nlohmann::json log_tail_json_inner(size_t max_lines)
-        {
             cell::sys::logger::instance().flush();
             std::filesystem::path path = cell::root / "logs" / "cell.log";
             nlohmann::json out{{"path", path.generic_string()}, {"lines", nlohmann::json::array()}, {"truncated", false}};
@@ -17037,6 +17019,25 @@ details{break-inside:avoid}
             for (size_t i = from; i < lines.size(); i++)
                 out["lines"].push_back(to_valid_utf8(lines[i]));
             return out;
+        }
+
+        // The safe wrapper, declared after the body it calls: an unreadable or
+        // huge log becomes an `error` field the pane can show, never a request
+        // that dies with it.
+        inline nlohmann::json log_tail_json(size_t max_lines)
+        {
+            try
+            {
+                return log_tail_json_inner(max_lines);
+            }
+            catch (const std::exception &e)
+            {
+                nlohmann::json out{{"path", (cell::root / "logs" / "cell.log").generic_string()},
+                                   {"lines", nlohmann::json::array()},
+                                   {"truncated", false},
+                                   {"error", e.what()}};
+                return out;
+            }
         }
 
         // An upload's filename is a *name*, not a path: separators are dropped,
