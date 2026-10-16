@@ -6,6 +6,9 @@ import { api } from '../lib/api'
 import { classifyError } from '../lib/errors'
 import { createEventBus } from '../lib/events'
 import { createFrameScheduler } from '../lib/scheduler'
+import { sortByRecency } from '../lib/sessions'
+import { usageTotals, type UsageTotals } from '../lib/stats'
+import { applyTheme, resolveTheme, saveTheme, type ThemeName } from '../lib/theme'
 import { normalizeTranscript, type UiMessage } from '../lib/transcript'
 import type {
   Approval,
@@ -16,6 +19,8 @@ import type {
 } from '../lib/api'
 
 export type Phase = 'booting' | 'landing' | 'onboarding' | 'app'
+/** Which of the two main views the shell shows (the reference GUI's 对话 / 轨迹 switch). */
+export type ViewName = 'chat' | 'trace'
 
 // Transcript normalisation lives in lib/transcript.ts (pure, unit tested); the
 // types are re-exported here so components keep one import site.
@@ -42,11 +47,24 @@ interface State {
   approvals: Approval[]
   config: ConfigSnapshot | null
   providers: ProviderEntry[]
-  sidebarOpen: boolean
   paletteOpen: boolean
   toasts: Toast[]
-  usage: { tok_in: number; tok_out: number; requests: number } | null
+  /** Usage counters: the whole install, and the session on screen. */
+  usage: { all: UsageTotals; session: UsageTotals } | null
   lastInterrupted: boolean
+  // ---- shell chrome ----
+  theme: ThemeName
+  view: ViewName
+  /** Applied sidebar filter (the input debounces before writing it). */
+  sessionQuery: string
+  sidebarWidth: number
+  sidebarCollapsed: boolean
+  /** Optional right-hand panel (file/diff preview), off by default. */
+  rightbarOpen: boolean
+  rightbarWidth: number
+  settingsOpen: boolean
+  /** Teamwork footprint of the session on screen (the header's agent chip). */
+  jobs: { count: number; workers: number }
 }
 
 const state = reactive<State>({
@@ -64,11 +82,19 @@ const state = reactive<State>({
   approvals: [],
   config: null,
   providers: [],
-  sidebarOpen: true,
   paletteOpen: false,
   toasts: [],
   usage: null,
   lastInterrupted: false,
+  theme: resolveTheme(),
+  view: 'chat',
+  sessionQuery: '',
+  sidebarWidth: 280,
+  sidebarCollapsed: false,
+  rightbarOpen: false,
+  rightbarWidth: 420,
+  settingsOpen: false,
+  jobs: { count: 0, workers: 0 },
 })
 
 let toastSeq = 1
@@ -91,6 +117,7 @@ export function toast(kind: Toast['kind'], text: string): void {
 
 // ---- actions ------------------------------------------------------------------
 export async function boot(): Promise<void> {
+  applyTheme(state.theme)
   try {
     state.bootstrap = await api.bootstrap()
     if (!state.bootstrap.serve_ok) {
@@ -128,10 +155,77 @@ export async function refreshConfig(): Promise<void> {
 export async function refreshSessions(): Promise<void> {
   try {
     const { sessions, current } = await api.listSessions()
-    state.sessions = sessions
+    // the sidebar is ordered by recency, and the kernel is the only source of
+    // `updated_at` — sorting here keeps every consumer (rows, groups) in step
+    state.sessions = sortByRecency(sessions)
     if (!state.currentSession && current) state.currentSession = current
   } catch (e) {
     toast('warn', `session list failed: ${String(e)}`)
+  }
+}
+
+// ---- shell chrome ------------------------------------------------------------
+export function setView(v: ViewName): void {
+  state.view = v
+}
+
+export function setTheme(t: ThemeName): void {
+  state.theme = t
+  saveTheme(t)
+  applyTheme(t)
+}
+
+export function toggleTheme(): void {
+  setTheme(state.theme === 'dark' ? 'light' : 'dark')
+}
+
+export function setSessionQuery(q: string): void {
+  state.sessionQuery = q
+}
+
+export function setSidebarWidth(w: number): void {
+  state.sidebarWidth = w
+}
+
+export function setRightbarWidth(w: number): void {
+  state.rightbarWidth = w
+}
+
+export function toggleRightbar(v?: boolean): void {
+  state.rightbarOpen = v ?? !state.rightbarOpen
+}
+
+export function openSettings(v: boolean): void {
+  state.settingsOpen = v
+}
+
+/** Re-read the transcript of the session on screen (after a turn, or on demand). */
+export async function reloadMessages(): Promise<void> {
+  const id = state.currentSession
+  if (!id) return
+  const { messages } = await api.sessionMessages(id).catch(() => ({ messages: [] }))
+  state.messages = normalizeTranscript(messages)
+}
+
+/**
+ * Teamwork footprint of the session on screen. The header shows it as a chip, so
+ * it is refreshed with the session rather than polled: a job can only be created
+ * through this same UI or the CLI, and the CLI's jobs land in the same store.
+ */
+export async function refreshJobs(): Promise<void> {
+  const id = state.currentSession
+  if (!id) {
+    state.jobs = { count: 0, workers: 0 }
+    return
+  }
+  try {
+    const list = await api.getSessionTeamworks(id)
+    state.jobs = {
+      count: list.jobs.length,
+      workers: list.jobs.reduce((n, j) => n + (j.workers?.length ?? 0), 0),
+    }
+  } catch {
+    state.jobs = { count: 0, workers: 0 }
   }
 }
 
@@ -149,6 +243,8 @@ export async function selectSession(id: string): Promise<void> {
     }
   } finally {
     state.loadingMessages = false
+    void refreshUsage()
+    void refreshJobs()
   }
 }
 
@@ -250,6 +346,9 @@ export async function send(text: string): Promise<void> {
     state.streamText = ''
     state.approvals = []
     void refreshUsage()
+    // the row label and its age come from the kernel, so the sidebar only
+    // becomes accurate after the turn has landed
+    void refreshSessions()
   }
 }
 
@@ -283,6 +382,7 @@ export async function resume(): Promise<void> {
     state.streamText = ''
     state.approvals = []
     void refreshUsage()
+    void refreshSessions()
   }
 }
 
@@ -310,18 +410,16 @@ export async function deny(id: string, reason = 'rejected in the UI'): Promise<v
 
 export async function refreshUsage(): Promise<void> {
   try {
-    const u = (await api.usages()) as {
-      models?: Record<string, { input_tokens?: number; output_tokens?: number; requests?: number }>
+    const u = await api.usages()
+    // The strip shows both scopes: the install total (what this thing has cost
+    // overall) and the session on screen. Records for deleted sessions are
+    // pruned server-side, so no filtering is needed here.
+    const sid = state.currentSession
+    const record = sid ? u.sessions?.[sid] : undefined
+    state.usage = {
+      all: usageTotals(u.models),
+      session: usageTotals(record ? { [sid as string]: record } : undefined),
     }
-    let tok_in = 0
-    let tok_out = 0
-    let requests = 0
-    for (const v of Object.values(u.models ?? {})) {
-      tok_in += v.input_tokens ?? 0
-      tok_out += v.output_tokens ?? 0
-      requests += v.requests ?? 0
-    }
-    state.usage = { tok_in, tok_out, requests }
   } catch {
     /* usage is informational */
   }
@@ -332,5 +430,5 @@ export function openPalette(v: boolean): void {
 }
 
 export function toggleSidebar(): void {
-  state.sidebarOpen = !state.sidebarOpen
+  state.sidebarCollapsed = !state.sidebarCollapsed
 }

@@ -1,31 +1,183 @@
-/* Design tokens + resets. Plain CSS (no preprocessor) so the single-file
-   bundle stays tiny; scoped component styles live in the .vue files. */
+/* Design tokens. Two layers, borrowed from the reference desktop harness
+   (`ui-theme/src/styles/design-platform.css`):
+
+     --cell-static-*  raw palette — named after the colour, never the meaning
+     --cell-alias-*   semantics  — named after the job, never the colour
+
+   Components only ever touch the alias layer, so a palette change is a
+   one-file change and light/dark is a second block of aliases rather than a
+   second stylesheet. The theme is applied by writing `data-theme` on <body>
+   (see lib/theme.ts) — no framework involvement, which keeps the single-file
+   bundle free of a runtime theming dependency.
+
+   The historical one-word names (--bg, --ink, --accent, …) stay as aliases at
+   the bottom: ten components use them, and renaming them is churn without a
+   payoff. New code should prefer the alias layer. */
 
 :root {
+  /* ---- static palette (dark end of the ramp) ---- */
+  --cell-static-navy-950: #0b0f19;
+  --cell-static-navy-900: #111827;
+  --cell-static-navy-850: #161f31;
+  --cell-static-navy-800: #1b2438;
+  --cell-static-navy-700: #26324a;
+  --cell-static-navy-600: #3a4761;
+
+  --cell-static-ink-100: #f3f6fb;
+  --cell-static-ink-200: #e5e7eb;
+  --cell-static-ink-400: #9ca3af;
+  --cell-static-ink-600: #6b7280;
+
+  --cell-static-blue-500: #3b82f6;
+  --cell-static-blue-400: #60a5fa;
+  --cell-static-blue-600: #2563eb;
+  --cell-static-green-500: #22c55e;
+  --cell-static-amber-500: #f59e0b;
+  --cell-static-red-500: #ef4444;
+  --cell-static-red-300: #fca5a5;
+
+  /* ---- static palette (light end of the ramp) ---- */
+  --cell-static-white: #ffffff;
+  --cell-static-paper-50: #f7f8fa;
+  --cell-static-paper-100: #eef1f5;
+  --cell-static-paper-200: #e3e7ee;
+  --cell-static-slate-400: #8b95a7;
+  --cell-static-slate-600: #5b667a;
+  --cell-static-slate-800: #232a38;
+
+  /* ---- metrics: shared by both themes ---- */
+  --cell-radius-xs: 6px;
+  --cell-radius-sm: 8px;
+  --cell-radius-md: 12px;
+  --cell-radius-lg: 16px;
+  --cell-radius-pill: 999px;
+
+  --cell-space-1: 4px;
+  --cell-space-2: 8px;
+  --cell-space-3: 12px;
+  --cell-space-4: 16px;
+  --cell-space-5: 24px;
+
+  --cell-font-size-xs: 11px;
+  --cell-font-size-sm: 12.5px;
+  --cell-font-size-body: 14px;
+  --cell-font-size-lg: 16px;
+  --cell-font-size-title: 1.55rem;
+
+  --cell-line-height: 1.65;
+  --cell-mono-size: 12.5px;
+
+  /* content column: the reading measure, and the chat/composer share it */
+  --cell-content-width: 820px;
+
+  --cell-motion-fast: 0.12s ease;
+  --cell-motion-base: 0.2s ease;
+
+  --cell-font:
+    system-ui, -apple-system, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', 'Noto Sans SC', sans-serif;
+  --cell-mono:
+    ui-monospace, 'Cascadia Code', 'JetBrains Mono', SFMono-Regular, Consolas, 'Liberation Mono', monospace;
+}
+
+/* ---- dark: the default face of the product ---- */
+body,
+body[data-theme='dark'] {
   color-scheme: dark;
 
-  --bg: #0b0f19;
-  --bg-elev: #111827;
-  --bg-elev-2: #161f31;
-  --line: #1f2937;
-  --line-soft: #182233;
+  --cell-alias-bg-base: var(--cell-static-navy-950);
+  --cell-alias-bg-raised: var(--cell-static-navy-900);
+  --cell-alias-bg-raised-2: var(--cell-static-navy-850);
+  --cell-alias-bg-sunken: #080c14;
+  --cell-alias-bg-hover: var(--cell-static-navy-800);
+  --cell-alias-bg-selected: rgba(59, 130, 246, 0.14);
+  --cell-alias-bg-overlay: rgba(3, 7, 18, 0.62);
 
-  --ink: #e5e7eb;
-  --ink-dim: #9ca3af;
-  --ink-faint: #6b7280;
+  --cell-alias-line: var(--cell-static-navy-700);
+  --cell-alias-line-soft: var(--cell-static-navy-800);
 
-  --accent: #3b82f6;
-  --accent-soft: rgba(59, 130, 246, 0.14);
-  --ok: #22c55e;
-  --warn: #f59e0b;
-  --bad: #ef4444;
+  --cell-alias-ink: var(--cell-static-ink-200);
+  --cell-alias-ink-strong: var(--cell-static-ink-100);
+  --cell-alias-ink-dim: var(--cell-static-ink-400);
+  --cell-alias-ink-faint: var(--cell-static-ink-600);
+  --cell-alias-ink-invert: #0b0f19;
 
-  --radius: 12px;
-  --radius-sm: 8px;
-  --shadow: 0 18px 50px rgba(0, 0, 0, 0.45);
+  --cell-alias-accent: var(--cell-static-blue-500);
+  --cell-alias-accent-hover: var(--cell-static-blue-400);
+  --cell-alias-accent-soft: rgba(59, 130, 246, 0.14);
+  --cell-alias-accent-line: rgba(59, 130, 246, 0.32);
 
-  --font: system-ui, -apple-system, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif;
-  --mono: ui-monospace, 'Cascadia Code', 'JetBrains Mono', Consolas, monospace;
+  --cell-alias-ok: var(--cell-static-green-500);
+  --cell-alias-warn: var(--cell-static-amber-500);
+  --cell-alias-bad: var(--cell-static-red-500);
+  --cell-alias-bad-soft: rgba(239, 68, 68, 0.12);
+
+  --cell-alias-code-bg: #0d1420;
+  --cell-alias-mark-bg: rgba(59, 130, 246, 0.18);
+  --cell-alias-shadow: 0 18px 50px rgba(0, 0, 0, 0.45);
+  --cell-alias-menu-surface: rgba(17, 24, 39, 0.94);
+  --cell-alias-menu-backdrop: blur(10px);
+  --cell-alias-scrollbar: var(--cell-static-navy-700);
+}
+
+/* ---- light: same semantics, inverted ramp ---- */
+body[data-theme='light'] {
+  color-scheme: light;
+
+  --cell-alias-bg-base: var(--cell-static-paper-50);
+  --cell-alias-bg-raised: var(--cell-static-white);
+  --cell-alias-bg-raised-2: var(--cell-static-paper-100);
+  --cell-alias-bg-sunken: var(--cell-static-paper-100);
+  --cell-alias-bg-hover: var(--cell-static-paper-100);
+  --cell-alias-bg-selected: rgba(37, 99, 235, 0.1);
+  --cell-alias-bg-overlay: rgba(20, 26, 38, 0.34);
+
+  --cell-alias-line: var(--cell-static-paper-200);
+  --cell-alias-line-soft: #edf0f4;
+
+  --cell-alias-ink: var(--cell-static-slate-800);
+  --cell-alias-ink-strong: #131822;
+  --cell-alias-ink-dim: var(--cell-static-slate-600);
+  --cell-alias-ink-faint: var(--cell-static-slate-400);
+  --cell-alias-ink-invert: var(--cell-static-white);
+
+  --cell-alias-accent: var(--cell-static-blue-600);
+  --cell-alias-accent-hover: var(--cell-static-blue-500);
+  --cell-alias-accent-soft: rgba(37, 99, 235, 0.1);
+  --cell-alias-accent-line: rgba(37, 99, 235, 0.28);
+
+  --cell-alias-ok: #16a34a;
+  --cell-alias-warn: #d97706;
+  --cell-alias-bad: #dc2626;
+  --cell-alias-bad-soft: rgba(220, 38, 38, 0.1);
+
+  --cell-alias-code-bg: var(--cell-static-paper-100);
+  --cell-alias-mark-bg: rgba(37, 99, 235, 0.14);
+  --cell-alias-shadow: 0 16px 40px rgba(23, 30, 46, 0.16);
+  --cell-alias-menu-surface: rgba(255, 255, 255, 0.96);
+  --cell-alias-menu-backdrop: blur(10px);
+  --cell-alias-scrollbar: #cbd3e0;
+}
+
+/* ---- legacy aliases: existing components read these ---- */
+body {
+  --bg: var(--cell-alias-bg-base);
+  --bg-elev: var(--cell-alias-bg-raised);
+  --bg-elev-2: var(--cell-alias-bg-raised-2);
+  --line: var(--cell-alias-line);
+  --line-soft: var(--cell-alias-line-soft);
+  --ink: var(--cell-alias-ink);
+  --ink-dim: var(--cell-alias-ink-dim);
+  --ink-faint: var(--cell-alias-ink-faint);
+  --accent: var(--cell-alias-accent);
+  --accent-soft: var(--cell-alias-accent-soft);
+  --ok: var(--cell-alias-ok);
+  --warn: var(--cell-alias-warn);
+  --bad: var(--cell-alias-bad);
+  --radius: var(--cell-radius-md);
+  --radius-sm: var(--cell-radius-sm);
+  --shadow: var(--cell-alias-shadow);
+  --font: var(--cell-font);
+  --mono: var(--cell-mono);
 }
 
 * {
@@ -40,11 +192,11 @@ body,
 }
 
 body {
-  background: var(--bg);
-  color: var(--ink);
-  font-family: var(--font);
-  font-size: 14px;
-  line-height: 1.6;
+  background: var(--cell-alias-bg-base);
+  color: var(--cell-alias-ink);
+  font-family: var(--cell-font);
+  font-size: var(--cell-font-size-body);
+  line-height: var(--cell-line-height);
   -webkit-font-smoothing: antialiased;
 }
 
@@ -67,13 +219,24 @@ select {
 }
 
 ::-webkit-scrollbar-thumb {
-  background: #26324a;
+  background: var(--cell-alias-scrollbar);
   border-radius: 6px;
-  border: 2px solid var(--bg);
+  border: 2px solid var(--cell-alias-bg-base);
 }
 
 ::-webkit-scrollbar-track {
   background: transparent;
+}
+
+/* a shortcut hint, used by menus, palettes and the composer footer */
+kbd {
+  font-family: var(--cell-mono);
+  font-size: var(--cell-font-size-xs);
+  color: var(--cell-alias-ink-dim);
+  border: 1px solid var(--cell-alias-line);
+  border-radius: var(--cell-radius-xs);
+  padding: 1px 5px;
+  background: var(--cell-alias-bg-raised-2);
 }
 
 @keyframes cell-fade-in {

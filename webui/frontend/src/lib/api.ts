@@ -32,7 +32,26 @@ export interface SessionSummary {
   id: string
   cwd: string
   messages: number
+  /** First user turn clipped to 60 chars (kept for older callers). */
   snippet: string
+  /** First user turn, newlines folded, up to 120 chars — the sidebar row label. */
+  title: string
+  /** Transcript mtime, Unix seconds — what the sidebar groups and sorts by. */
+  updated_at: number
+}
+
+/** One usage record from `usages.json`; counters accumulate per session and per model. */
+export interface UsageRecord {
+  requests?: number
+  messages?: number
+  input_tokens?: number
+  output_tokens?: number
+  total_tokens?: number
+  /** Prompt tokens served from the provider's cache, and the prompt total they are measured against. */
+  cached_tokens?: number
+  prompt_tokens?: number
+  input_chars?: number
+  output_chars?: number
 }
 
 export interface ProviderEntry {
@@ -531,7 +550,9 @@ export class ApiClient {
   // ---- misc -----------------------------------------------------------------
 
   usages() {
-    return this.request<Record<string, unknown>>('/usages')
+    return this.request<{ sessions?: Record<string, UsageRecord>; models?: Record<string, UsageRecord> }>(
+      '/usages',
+    )
   }
 
   notices(session?: string) {

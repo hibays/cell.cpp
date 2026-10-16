@@ -2,7 +2,7 @@
 // composer live inside the workspace, so the handlers go through the store.
 
 import { onMounted, onUnmounted } from 'vue'
-import { interrupt, newSession, resume, selectSession, store } from '../store'
+import { interrupt, newSession, resume, selectSession, store, toggleSidebar } from '../store'
 
 function isTypingTarget(t: EventTarget | null): boolean {
   const el = t as HTMLElement | null
@@ -32,7 +32,7 @@ export function useShortcuts(): void {
     // Ctrl/Cmd+B — sidebar
     if (mod && e.key.toLowerCase() === 'b' && store.phase === 'app') {
       e.preventDefault()
-      store.sidebarOpen = !store.sidebarOpen
+      toggleSidebar()
       return
     }
 

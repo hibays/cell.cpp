@@ -1,8 +1,18 @@
 <script setup lang="ts">
+// The strip under the composer: kernel state on the left, telemetry on the right.
+//
+// Numbers policy — every figure here comes from the kernel, or from the
+// transcript, and anything unknown renders as a dash rather than a plausible
+// zero:
+//   * turns / steps   derived from the transcript (lib/stats.ts)
+//   * tokens, cache   from /v1/usages (session scope, install scope in the tooltip)
+//   * while a turn is streaming, elapsed time and streamed characters are shown
+//     instead of a tok/s we cannot honestly compute client-side.
 import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { api } from '../lib/api'
 import { store } from '../store'
-import { formatNumber } from '../lib/format'
+import { cacheHitRatio, transcriptStats } from '../lib/stats'
+import { formatCompact, formatPercent } from '../lib/format'
 import { createConnection, type ConnectionState } from '../lib/connection'
 import { classifyError, type CellErrorView } from '../lib/errors'
 import { fromKernelConfig, PRESETS } from '../lib/permissions'
@@ -38,6 +48,29 @@ const pillText = computed(() => {
   return '内核离线'
 })
 
+const stats = computed(() => transcriptStats(store.messages))
+const sessionUsage = computed(() => store.usage?.session ?? null)
+const cacheHit = computed(() => {
+  const u = sessionUsage.value
+  return u ? cacheHitRatio(u) : undefined
+})
+
+/** Install-wide totals, for the tooltip — the strip itself is session-scoped. */
+const installHint = computed(() => {
+  const all = store.usage?.all
+  if (!all) return '用量统计尚不可用'
+  const hit = cacheHitRatio(all)
+  return [
+    `安装合计：${all.requests} 次请求`,
+    `${formatCompact(all.inputTokens)} ↑ / ${formatCompact(all.outputTokens)} ↓ tokens`,
+    `缓存命中 ${hit === undefined ? '—' : formatPercent(hit)}`,
+  ].join('\n')
+})
+
+/** Live elapsed seconds while a turn streams (the strip's only time-based figure). */
+const elapsed = ref(0)
+let elapsedTimer = 0
+
 // A slow kernel must not stack health requests: the interval, the retry button
 // and a manual poll would otherwise all be in flight at once, which is exactly
 // when the kernel is least able to answer.
@@ -69,101 +102,140 @@ onMounted(() => {
   })
   void poll()
   timer = window.setInterval(() => void poll(), 5000)
+  elapsedTimer = window.setInterval(() => {
+    elapsed.value = store.streaming ? Math.floor((Date.now() - store.streamStartedAt) / 1000) : 0
+  }, 500)
 })
 
 onUnmounted(() => {
   window.clearInterval(timer)
+  window.clearInterval(elapsedTimer)
   unsubscribe?.()
 })
 </script>
 
 <template>
-  <div class="statusbar">
-    <span class="pill" :class="connState === 'connected' ? 'ok' : connState === 'connecting' ? 'warn' : 'bad'">
+  <footer class="strip">
+    <span class="pill" :class="connState">
+      <span class="dot" />
       {{ pillText }}
     </span>
-    <span v-if="health" class="model">{{ health.provider }}:{{ health.model }}</span>
-    <span v-if="health" class="mode" :title="`sandbox: ${health.sandbox_mode}`">{{ fenceLabel }}</span>
-    <span v-if="failure" class="err" :title="failure.hint">
-      {{ failure.title }}
-    </span>
-    <button v-if="failure?.retryable" class="retry" type="button" @click="void poll()">重试</button>
+    <span v-if="health" class="item mono">{{ health.provider }}:{{ health.model }}</span>
+    <span v-if="fenceLabel" class="item" :title="`沙箱模式：${health?.sandbox_mode}`">🛡 {{ fenceLabel }}</span>
+
     <span class="spacer" />
-    <span class="usage"
-      >tokens {{ formatNumber(store.usage?.tok_in) }}↑ {{ formatNumber(store.usage?.tok_out) }}↓</span
-    >
-  </div>
+
+    <span v-if="failure" class="item bad" :title="failure.hint">
+      {{ failure.title }}
+      <button class="retry" @click="poll()">重试</button>
+    </span>
+
+    <span v-if="store.streaming" class="item live">
+      <span class="pulse" />
+      输出中 · {{ elapsed }}s · {{ formatCompact(store.streamText.length) }} 字
+    </span>
+
+    <span class="item" title="本会话的轮次与工具调用步数">
+      {{ stats.turns }} 轮 {{ stats.steps }} 步
+    </span>
+    <span class="item" :title="installHint">
+      {{ sessionUsage ? formatCompact(sessionUsage.totalTokens) : '—' }} tok
+      <span class="dim">缓存命中 {{ cacheHit === undefined ? '—' : formatPercent(cacheHit) }}</span>
+    </span>
+    <span v-if="health" class="item mono dim" :title="`版本 ${health.version} · 会话 ${store.currentSession ?? '—'}`">
+      {{ health.version }} · {{ store.currentSession?.slice(-6) ?? '—' }}
+    </span>
+  </footer>
 </template>
 
 <style scoped>
-.statusbar {
+.strip {
   display: flex;
   align-items: center;
   gap: 10px;
   padding: 6px 14px;
-  border-top: 1px solid var(--line);
-  background: var(--bg-elev);
-  font-size: 11.5px;
-  color: var(--ink-dim);
-  font-family: var(--mono);
-}
-
-.pill {
-  border-radius: 999px;
-  padding: 1px 9px;
-  font-weight: 600;
-}
-
-.pill.ok {
-  background: rgba(34, 197, 94, 0.14);
-  color: #86efac;
-}
-
-.pill.bad {
-  background: rgba(239, 68, 68, 0.14);
-  color: #fca5a5;
-}
-
-.pill.warn {
-  background: rgba(234, 179, 8, 0.16);
-  color: #fde047;
-}
-
-.mode {
-  border: 1px solid var(--line);
-  border-radius: 999px;
-  padding: 0 8px;
-  color: var(--ink-dim);
-}
-
-.err {
-  color: #fca5a5;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  max-width: 42%;
-}
-
-.retry {
-  border: 1px solid var(--line);
-  border-radius: 6px;
-  background: transparent;
-  color: var(--ink-dim);
-  font: inherit;
-  padding: 0 8px;
-  cursor: pointer;
-}
-
-.retry:hover {
-  color: var(--ink);
-  border-color: var(--ink-faint);
+  border-top: 1px solid var(--cell-alias-line-soft);
+  background: var(--cell-alias-bg-raised);
+  font-size: var(--cell-font-size-xs);
+  color: var(--cell-alias-ink-dim);
+  min-height: 30px;
 }
 
 .spacer {
   flex: 1;
 }
 
-.usage {
-  color: var(--ink-faint);
+.pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid var(--cell-alias-line);
+  border-radius: var(--cell-radius-pill);
+  padding: 1px 9px;
+}
+
+.dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--cell-alias-ink-faint);
+}
+
+.pill.connected .dot {
+  background: var(--cell-alias-ok);
+}
+
+.pill.connecting .dot {
+  background: var(--cell-alias-warn);
+}
+
+.pill.disconnected .dot {
+  background: var(--cell-alias-bad);
+}
+
+.item {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+}
+
+.item.mono {
+  font-family: var(--cell-mono);
+}
+
+.item.dim,
+.dim {
+  color: var(--cell-alias-ink-faint);
+}
+
+.item.bad {
+  color: var(--cell-alias-bad);
+}
+
+.item.live {
+  color: var(--cell-alias-accent);
+}
+
+.pulse {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--cell-alias-accent);
+  animation: cell-pulse 1.2s ease-in-out infinite;
+}
+
+.retry {
+  border: 1px solid var(--cell-alias-line);
+  border-radius: var(--cell-radius-pill);
+  background: none;
+  color: inherit;
+  font-size: var(--cell-font-size-xs);
+  padding: 0 8px;
+}
+
+.retry:hover {
+  border-color: var(--cell-alias-accent);
+  color: var(--cell-alias-ink);
 }
 </style>
