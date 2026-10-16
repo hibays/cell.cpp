@@ -125,8 +125,17 @@ units), `vue-tsc --noEmit`, `vite build` + `embed_webui.mjs`, `cell.cellui_boot`
   a REST export (`GET /v1/sessions/{id}/export?format=md`) so the export panel
   works in a plain browser, which has neither the native save dialog nor a place
   to reveal a file; batch export still needs the shell and says so.
-  **Still open:** session archives, and uploaded (as opposed to referenced)
-  attachments.
+- **P7 — the last two.** Archives: `POST /v1/sessions/{id}/archive` hides a
+  session from the default list and `unarchive` brings it back, with a 活跃/归档
+  switch in the sidebar and a per-row action — the transcript and the id keep
+  working either way, so archiving hides rather than deletes. Real uploads:
+  `POST /v1/uploads?name=` puts the bytes in the workspace's `.cell-uploads/`
+  (never `CELL_ROOT` — the tools refuse to read the runtime root, so a file
+  parked there would be invisible to the agent it was sent for), and the
+  composer's attach menu uploads and attaches the returned path. Also in this
+  pass: the approval audit next to the transcript, and notices `follow=true`.
+  With this, every row of the B1–B7 / F1–F11 matrix is either delivered or
+  written down as a non-goal with its reason.
 
 ## 5. Non-goals and constraints
 

@@ -127,6 +127,10 @@ anywhere: it never resolves to a path.
 | ✅ | `GET /v1/sessions/{id}/messages?after=N&limit=M` | transcript entries verbatim (`role`/`content`/tool calls/reasoning); 404 when the session has no transcript yet |
 | ✅ | `DELETE /v1/sessions/{id}` | removes the session folder; 409 while a turn runs in it |
 | ✅ | `GET /v1/sessions/{id}/export?format=json\|md` | the transcript for export. `json` → `{session, format, count, messages}`; `md` → `{session, format, count, markdown}` with role headings, reasoning as a quote, tool calls as a list and tool results as fenced blocks (clipped at 60 lines each). The injected system block is left out — it is configuration, not conversation. `400 bad_format` for anything else, `404` for a session with no transcript. The desktop shell exports a self-contained HTML through the bridge instead; this is what a browser has |
+| ✅ | `POST /v1/sessions/{id}/archive` / `unarchive` | hide a session from the default list and bring it back. Archiving is *only* hiding: the transcript, the id and every session-scoped route keep working, and the marker is a file inside the session directory. Rows carry `archived`; `GET /v1/sessions?archived=1` lists them. `409` while a turn or a background job is on that session, `404` unknown |
+| ✅ | `GET /v1/sessions/{id}/approvals?tail=N` | the approval audit written next to the transcript: `{session, approvals:[{id, session, tool, args, decision, reason, at}]}`, oldest first, last `N` (default 100) |
+| ✅ | `POST /v1/uploads?name=` | put bytes where the agent can read them: the body lands in the workspace's `.cell-uploads/<name>` and `{name, path, bytes}` comes back for the composer to attach. The name is a *name* — separators and control characters are dropped, a leading dot is refused, Windows device names get a prefix, and a colliding name gets a numeric suffix (an upload is not an edit). 8 MiB per file, `400` on an empty body. Deliberately **not** in `CELL_ROOT`: the tools refuse to read the runtime root, so a file parked there would be invisible to the agent it was sent for |
+| ✅ | `GET /v1/uploads` | what has been uploaded into this workspace: `{dir, entries:[{name, path, size, mtime}], truncated}` |
 | ✅ | `POST /v1/sessions/{id}/clear` | `/clear` (reset context, keep the file) |
 | 🚧 | `GET /v1/sessions/{id}/archives` | `/saved list` |
 | 🚧 | `POST /v1/sessions/{id}/export` | the self-contained HTML exporter (`/export`) |
@@ -174,7 +178,7 @@ asks the HTTP client, both fail closed.
 | --- | --- | --- |
 | ✅ | `GET /v1/notices?session={id}` | pending batch (`peek`) as JSON |
 | ✅ | `POST /v1/notices` | `{session?, topic?, body}` → `{id}`; feeds the agent's next turn exactly like the `notice` tool |
-| 🚧 | `GET /v1/notices?follow=true` | SSE/long-poll subscription |
+| ✅ | `GET /v1/notices?session={id}&follow=1&seconds=N` | the same notices as an SSE stream (`notice` frames plus a final `notice_end`), bounded to `seconds` (default 120, max 900) and 200 notices, polled every 250 ms and stopped as soon as a write fails |
 
 ### 3.8 Skills, usage
 
@@ -324,17 +328,22 @@ round-trip, session persistence, graceful shutdown).
 **Done (P0)** — transport, core turn execution, session/provider/config
 management, approvals, notices, usage, skills, graceful shutdown.
 
-**Next (P1)**
-1. `turn_engine` extraction out of `repl::run()` → semantic `token` /
-   `reasoning` / `tool_call` / `tool_result` / `usage` / `interrupt` events, which
-   the turn engine emits through a process-wide sink that only the service layer
-   installs — the CLI pays one null check per delta.
-2. ~~Teamwork endpoints over the existing job store + `run_bg`.~~ ✅ done
-   (create / edit / remove / run / resume / stop / append-worker / remove-worker;
-   see §3.9). Remaining: per-worker `report` read (🚧).
-3. ~~`/compact`~~ ✅ done (§3.5); ~~skill reads + `/skill` load~~ ✅ done (§3.8).
-   Remaining: `/clear`, archives, HTML export, logs tail.
-4. SSE `Last-Event-ID` resume for interrupted streams; notices `follow=true`.
+**Done (P1)** — everything the next list once held:
+semantic turn events (`token` / `reasoning` / `tool_call` / `tool_result` /
+`usage` / `interrupt`, plus `notice`), the full teamwork surface including the
+per-worker `report`, `/clear`, session archives, exports (`json` / `md` beside
+the shell's HTML), the log tail, notices `follow=true`, the approval audit next
+to the transcript, uploads, and the read-only file listing/content the shell's
+panels are built on.
 
-**Later (P2)** — multi-turn parallelism per session, TLS/reverse-proxy
-guidance, CORS allow-list, approval audit log stored next to the transcript.
+**Later (P2), with the reason it is later**
+- *Multi-turn parallelism per session* — the core is deliberately single
+  threaded (one turn at a time, `409 busy` on a second). Parallel turns would
+  need a per-session lock discipline through compaction, teamwork and the
+  notice queue; it is a change to the engine's shape, not an endpoint.
+- *SSE `Last-Event-ID` resume* — the client already recovers a broken turn by
+  re-fetching the transcript, and a turn's stream is dropped when the turn ends,
+  so a replay id would buy little until a client reconnects mid-turn. The shell
+  uses semantic events for the live view and the transcript for the record.
+- *TLS / reverse-proxy guidance and a CORS allow-list* — deployment and policy
+  work that belongs to the host, not to the protocol.
