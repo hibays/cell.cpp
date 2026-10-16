@@ -17,6 +17,7 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -85,6 +86,7 @@ class MockLLM(BaseHTTPRequestHandler):
         # is the last message) must answer with text instead of proposing it again
         wants_read = "[READ]" in last and not last_is_tool
         wants_slow = "[SLOW]" in last
+        wants_exec = "[EXEC]" in last and not last_is_tool
         text = f"mock reply to: {last[:80]}"
         # the kernel always requests stream=true — answer in OpenAI SSE chunks
         self.send_response(200)
@@ -107,7 +109,32 @@ class MockLLM(BaseHTTPRequestHandler):
             )
             self.wfile.write(b"data: [DONE]\n\n")
             return
-        if wants_read:
+        if wants_exec:
+            chunks = [
+                {
+                    "choices": [
+                        {
+                            "delta": {
+                                "role": "assistant",
+                                "tool_calls": [
+                                    {
+                                        "index": 0,
+                                        "id": "call_exec_1",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "exec",
+                                            "arguments": json.dumps({"cmd": "echo approval-ok"}),
+                                        },
+                                    }
+                                ],
+                            }
+                        }
+                    ]
+                },
+                {"choices": [{"delta": {}, "finish_reason": "tool_calls"}],
+                 "usage": {"prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8}},
+            ]
+        elif wants_read:
             chunks = [
                 {
                     "choices": [
@@ -148,6 +175,23 @@ class MockLLM(BaseHTTPRequestHandler):
         for c in chunks:
             self.wfile.write(f"data: {json.dumps(c)}\n\n".encode())
         self.wfile.write(b"data: [DONE]\n\n")
+
+
+def api_raw(base: str, token: str, method: str, path: str, body: bytes, content_type: str = "application/octet-stream"):
+    """POST raw bytes (an upload is not JSON)."""
+    req = urllib.request.Request(base + path, data=body, method=method)
+    req.add_header("Authorization", "Bearer " + token)
+    req.add_header("Content-Type", content_type)
+    with urllib.request.urlopen(req, timeout=30) as r:
+        return json.loads(r.read().decode("utf-8"))
+
+
+def api_stream(base: str, token: str, path: str, seconds: int = 2) -> str:
+    """Read a bounded SSE response as text."""
+    req = urllib.request.Request(base + path)
+    req.add_header("Authorization", "Bearer " + token)
+    with urllib.request.urlopen(req, timeout=seconds + 20) as r:
+        return r.read().decode("utf-8", "replace")
 
 
 def api(base: str, token: str, method: str, path: str, body: dict | None = None):
@@ -501,6 +545,75 @@ def run_once(attempt: int) -> bool:
         assert all(n["session"] == nsid for n in notices), f"cross-session notice leaked: {notices}"
         assert "slow" in nturn.get("output", ""), nturn.get("output", "")[:60]
         print("notice event streamed:", notices[0]["topic"], "(cross-session filtered)")
+
+        # ---- approvals: the decision lands, and the audit sits next to the
+        # transcript so a session's approval history is readable on its own ----
+        asid = api(base, token, "POST", "/v1/sessions")["id"]
+
+        def exec_turn():
+            try:
+                api(base, token, "POST", f"/v1/sessions/{asid}/turn", {"text": "跑一下 [EXEC]"})
+            except Exception:
+                pass
+
+        at = threading.Thread(target=exec_turn)
+        at.start()
+        pending = []
+        for _ in range(80):
+            pending = api(base, token, "GET", "/v1/approvals")["pending"]
+            if pending:
+                break
+            time.sleep(0.1)
+        assert pending, "the exec tool never asked for approval"
+        aid = pending[0]["request_id"]
+        assert api(base, token, "POST", "/v1/approvals/" + aid, {"decision": "allow"})["decision"] == "allow"
+        at.join(timeout=30)
+        audit = api(base, token, "GET", f"/v1/sessions/{asid}/approvals")["approvals"]
+        assert audit, "no audit line was written"
+        assert audit[-1]["decision"] == "allow" and audit[-1]["tool"] == "exec", audit
+        assert audit[-1]["session"] == asid and audit[-1]["args"], audit
+        print(f"approval audit: {audit[-1]['tool']} {audit[-1]['decision']}")
+
+        # ---- notices follow=true: the same notices, pushed ----
+        fsid = api(base, token, "POST", "/v1/sessions")["id"]
+        api(base, token, "POST", "/v1/notices", {"session": fsid, "topic": "follow", "body": "推给你"})
+        followed = api_stream(base, token, f"/v1/notices?session={fsid}&follow=1&seconds=1")
+        assert '"follow"' in followed and "推给你" in followed, followed[:200]
+        assert "notice_end" in followed, followed[-200:]
+        print("notices follow=true: streamed and ended")
+
+        # ---- uploads: bytes land where the agent can read them ----
+        up = api_raw(base, token, "POST", "/v1/uploads?name=notes.txt", b"hello upload")
+        assert up["bytes"] == 12 and up["path"] == ".cell-uploads/notes.txt", up
+        # a name is a name, not a path: separators go, and no leading dot
+        tricky = api_raw(base, token, "POST", "/v1/uploads?name=../../escape.txt", b"x")
+        assert tricky["path"] == ".cell-uploads/escape.txt", tricky
+        hidden = api_raw(base, token, "POST", "/v1/uploads?name=.ssh", b"x")
+        assert hidden["name"] == "ssh", hidden
+        listing = api(base, token, "GET", "/v1/uploads")
+        names = [e["name"] for e in listing["entries"]]
+        assert "notes.txt" in names and "escape.txt" in names, names
+        # and it is readable through the file endpoint, which is how the agent sees it
+        got = api(base, token, "GET", "/v1/files/content?path=" + urllib.parse.quote(up["path"]))
+        assert got["content"] == "hello upload", got
+        assert api_code(base, token, "POST", "/v1/uploads?name=x.txt") == 400  # empty body
+        print("uploads:", names)
+
+        # ---- archives: hidden from the default list, still addressable ----
+        dsid = api(base, token, "POST", "/v1/sessions")["id"]
+        api(base, token, "POST", f"/v1/sessions/{dsid}/turn", {"text": "待归档"})
+        assert api(base, token, "POST", f"/v1/sessions/{dsid}/archive")["archived"] is True
+        live_ids = [s["id"] for s in api(base, token, "GET", "/v1/sessions")["sessions"]]
+        assert dsid not in live_ids, "an archived session is still in the default list"
+        arch = api(base, token, "GET", "/v1/sessions?archived=1")["sessions"]
+        assert dsid in [s["id"] for s in arch], [s["id"] for s in arch]
+        assert [s for s in arch if s["id"] == dsid][0]["archived"] is True
+        # the transcript is untouched: archiving hides, it does not delete
+        assert api(base, token, "GET", f"/v1/sessions/{dsid}/messages")["messages"]
+        assert api(base, token, "POST", f"/v1/sessions/{dsid}/unarchive")["archived"] is False
+        assert dsid in [s["id"] for s in api(base, token, "GET", "/v1/sessions")["sessions"]]
+        assert api_code(base, token, "POST", "/v1/sessions/ghost-x/archive") == 404
+        print("archives: hidden, listed on request, restored")
 
         # ---- export: the browser fallback for the native shell's HTML export --
         esid = api(base, token, "POST", "/v1/sessions")["id"]
