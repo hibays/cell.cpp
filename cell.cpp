@@ -5674,6 +5674,45 @@ namespace cell
         }
     } // namespace net
     // =========================================================================
+    //  events — the turn's *semantic* output.
+    //
+    //  A turn produces two kinds of output. Raw stdout/stderr is what a terminal
+    //  shows and what the CLI has always been built around; the service layer
+    //  captures it as `output` events. On top of that, the engine knows *what*
+    //  happened — a reasoning delta, an answer token, a tool call starting,
+    //  a tool result, what the request cost — and that is what a GUI wants to
+    //  render as structure instead of re-parsing a terminal transcript after the
+    //  fact.
+    //
+    //  The sink is process-wide because the emission points (the streaming
+    //  callbacks, the tool loop, the request accounting) sit deep inside the turn
+    //  engine, while only the service layer knows a stream exists. The CLI never
+    //  installs one, so every emit collapses to one null check.
+    // =========================================================================
+    namespace events
+    {
+        using sink_t = std::function<void(nlohmann::json &&)>;
+
+        inline sink_t &sink()
+        {
+            static sink_t s;
+            return s;
+        }
+
+        /** Forward one event; no-op unless a sink is installed for this turn. */
+        inline void emit(nlohmann::json ev)
+        {
+            if (auto &s = sink())
+                s(std::move(ev));
+        }
+
+        /** Shorthand: emit(type, data). */
+        inline void emit(const char *type, nlohmann::json data)
+        {
+            emit(nlohmann::json{{"type", type}, {"data", std::move(data)}});
+        }
+    } // namespace events
+    // =========================================================================
     //  sys — console I/O, structured logger + rotation, exceptions with source
     //  location, scope guards, a dynamically-scaling thread pool and signal
     //  handlers.
@@ -22071,6 +22110,9 @@ int repl::run()
                     {
                         if (data.empty())
                             return;
+                        // the answer's text, as it arrives: the GUI renders this
+                        // instead of re-reading stdout
+                        cell::events::emit("token", {{"text", std::string(data.data(), data.size())}});
                         if (!ui.got)
                         {
                             ui.got = true;
@@ -22117,6 +22159,8 @@ int repl::run()
                     {
                         if (data.empty())
                             return;
+                        // chain-of-thought, streamed separately from the answer
+                        cell::events::emit("reasoning", {{"text", std::string(data.data(), data.size())}});
                         if (!ui.got)
                         {
                             ui.got = true;
@@ -22170,6 +22214,22 @@ int repl::run()
                         ui.timer_line = false;
                         ui.tok_line = false;
                     }
+                    // What this request cost. The strip's decode rate and cache
+                    // hit come from here; the decoder window is measured from the
+                    // first token, not from the request, which also includes the
+                    // prompt upload (and would report a flattering number).
+                    if (usage.is_object() && !usage.empty())
+                    {
+                        auto cc = usage_cache_counts(usage);
+                        cell::events::emit("usage",
+                                           {{"in_tokens", usage_in(usage).value_or(0)},
+                                            {"out_tokens", usage_out(usage).value_or(0)},
+                                            {"total_tokens", usage_total(usage).value_or(0)},
+                                            {"cached_tokens", cc ? cc->first : 0},
+                                            {"prompt_tokens", cc ? cc->second : 0},
+                                            {"request_ms", cell::sys::elapsed_ms(ui.t0)},
+                                            {"decode_ms", ui.got ? cell::sys::elapsed_ms(ui.tok0) : 0}});
+                    }
                     // context overflow: compress and retry immediately instead of
                     // burning retry attempts on an error that compaction can fix
                     if (!ok && !compacted_this_round && cell::chat::is_context_overflow(err) &&
@@ -22198,6 +22258,9 @@ int repl::run()
                     if (ui.cancelled)
                     {
                         log.warn("llm", std::format("cancelled model={} round={} partial_chars={}", cfg.model_label(), rounds, reply_text_len(reply)));
+                        // the GUI needs to know the partial answer is final, not
+                        // still arriving: the stream cannot say it by itself
+                        cell::events::emit("interrupt", {{"partial_chars", (long long)reply_text_len(reply)}});
                         cell::sys::println();
                         cell::sys::error("[cancelled]");
                         // Ctrl+C prints nothing and exits through the signal hook;
@@ -22291,6 +22354,11 @@ int repl::run()
                         res[i].policy = "?";
                         res[i].status = "failed";
                         res[i].output = "[tool failed]";
+                        // "the model asked for this", before any sandbox decision:
+                        // the trace view shows the call the moment it is proposed.
+                        // The id is what pairs it with its result — matching on the
+                        // name would mis-pair two calls to the same tool.
+                        cell::events::emit("tool_call", {{"id", tc.value("id", "")}, {"name", res[i].name}, {"args", res[i].args}});
                         auto it = tool_list.find(res[i].name);
                         if (it == tool_list.end())
                         {
@@ -22404,6 +22472,20 @@ int repl::run()
                         log.info("tool", std::format("#{} {} policy={} status={} time={:.2f}s out_chars={} args={}",
                                                      tc_seq, res[i].name, res[i].policy, res[i].status, res[i].sec,
                                                      (long long)res[i].output.size(), trunc(res[i].args, 200)));
+                        // The result, as the tool card wants it. The payload is
+                        // capped: a live stream is for reading, and the full
+                        // output is in the transcript the turn ends with.
+                        {
+                            constexpr size_t kEventOutputMax = 16 * 1024;
+                            bool cut = res[i].output.size() > kEventOutputMax;
+                            std::string out = cut ? res[i].output.substr(0, kEventOutputMax) : res[i].output;
+                            cell::events::emit("tool_result", {{"id", tc.value("id", "")},
+                                                               {"name", res[i].name},
+                                                               {"status", res[i].status},
+                                                               {"seconds", res[i].sec},
+                                                               {"output", std::move(out)},
+                                                               {"truncated", cut}});
+                        }
                         std::string marker;
                         std::string wrapped = harden_tool_result(res[i].name, res[i].args, res[i].output, &marker);
                         // console echo of the returned content: cyan, distinct
@@ -24384,6 +24466,12 @@ int repl::run()
                                       int rc = 0;
                                       cell::serve::clear_cancel();
                                       serve_bridge.set_current(ts);
+                                      // Semantic events (token / reasoning / tool_call /
+                                      // tool_result / usage / interrupt) reach the same
+                                      // stream as the captured stdout — installed for this
+                                      // turn only, so the CLI never pays for it.
+                                      cell::events::sink() = [ts](nlohmann::json &&ev)
+                                      { ts->push(std::move(ev)); };
                                       try
                                       {
                                           h.use(sid);
@@ -24411,6 +24499,7 @@ int repl::run()
                                           rc = 1;
                                       }
                                       bool interrupted = cell::serve::take_cancel_seen();
+                                      cell::events::sink() = nullptr; // nothing may bridge into a finished turn
                                       serve_bridge.set_current(nullptr);
                                       serve_bridge.turn_active.store(false);
                                       ts->push(json{{"type", "turn_done"}, {"data", {{"rc", rc}, {"interrupted", interrupted}}}});
