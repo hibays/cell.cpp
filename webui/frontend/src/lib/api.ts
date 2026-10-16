@@ -65,6 +65,24 @@ export interface FileEntry {
   mtime: number
 }
 
+/** One file's content for the viewer; `binary` means there is no `content` to show. */
+export interface FileContent {
+  path: string
+  name: string
+  size: number
+  mtime: number
+  truncated: boolean
+  binary: boolean
+  content: string
+}
+
+export interface LogTail {
+  path: string
+  size?: number
+  truncated: boolean
+  lines: string[]
+}
+
 export interface FileListing {
   cwd: string
   /** The listed directory, relative to the workdir ("." for the root). */
@@ -138,6 +156,7 @@ export type TurnEvent =
     }
   | { type: 'usage'; data: UsageEvent }
   | { type: 'interrupt'; data: { partial_chars: number } }
+  | { type: 'notice'; data: { id: string; session: string; from: string; topic: string; body: string; created_at: number } }
 
 export interface TurnResult {
   rc: number
@@ -578,6 +597,18 @@ export class ApiClient {
   listFiles(path = '') {
     const q = path ? `?path=${encodeURIComponent(path)}` : ''
     return this.request<FileListing>(`/files${q}`)
+  }
+
+  /** One workspace file's content (read-only, capped, UTF-8 sanitised). */
+  fileContent(path: string, max?: number) {
+    const q = new URLSearchParams({ path })
+    if (max) q.set('max', String(max))
+    return this.request<FileContent>(`/files/content?${q.toString()}`)
+  }
+
+  /** Tail of the runtime log, for the diagnostics pane. */
+  logs(tail = 200) {
+    return this.request<LogTail>(`/logs?tail=${tail}`)
   }
 
   // ---- skills ----------------------------------------------------------------

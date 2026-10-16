@@ -15,6 +15,7 @@ import type {
   Approval,
   Bootstrap,
   ConfigSnapshot,
+  FileContent,
   FileEntry,
   ProviderEntry,
   SessionSummary,
@@ -24,6 +25,8 @@ import type {
 export type Phase = 'booting' | 'landing' | 'onboarding' | 'app'
 /** Which of the two main views the shell shows (the reference GUI's 对话 / 轨迹 switch). */
 export type ViewName = 'chat' | 'trace'
+/** The right-hand panel's tabs. */
+export type SideTab = 'files' | 'changes' | 'logs'
 
 // Transcript normalisation lives in lib/transcript.ts (pure, unit tested); the
 // types are re-exported here so components keep one import site.
@@ -67,6 +70,13 @@ interface State {
   rightbarOpen: boolean
   rightbarWidth: number
   settingsOpen: boolean
+  // ---- right-hand panel ----
+  sideTab: SideTab
+  /** The file open in the viewer; null shows the browser instead. */
+  openFile: FileContent | null
+  /** Tail of the runtime log for the diagnostics tab. */
+  logLines: string[]
+  logsTruncated: boolean
   /** Teamwork footprint of the session on screen (the header's agent chip). */
   jobs: { count: number; workers: number }
   // ---- composer ----
@@ -108,6 +118,10 @@ const state = reactive<State>({
   rightbarOpen: false,
   rightbarWidth: 420,
   settingsOpen: false,
+  sideTab: 'files',
+  openFile: null,
+  logLines: [],
+  logsTruncated: false,
   jobs: { count: 0, workers: 0 },
   queued: [],
   attachments: [],
@@ -216,6 +230,37 @@ export function toggleRightbar(v?: boolean): void {
 
 export function openSettings(v: boolean): void {
   state.settingsOpen = v
+}
+
+// ---- right-hand panel ---------------------------------------------------------
+export function setSideTab(tab: SideTab): void {
+  state.sideTab = tab
+}
+
+/** Open a workspace file in the viewer. A failure clears it and says why. */
+export async function openFileAt(path: string): Promise<void> {
+  try {
+    state.openFile = await api.fileContent(path)
+    state.rightbarOpen = true
+    state.sideTab = 'files'
+  } catch (e) {
+    state.openFile = null
+    toast('warn', `无法打开 ${path}：${String(e)}`)
+  }
+}
+
+export function closeFile(): void {
+  state.openFile = null
+}
+
+export async function refreshLogs(tail = 300): Promise<void> {
+  try {
+    const out = await api.logs(tail)
+    state.logLines = out.lines
+    state.logsTruncated = out.truncated
+  } catch (e) {
+    toast('warn', `读取日志失败：${String(e)}`)
+  }
 }
 
 /** Re-read the transcript of the session on screen (after a turn, or on demand). */
@@ -435,6 +480,12 @@ events.on('turn_start', (e) => {
   state.streamModel = e.data.model
 })
 
+// A notice posted for the running session reaches us as an event — no polling.
+events.on('notice', (e) => {
+  const { topic, body } = e.data
+  toast('info', topic ? `${topic}：${body}` : body)
+})
+
 const BATCHED = new Set(['token', 'reasoning', 'usage', 'output'])
 events.onAny((e) => {
   if (!state.live) return
@@ -556,7 +607,8 @@ export async function refreshUsage(): Promise<void> {
     const record = sid ? u.sessions?.[sid] : undefined
     state.usage = {
       all: usageTotals(u.models),
-      session: usageTotals(record ? { [sid as string]: record } : undefined),
+      // `sid &&` narrows the id to a string, which is what the map key wants
+      session: usageTotals(sid && record ? { [sid]: record } : undefined),
     }
   } catch {
     /* usage is informational */

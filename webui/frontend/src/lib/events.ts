@@ -43,6 +43,7 @@ const KNOWN_TYPES: ReadonlySet<string> = new Set([
   'tool_result',
   'usage',
   'interrupt',
+  'notice',
 ])
 
 const str = (v: unknown): string => (typeof v === 'string' ? v : '')
@@ -116,6 +117,18 @@ export function parseEvent(raw: unknown): TurnEvent | null {
       }
     case 'interrupt':
       return { type, data: { partial_chars: num(data['partial_chars']) } }
+    case 'notice':
+      return {
+        type,
+        data: {
+          id: str(data['id']),
+          session: str(data['session']),
+          from: str(data['from']),
+          topic: str(data['topic']),
+          body: str(data['body']),
+          created_at: num(data['created_at']),
+        },
+      }
     default:
       return null
   }

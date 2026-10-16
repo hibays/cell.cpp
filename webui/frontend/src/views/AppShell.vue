@@ -20,6 +20,7 @@ import {
   toggleSidebar,
 } from '../store'
 import Sidebar from '../components/Sidebar.vue'
+import SidePanel from '../components/SidePanel.vue'
 import StatusBar from '../components/StatusBar.vue'
 import CommandPalette from '../components/CommandPalette.vue'
 import ExportPanel from '../components/ExportPanel.vue'
@@ -157,7 +158,7 @@ onUnmounted(() => {
           <button
             class="tool"
             :class="{ on: store.rightbarOpen }"
-            title="右侧面板"
+            title="文件 / 改动 / 日志（Ctrl+.）"
             @click="toggleRightbar()"
           >
             ▥
@@ -180,14 +181,7 @@ onUnmounted(() => {
       />
 
       <aside v-if="cols.rightbar > 0" class="rightbar">
-        <div class="rb-head">
-          <span>面板</span>
-          <span class="spacer" />
-          <button class="tool" title="关闭" @click="toggleRightbar(false)">×</button>
-        </div>
-        <p class="rb-empty">
-          文件与变更面板将在下一阶段接入（内核的文件列举与修订审查端点）。
-        </p>
+        <SidePanel />
       </aside>
     </div>
 
@@ -354,23 +348,6 @@ onUnmounted(() => {
   flex-direction: column;
   border-left: 1px solid var(--cell-alias-line-soft);
   background: var(--cell-alias-bg-raised);
-}
-
-.rb-head {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 8px 12px;
-  border-bottom: 1px solid var(--cell-alias-line-soft);
-  font-size: var(--cell-font-size-sm);
-  color: var(--cell-alias-ink-dim);
-}
-
-.rb-empty {
-  margin: 14px;
-  color: var(--cell-alias-ink-faint);
-  font-size: var(--cell-font-size-sm);
-  line-height: 1.7;
 }
 
 .modal {
