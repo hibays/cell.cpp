@@ -134,6 +134,13 @@ units), `vue-tsc --noEmit`, `vite build` + `embed_webui.mjs`, `cell.cellui_boot`
   parked there would be invisible to the agent it was sent for), and the
   composer's attach menu uploads and attaches the returned path. Also in this
   pass: the approval audit next to the transcript, and notices `follow=true`.
+- **P8 — driving the sub-agents.** The endpoints for creating, running, stopping,
+  resuming and staffing a teamwork job had been served for a while; the shell
+  could read a report but not start anything. The trace view's 子智能体 block is
+  now that other half: a launcher that turns one task per line into a job
+  (parallel or serial, with the kernel naming the children), per-job controls
+  that appear only when the job's state allows them, staffing a pending job
+  before it runs, and a status poll that runs only while something is running.
   With this, every row of the B1–B7 / F1–F11 matrix is either delivered or
   written down as a non-goal with its reason.
 
