@@ -15754,6 +15754,10 @@ details{break-inside:avoid}
         public:
             using handler_t = std::function<void(const request &, responder &)>;
 
+            // stop() in the destructor: a joinable acceptor_ / connection thread
+            // would otherwise call std::terminate, and stop() is idempotent
+            ~http_server() { stop(); }
+
             bool start(const std::string &host, int port, handler_t handler, std::string &err)
             {
                 if (!ensure_socket_layer())
@@ -15815,16 +15819,69 @@ details{break-inside:avoid}
                 stopping_.store(true);
                 if (acceptor_.joinable())
                     acceptor_.join();
-                // give in-flight connections a moment to flush their response
-                for (int i = 0; i < 100 && active_.load() > 0; i++)
-                    std::this_thread::sleep_for(std::chrono::milliseconds(50));
                 close_socket(listener_);
                 listener_ = kInvalidSocket;
+                // give in-flight connections a moment to flush their response,
+                // joining each one as it finishes. They are joined rather than
+                // detached on purpose: std::thread::detach() does not close the
+                // underlying Win32 thread handle under MinGW/winpthreads (join()
+                // does), so one detached connection thread per request leaks one
+                // handle per request — measured as a steady +1 per HTTP request.
+                for (int i = 0; i < 100; i++)
+                {
+                    reap_connections();
+                    // safe without the lock: the acceptor is joined and only the
+                    // acceptor ever adds a connection
+                    if (conns_.empty())
+                        return;
+                    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                }
+                // still running after 5 s: joining would block the shutdown for up
+                // to their whole socket timeout. Hand those few to the OS — the
+                // only place a connection handle is left to the process exit.
+                std::lock_guard lk(conns_mx_);
+                for (auto &conn : conns_)
+                    if (conn.thread.joinable())
+                        conn.thread.detach();
+                conns_.clear();
             }
 
             int port() const { return port_; }
 
         private:
+            // One accepted connection. Its thread stays joinable so that a finished
+            // connection can be reaped; `finished` is what tells the acceptor that
+            // joining is safe (the thread sets it last, after its last use of the
+            // connection).
+            struct connection
+            {
+                std::thread thread;
+                std::shared_ptr<std::atomic<bool>> finished;
+            };
+
+            // Join and drop every connection whose thread has finished. The joins
+            // happen outside the lock because a connection never touches it.
+            void reap_connections()
+            {
+                std::vector<std::thread> done;
+                {
+                    std::lock_guard lk(conns_mx_);
+                    for (auto it = conns_.begin(); it != conns_.end();)
+                    {
+                        if (it->finished->load(std::memory_order_acquire))
+                        {
+                            done.push_back(std::move(it->thread));
+                            it = conns_.erase(it);
+                        }
+                        else
+                            ++it;
+                    }
+                }
+                for (auto &t : done)
+                    if (t.joinable())
+                        t.join();
+            }
+
             void accept_loop()
             {
                 while (!stopping_.load())
@@ -15841,13 +15898,32 @@ details{break-inside:avoid}
                                   (unsigned)(peer.sin_addr.s_addr & 0xff), (unsigned)((peer.sin_addr.s_addr >> 8) & 0xff),
                                   (unsigned)((peer.sin_addr.s_addr >> 16) & 0xff), (unsigned)((peer.sin_addr.s_addr >> 24) & 0xff));
                     std::string peer_ip = ip;
-                    active_.fetch_add(1);
-                    std::thread([this, c, peer_ip]()
-                                {
-                                    serve_connection(c, peer_ip);
-                                    active_.fetch_sub(1);
-                                })
-                        .detach();
+                    reap_connections(); // keep the tracking vector at live connections only
+                    // grow the vector before the thread exists: a push_back that
+                    // throws later (out of memory) would destroy the moved-in
+                    // std::thread while it is still joinable, and that terminates
+                    // the process — skipping the whole persistence path
+                    {
+                        std::lock_guard lk(conns_mx_);
+                        conns_.reserve(conns_.size() + 1);
+                    }
+                    auto fin = std::make_shared<std::atomic<bool>>(false);
+                    std::thread worker([this, c, peer_ip, fin]()
+                                       {
+                                           // a stray exception must not take the
+                                           // process down; the socket is the fun-
+                                           // ction's business (see serve_connection)
+                                           try
+                                           {
+                                               serve_connection(c, peer_ip);
+                                           }
+                                           catch (...)
+                                           {
+                                           }
+                                           fin->store(true, std::memory_order_release);
+                                       });
+                    std::lock_guard lk(conns_mx_);
+                    conns_.push_back(connection{std::move(worker), fin});
                 }
             }
 
@@ -15856,6 +15932,14 @@ details{break-inside:avoid}
                 constexpr size_t kMaxHead = 64 * 1024;
                 constexpr size_t kMaxBody = 16 * 1024 * 1024;
                 set_socket_timeouts(c, 30000);
+                // this call owns the socket: every exit closes it, including the
+                // early returns below and the path an exception unwinds through
+                // (the accept loop only catches, it never closes)
+                struct socket_guard
+                {
+                    socket_t s;
+                    ~socket_guard() { close_socket(s); }
+                } guard{c};
 
                 // The front-end is served by WebUI from its own origin and talks
                 // to this server over fetch(); without CORS headers Chromium
@@ -15883,15 +15967,11 @@ details{break-inside:avoid}
                     if (buf.size() > kMaxHead)
                     {
                         send_error(413, "payload_too_large", "request head exceeds 64 KiB");
-                        close_socket(c);
                         return;
                     }
                     int n = recv_into(c, chunk, sizeof chunk);
                     if (n <= 0)
-                    {
-                        close_socket(c);
                         return;
-                    }
                     buf.append(chunk, (size_t)n);
                 }
 
@@ -15907,7 +15987,6 @@ details{break-inside:avoid}
                 if (sp1 == std::string::npos || sp2 == std::string::npos)
                 {
                     send_error(400, "bad_request", "malformed request line");
-                    close_socket(c);
                     return;
                 }
                 req.method = line.substr(0, sp1);
@@ -15946,17 +16025,13 @@ details{break-inside:avoid}
                 if (clen > kMaxBody)
                 {
                     send_error(413, "payload_too_large", "request body exceeds 16 MiB");
-                    close_socket(c);
                     return;
                 }
                 while (rest.size() < clen)
                 {
                     int n = recv_into(c, chunk, sizeof chunk);
                     if (n <= 0)
-                    {
-                        close_socket(c);
                         return;
-                    }
                     rest.append(chunk, (size_t)n);
                 }
                 req.body = rest.substr(0, clen);
@@ -15971,7 +16046,6 @@ details{break-inside:avoid}
                     std::string h = std::format("HTTP/1.1 204 No Content\r\n{}\r\n", kCors);
                     send_all(c, h.data(), h.size());
                     shutdown_write(c);
-                    close_socket(c);
                     return;
                 }
 
@@ -16012,14 +16086,14 @@ details{break-inside:avoid}
                 if (!res.responded)
                     send_error(404, "not_found", std::format("no route for {} {}", req.method, req.path));
                 shutdown_write(c);
-                close_socket(c);
             }
 
             handler_t handler_;
             socket_t listener_ = kInvalidSocket;
             std::thread acceptor_;
+            std::mutex conns_mx_;
+            std::vector<connection> conns_;
             std::atomic<bool> stopping_{false};
-            std::atomic<int> active_{0};
             int port_ = 0;
         };
 
@@ -16063,58 +16137,76 @@ details{break-inside:avoid}
                 cap->sink_ = std::move(sink);
                 cap->saved_out_ = fd_dup(1);
                 cap->saved_err_ = fd_dup(2);
-                if (cap->saved_out_ < 0 || cap->saved_err_ < 0 ||
-                    fd_dup2(fds[1], 1) < 0 || fd_dup2(fds[1], 2) < 0)
+                const bool dup_ok = cap->saved_out_ >= 0 && cap->saved_err_ >= 0;
+                const bool redir_ok = dup_ok && fd_dup2(fds[1], 1) >= 0 && fd_dup2(fds[1], 2) >= 0;
+                // our own copy of the write end is not needed any more: from here on
+                // fd 1 and fd 2 are what keep the pipe open
+                fd_close(fds[1]);
+                if (!redir_ok)
                 {
-                    if (cap->saved_out_ >= 0)
-                        fd_dup2(cap->saved_out_, 1);
-                    if (cap->saved_err_ >= 0)
-                        fd_dup2(cap->saved_err_, 2);
-                    if (cap->saved_out_ >= 0)
-                        fd_close(cap->saved_out_);
-                    if (cap->saved_err_ >= 0)
-                        fd_close(cap->saved_err_);
+                    // end() puts whatever was saved back on fd 1/2 and closes both
+                    // copies. Restoring by hand here (as this used to) left an
+                    // already-closed fd number in saved_out_, so the later end()
+                    // called fd_dup2() with it and could point stdout at whatever
+                    // the OS had handed out under that number since.
+                    cap->end();
                     fd_close(fds[0]);
-                    fd_close(fds[1]);
                     err = "dup2() failed";
                     return nullptr;
                 }
-                fd_close(fds[1]); // fd 1 and fd 2 hold the write end now
                 cap->read_fd_ = fds[0];
-                std::shared_ptr<capture> self = cap;
-                std::thread([self]() { self->read_loop(); }).detach();
+                // The reader is joinable, not detached. Two reasons: detaching never
+                // closes the underlying thread handle under MinGW/winpthreads (one
+                // leaked handle per captured turn, measured), and the lifetime has
+                // to be explicit anyway — a caller that drops the capture without
+                // end() would otherwise strand a reader blocked in read() while fd
+                // 1/2 still point at the pipe (end() is what gives it EOF).
+                // `self` is safe as a raw pointer: ~capture() joins the thread.
+                auto *self = cap.get();
+                cap->reader_ = std::thread([self]()
+                                           { self->read_loop(); });
                 return cap;
             }
 
-            // restore the host streams; the reader thread sees EOF and exits
+            // restore the host streams and let the reader finish; the reader sees
+            // EOF as soon as fd 1/2 stop pointing at the pipe. Idempotent, and
+            // safe to call from an unwinding stack (the destructor does).
             void end()
             {
-                if (ended_.exchange(true))
-                    return;
-                std::fflush(nullptr);
-                if (saved_out_ >= 0)
+                std::lock_guard lk(end_mx_);
+                if (!ended_)
                 {
-                    fd_dup2(saved_out_, 1);
-                    fd_close(saved_out_);
-                    saved_out_ = -1;
+                    ended_ = true;
+                    std::fflush(nullptr);
+                    if (saved_out_ >= 0)
+                    {
+                        fd_dup2(saved_out_, 1);
+                        fd_close(saved_out_);
+                        saved_out_ = -1;
+                    }
+                    if (saved_err_ >= 0)
+                    {
+                        fd_dup2(saved_err_, 2);
+                        fd_close(saved_err_);
+                        saved_err_ = -1;
+                    }
+                    std::clearerr(stdout);
+                    std::clearerr(stderr);
                 }
-                if (saved_err_ >= 0)
-                {
-                    fd_dup2(saved_err_, 2);
-                    fd_close(saved_err_);
-                    saved_err_ = -1;
-                }
-                std::clearerr(stdout);
-                std::clearerr(stderr);
+                // joined under the lock, so a concurrent end() cannot get past the
+                // restore while the reader is still reading read_fd_
+                if (reader_.joinable())
+                    reader_.join();
             }
 
             ~capture()
             {
                 end();
-                // safe: the destructor only runs once the reader thread released
-                // its own shared_ptr, i.e. it is no longer blocked in read()
                 if (read_fd_ >= 0)
+                {
                     fd_close(read_fd_);
+                    read_fd_ = -1;
+                }
             }
 
         private:
@@ -16139,7 +16231,9 @@ details{break-inside:avoid}
             }
 
             std::function<void(std::string)> sink_;
-            std::atomic<bool> ended_{false};
+            std::mutex end_mx_;  // serializes end()'s join against a concurrent end()
+            std::thread reader_; // joined by end(): never detached (handle leak)
+            bool ended_ = false; // guarded by end_mx_
             int saved_out_ = -1, saved_err_ = -1, read_fd_ = -1;
         };
 
