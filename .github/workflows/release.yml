@@ -125,17 +125,21 @@ jobs:
       # resource is loadable by id). Set CELLUI_BOOT_TEST=1 to additionally spawn
       # the shell and wait for the in-process kernel; that needs a real display,
       # so it stays off on headless runners.
+      # No CELL_LLDB here, and that is deliberate. The e2e can wrap the kernel in
+      # lldb on macOS (an opt-in aid for the old "unreachable provider" SIGABRT),
+      # but a debugger changes what is being measured: lldb ptrace-attaches to the
+      # process, so a signal that a plain process shrugs off stops it dead, every
+      # later request hangs until the socket timeout, and the kernel looks alive
+      # while answering nothing. That is exactly how this job failed on a commit
+      # the CI job (no lldb) passed. The release tests the shipped binary; the
+      # diagnosis belongs to a developer running the e2e with CELL_LLDB=1 by hand.
       - name: Test (Windows MSVC)
         if: runner.os == 'Windows'
         run: ctest --test-dir build -C Release --output-on-failure
-        env:
-          CELL_LLDB: ${{ runner.os == 'macOS' && '1' || '0' }}
 
       - name: Test (POSIX)
         if: runner.os != 'Windows'
         run: ctest --test-dir build --output-on-failure
-        env:
-          CELL_LLDB: ${{ runner.os == 'macOS' && '1' || '0' }}
 
       - name: Package
         if: matrix.name == 'windows-x64-msvc'
