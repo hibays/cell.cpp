@@ -201,8 +201,13 @@ def api(base: str, token: str, method: str, path: str, body: dict | None = None)
         method=method,
         headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
     )
-    with urllib.request.urlopen(req, timeout=30) as r:
-        return json.loads(r.read() or b"{}")
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return json.loads(r.read() or b"{}")
+    except Exception as e:
+        # name the request: a bare "Remote end closed connection without response"
+        # says nothing about which of forty steps was running
+        raise RuntimeError(f"{method} {path}: {type(e).__name__}: {e}") from e
 
 
 def api_code(base: str, token: str, method: str, path: str, body: dict | None = None):

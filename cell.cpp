@@ -16157,7 +16157,16 @@ details{break-inside:avoid}
                     }
                     int n = recv_into(c, chunk, sizeof chunk);
                     if (n <= 0)
+                    {
+                        // The only path that closes a connection without answering.
+                        // It logged nothing, so a client saw "remote end closed"
+                        // and the log said nothing at all — which is exactly how a
+                        // release-blocking e2e failure stayed mysterious.
+                        cell::sys::logger::instance().warn(
+                            "serve", std::format("recv_failed peer={} buffered={} err={}", peer, buf.size(),
+                                                 socket_error_text(last_socket_error())));
                         return;
+                    }
                     buf.append(chunk, (size_t)n);
                 }
 
@@ -16217,7 +16226,16 @@ details{break-inside:avoid}
                 {
                     int n = recv_into(c, chunk, sizeof chunk);
                     if (n <= 0)
+                    {
+                        // The only path that closes a connection without answering.
+                        // It logged nothing, so a client saw "remote end closed"
+                        // and the log said nothing at all — which is exactly how a
+                        // release-blocking e2e failure stayed mysterious.
+                        cell::sys::logger::instance().warn(
+                            "serve", std::format("recv_failed peer={} buffered={} err={}", peer, buf.size(),
+                                                 socket_error_text(last_socket_error())));
                         return;
+                    }
                     rest.append(chunk, (size_t)n);
                 }
                 req.body = rest.substr(0, clen);
@@ -16969,6 +16987,24 @@ details{break-inside:avoid}
             // The logger buffers non-error lines and flushes at 16 KiB or on
             // close, so a tail read without this first would show an empty file
             // while the process is running — exactly when the pane is wanted.
+            try
+            {
+                return log_tail_json_inner(max_lines);
+            }
+            catch (const std::exception &e)
+            {
+                // A pane that cannot read the log should say so; it must not take
+                // the request down with it.
+                nlohmann::json out{{"path", (cell::root / "logs" / "cell.log").generic_string()},
+                                   {"lines", nlohmann::json::array()},
+                                   {"truncated", false},
+                                   {"error", e.what()}};
+                return out;
+            }
+        }
+
+        inline nlohmann::json log_tail_json_inner(size_t max_lines)
+        {
             cell::sys::logger::instance().flush();
             std::filesystem::path path = cell::root / "logs" / "cell.log";
             nlohmann::json out{{"path", path.generic_string()}, {"lines", nlohmann::json::array()}, {"truncated", false}};
