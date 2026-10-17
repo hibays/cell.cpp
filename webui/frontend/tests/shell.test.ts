@@ -13,6 +13,7 @@ import {
   SIDEBAR_COLLAPSED,
   SIDEBAR_MAX,
   SIDEBAR_MIN,
+  SLOT,
   clampSidebar,
   gridTemplate,
   solveColumns,
@@ -44,7 +45,7 @@ const session = (over: Partial<SessionSummary>): SessionSummary => ({
 describe('shell layout — the three-column solver', () => {
   test('CSS solves the squeeze, so the centre keeps its minimum', () => {
     const cols = solveColumns({ width: 1600, sidebarWidth: 300, collapsed: false, rightbarOpen: false, rightbarWidth: 0 })
-    expect(gridTemplate(cols)).toBe(`300px minmax(${CENTER_MIN}px, 1fr) 0px`)
+    expect(gridTemplate(cols)).toBe(`300px 0px minmax(${CENTER_MIN}px, 1fr) 0px 0px`)
   })
 
   test('a closed right bar collapses to 0px rather than disappearing from the template', () => {
@@ -53,6 +54,22 @@ describe('shell layout — the three-column solver', () => {
     expect(closed.rightbar).toBe(0)
     expect(open.rightbar).toBeGreaterThan(0)
     expect(gridTemplate(closed).endsWith('0px')).toBe(true)
+    expect(gridTemplate(open).endsWith(`${open.rightbar}px)`)).toBe(true)
+  })
+
+  test('the template always has five columns, one per slot', () => {
+    // The regression this pins: the template used to have three columns, so a
+    // conditionally rendered drag handle stole the centre column and the main
+    // column landed in the 0px rightbar slot — the whole conversation invisible
+    // whenever the sidebar was expanded. Slots must stay in step with it.
+    const slots = Object.values(SLOT)
+    expect(slots).toEqual([1, 2, 3, 4, 5])
+    const at = (collapsed: boolean, rightbarOpen: boolean, rightbarWidth = 420) =>
+      solveColumns({ width: 1400, sidebarWidth: 300, collapsed, rightbarOpen, rightbarWidth })
+    expect(gridTemplate(at(false, false))).toBe(`300px 0px minmax(${CENTER_MIN}px, 1fr) 0px 0px`)
+    expect(gridTemplate(at(false, true))).toBe(`300px 0px minmax(${CENTER_MIN}px, 1fr) 0px minmax(0px, 420px)`)
+    expect(gridTemplate(at(true, false))).toBe(`${SIDEBAR_COLLAPSED}px 0px minmax(${CENTER_MIN}px, 1fr) 0px 0px`)
+    expect(gridTemplate(at(true, true))).toBe(`${SIDEBAR_COLLAPSED}px 0px minmax(${CENTER_MIN}px, 1fr) 0px minmax(0px, 420px)`)
   })
 
   test('a narrow frame auto-collapses to the rail and restores the width later', () => {
@@ -193,6 +210,16 @@ describe('trace ledger — transcript folded into turns', () => {
     expect(turns.length).toBe(1)
     expect(turns[0].prompt).toBe('')
     expect(turns[0].steps.length).toBe(1)
+  })
+
+  test('an empty answer is an explicit step, not a turn that looks unanswered', () => {
+    const turns = buildTurns([
+      { key: 'u1', role: 'user', text: 'why empty' },
+      { key: 'a1', role: 'assistant', text: '', empty: true },
+    ])
+    expect(turns.length).toBe(1)
+    expect(turns[0].steps).toEqual([expect.objectContaining({ kind: 'answer', empty: true })])
+    expect(turnStatus(turns[0])).toBe('ok')
   })
 
   test('status prefers "still running", then "blocked", else ok', () => {

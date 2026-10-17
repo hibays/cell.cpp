@@ -96,14 +96,29 @@ describe('transcript normalisation', () => {
     expect(b[0].reasoning).toBe('r2')
   })
 
-  test('empty and unknown records are skipped, never rendered as blanks', () => {
+  test('unknown records and whitespace-only users are skipped, never rendered as blanks', () => {
     const out = normalizeTranscript([
-      { role: 'assistant', content: '' },
       { role: 'system', content: 'folded away' },
       { role: 'nonsense', content: 'x' },
       { role: 'user', content: '   ' },
     ])
     expect(out).toEqual([])
+  })
+
+  test('an empty assistant record stays as an explicit gap, not silence', () => {
+    // Old kernels persisted these; dropping them makes the question before
+    // them look answered-by-design. The gap is a fact and renders as one.
+    const out = normalizeTranscript([
+      { role: 'user', content: 'why empty' },
+      { role: 'assistant', content: '' },
+      { role: 'assistant', content: null },
+      { role: 'user', content: 'again' },
+    ])
+    expect(out).toHaveLength(4)
+    expect(out[1].empty).toBe(true)
+    expect(out[1].text).toBe('')
+    expect(out[2].empty).toBe(true)
+    expect(out[3].role).toBe('user')
   })
 
   test('malformed input never throws', () => {
