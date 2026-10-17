@@ -7968,26 +7968,39 @@ namespace cell
                             usage = j["usage"];
                         // const operator[] asserts on a missing key, and this
                         // build keeps asserts enabled: never index blindly
-                        if (!j.contains("choices") || !j["choices"].is_array() || j["choices"].empty() ||
-                            !j["choices"][0].contains("delta") || !j["choices"][0]["delta"].is_object())
+                        if (!j.contains("choices") || !j["choices"].is_array() || j["choices"].empty())
                             return;
                         {
-                            // the final chunk carries the stop reason; capture it so an
-                            // empty completion can name the cause (e.g. length = context overflow)
+                            // the final chunk carries the stop reason; capture it BEFORE the
+                            // delta guard so a frame that omits delta (some providers send
+                            // {choices:[{finish_reason:"length"}]} as the last frame) still
+                            // names the cause instead of hiding a truncated reply
                             auto &c0 = j["choices"][0];
                             if (c0.contains("finish_reason") && c0["finish_reason"].is_string() &&
                                 !c0["finish_reason"].get<std::string>().empty())
                                 finish_reason = c0["finish_reason"].get<std::string>();
                         }
+                        if (!j["choices"][0].contains("delta") || !j["choices"][0]["delta"].is_object())
+                            return;
                         auto &delta = j["choices"][0]["delta"];
-                        // chain-of-thought: reasoning models stream delta.reasoning_content
-                        if (delta.contains("reasoning_content") && delta["reasoning_content"].is_string())
-                        {
-                            const std::string &t = delta["reasoning_content"].get_ref<const std::string &>();
-                            reasoning.append(t);
-                            if (on_reason)
-                                on_reason(std::span<const char>(t));
-                        }
+                        // chain-of-thought: providers disagree on the field name.
+                        // DeepSeek/vLLM stream delta.reasoning_content; Ollama's
+                        // OpenAI-compatible endpoint streams delta.reasoning (gemma4,
+                        // qwen3, ...); some proxies use delta.thinking. Accept all
+                        // three, otherwise a thinking model's CoT is silently dropped
+                        // and the turn looks empty ("thinking, then silent").
+                        for (const char *rf : {"reasoning_content", "reasoning", "thinking"})
+                            if (delta.contains(rf) && delta[rf].is_string())
+                            {
+                                const std::string &t = delta[rf].get_ref<const std::string &>();
+                                if (!t.empty())
+                                {
+                                    reasoning.append(t);
+                                    if (on_reason)
+                                        on_reason(std::span<const char>(t));
+                                }
+                                break; // one reasoning field per delta
+                            }
                         if (delta.contains("content") && delta["content"].is_string())
                             [[likely]]
                         {
@@ -8066,12 +8079,34 @@ namespace cell
                         if (ch.is_array() && !ch.empty() && ch[0].contains("message"))
                         {
                             auto &m = ch[0]["message"];
+                            // the recovered text must be STREAMED, not just put in the
+                            // reply: otherwise the turn succeeds with an empty output
+                            // event and the client renders silence.
                             if (m.contains("content") && m["content"].is_string())
+                            {
                                 text = m["content"].get<std::string>();
+                                if (!text.empty())
+                                    on_token(std::span<const char>(text));
+                            }
                             else if (m.contains("content") && m["content"].is_array())
                                 for (auto &b : m["content"])
                                     if (b.value("type", "") == "text" && b.contains("text") && b["text"].is_string())
-                                        text += b["text"].get<std::string>();
+                                    {
+                                        const std::string &t = b["text"].get_ref<const std::string &>();
+                                        text += t;
+                                        if (!t.empty())
+                                            on_token(std::span<const char>(t));
+                                    }
+                            // reasoning may ride along in the same body (Ollama
+                            // reasoning / DeepSeek reasoning_content): stream it too
+                            for (const char *rf : {"reasoning_content", "reasoning", "thinking"})
+                                if (m.contains(rf) && m[rf].is_string())
+                                {
+                                    reasoning = m[rf].get<std::string>();
+                                    if (!reasoning.empty() && on_reason)
+                                        on_reason(std::span<const char>(reasoning));
+                                    break;
+                                }
                             if (m.contains("tool_calls"))
                                 tool_calls = m["tool_calls"];
                         }
@@ -8091,6 +8126,25 @@ namespace cell
                         {
                             err = diag; // ok stays true: run_turn reports this diagnostic and fails the turn
                         }
+                    }
+                }
+                // A finish_reason of "length" means the provider stopped at the
+                // context/output limit. With a large prompt that is the context window
+                // exhausted mid-reply (Ollama defaults to a 4k window): the reply we
+                // have is truncated, so treat it as context pressure and retry after a
+                // compact. With a small prompt it is an output max_tokens limit, which
+                // compaction cannot fix — keep the partial answer instead of dropping it.
+                if (ok && finish_reason == "length")
+                {
+                    long long pt = -1;
+                    if (usage.contains("prompt_tokens") && usage["prompt_tokens"].is_number_integer())
+                        pt = (long long)usage["prompt_tokens"];
+                    else if (usage.contains("input_tokens") && usage["input_tokens"].is_number_integer())
+                        pt = (long long)usage["input_tokens"];
+                    if (pt >= 3072)
+                    {
+                        err = std::format("provider stopped at the context window limit (finish_reason=length, prompt_tokens={}) — the reply was truncated; auto-compacting and retrying", pt);
+                        ok = false; // run_turn's is_context_overflow(err) compacts + retries
                     }
                 }
                 // assemble the reply even after a failed/aborted transfer so partial text survives
@@ -8657,6 +8711,22 @@ namespace cell
                         push_call(item_id);
                 if (!tool_calls.empty())
                     reply["tool_calls"] = tool_calls;
+                // finish_reason "length" (Responses: status "incomplete") means the
+                // provider stopped at the context/output limit; a large prompt means the
+                // context window was exhausted mid-reply, so retry after a compact.
+                if (ok && finish_reason == "length")
+                {
+                    long long pt = -1;
+                    if (usage.contains("prompt_tokens") && usage["prompt_tokens"].is_number_integer())
+                        pt = (long long)usage["prompt_tokens"];
+                    else if (usage.contains("input_tokens") && usage["input_tokens"].is_number_integer())
+                        pt = (long long)usage["input_tokens"];
+                    if (pt >= 3072)
+                    {
+                        err = std::format("provider stopped at the context window limit (finish_reason=length, prompt_tokens={}) — the reply was truncated; auto-compacting and retrying", pt);
+                        ok = false; // run_turn's is_context_overflow(err) compacts + retries
+                    }
+                }
                 // An HTTP 200 that streamed no content is a failed round wearing a
                 // success: some OpenAI Responses proxies return an empty output once
                 // the prompt outgrows the model context window. Surface the provider's
@@ -9060,6 +9130,23 @@ namespace cell
                     }
                     tc["function"]["arguments"] = args;
                     tool_calls.push_back(tc);
+                }
+                // stop_reason "max_tokens" (mapped to finish_reason "length" above)
+                // means the provider stopped at the context/output limit; a large input
+                // means the context window was exhausted mid-reply, so retry after a
+                // compact.
+                if (ok && finish_reason == "length")
+                {
+                    long long pt = -1;
+                    if (usage.contains("prompt_tokens") && usage["prompt_tokens"].is_number_integer())
+                        pt = (long long)usage["prompt_tokens"];
+                    else if (usage.contains("input_tokens") && usage["input_tokens"].is_number_integer())
+                        pt = (long long)usage["input_tokens"];
+                    if (pt >= 3072)
+                    {
+                        err = std::format("provider stopped at the context window limit (finish_reason=length, prompt_tokens={}) — the reply was truncated; auto-compacting and retrying", pt);
+                        ok = false; // run_turn's is_context_overflow(err) compacts + retries
+                    }
                 }
                 // An HTTP 200 that streamed no content is a failed round wearing a
                 // success: small/legacy models can return this once the prompt outgrows
@@ -10997,6 +11084,32 @@ details{break-inside:avoid}
                     return true;
                 if ((t == "reasoning" || t == "thinking") &&
                     !(b.value("reasoning", std::string()).empty() && b.value("thinking", std::string()).empty()))
+                    return true;
+            }
+            return false;
+        }
+        // A turn "carries an answer" only if it produced something for the user to
+        // act on: a final text answer or a tool call. Chain-of-thought / thinking is
+        // the model's private scratch — streaming it without a following answer (a
+        // context-window cutoff, or a local thinking-model quirk) is an incomplete
+        // turn, not a successful one. run_turn uses this to reject reasoning-only
+        // responses that reply_carries_content would otherwise accept as "content".
+        static bool reply_carries_answer(const nlohmann::json &reply, const nlohmann::json &tool_calls)
+        {
+            if (tool_calls.is_array() && !tool_calls.empty())
+                return true;
+            auto it = reply.find("content");
+            if (it == reply.end() || it->is_null())
+                return false;
+            if (it->is_string())
+                return !it->get_ref<const std::string &>().empty();
+            if (!it->is_array())
+                return false;
+            for (auto &b : *it)
+            {
+                if (!b.is_object())
+                    continue;
+                if (b.value("type", "") == "text" && !b.value("text", std::string()).empty())
                     return true;
             }
             return false;
@@ -20773,6 +20886,45 @@ static int run_selftest()
                                                    nlohmann::json::array({{{"id", "c"}, {"type", "function"}}})),
                  "empty-reply guard: tool calls carry content");
 
+        // the answer guard (reasoning alone is not an answer): a thinking model
+        // that streams chain-of-thought and stops before the answer must fail the
+        // turn — this is the "thinking, then suddenly silent" bug in a 4k Ollama
+        // window. Final text and tool calls are answers; reasoning is not.
+        R.expect(!cell::chat::reply_carries_answer(
+                     {{"role", "assistant"}, {"content", nlohmann::json::array({{{"type", "reasoning"}, {"reasoning", "hmm"}}})}},
+                     nlohmann::json::array()),
+                 "answer guard: reasoning alone is not an answer (silent thinking)");
+        R.expect(!cell::chat::reply_carries_answer(
+                     {{"role", "assistant"}, {"content", nlohmann::json::array({
+                         {{"type", "reasoning"}, {"reasoning", "long thought"}},
+                         {{"type", "text"}, {"text", ""}},
+                     })}},
+                     nlohmann::json::array()),
+                 "answer guard: reasoning plus an empty text block is not an answer");
+        R.expect(cell::chat::reply_carries_answer(
+                     {{"role", "assistant"}, {"content", nlohmann::json::array({
+                         {{"type", "reasoning"}, {"reasoning", "long thought"}},
+                         {{"type", "text"}, {"text", "the answer"}},
+                     })}},
+                     nlohmann::json::array()),
+                 "answer guard: reasoning followed by text is an answer");
+        R.expect(cell::chat::reply_carries_answer({{"role", "assistant"}, {"content", "plain answer"}}, nlohmann::json::array()),
+                 "answer guard: a plain text string is an answer (single-turn)");
+        R.expect(!cell::chat::reply_carries_answer({{"role", "assistant"}, {"content", nullptr}}, nlohmann::json::array()),
+                 "answer guard: null content is not an answer");
+        R.expect(cell::chat::reply_carries_answer({{"role", "assistant"}, {"content", nullptr}},
+                                                   nlohmann::json::array({{{"id", "c"}, {"type", "function"}}})),
+                 "answer guard: a tool call is an answer (agentic turn)");
+        // the truncation diagnostic MUST trip is_context_overflow, otherwise the
+        // "reply was truncated" path never auto-compacts (the phrase is matched
+        // with a space: "context window", not "context-window")
+        R.expect(cell::chat::is_context_overflow(
+                     "provider stopped at the context window limit (finish_reason=length, prompt_tokens=3969) — the reply was truncated; auto-compacting and retrying"),
+                 "overflow: the truncation diagnostic triggers auto-compact");
+        R.expect(cell::chat::is_context_overflow(
+                     "provider returned reasoning but no answer (prompt_tokens=3969) — the conversation likely exceeded the model context window; auto-compacting and retrying"),
+                 "overflow: the reasoning-only diagnostic triggers auto-compact");
+
         // empty-completion diagnostic: the kernel must name the provider's real
         // reason (finish_reason / prompt_tokens) instead of a bare "empty reply",
         // and flag context-window pressure so the turn can auto-compact.
@@ -23078,6 +23230,30 @@ int repl::run()
                                             {"request_ms", cell::sys::elapsed_ms(ui.t0)},
                                             {"decode_ms", ui.got ? cell::sys::elapsed_ms(ui.tok0) : 0}});
                     }
+                    // A success-shaped stream that carried only chain-of-thought — no
+                    // final answer and no tool call — is an incomplete turn wearing a
+                    // success (a context-window cutoff that swallowed the answer, or a
+                    // local thinking-model quirk). Convert it to a failure so the
+                    // context-overflow auto-compact below can recover it, or it fails
+                    // fast with a clear diagnostic instead of being silently accepted.
+                    if (ok && !cell::chat::reply_carries_answer(reply, tool_calls))
+                    {
+                        long long pt = -1;
+                        if (usage.contains("prompt_tokens") && usage["prompt_tokens"].is_number_integer())
+                            pt = (long long)usage["prompt_tokens"];
+                        else if (usage.contains("input_tokens") && usage["input_tokens"].is_number_integer())
+                            pt = (long long)usage["input_tokens"];
+                        // Ollama's OpenAI-compatible endpoint reports no usage, so fall
+                        // back to the prompt's character count (~4 chars/token) to keep
+                        // the 4k-window case on the auto-compact path instead of failing.
+                        bool ctx_pressure = (pt > 0 && pt >= 3072) || (pt < 0 && in_chars >= 12000);
+                        if (ctx_pressure)
+                            err = std::format("provider returned reasoning but no answer (prompt_tokens={}) — the conversation likely exceeded the model context window; auto-compacting and retrying", pt > 0 ? std::to_string(pt) : std::string("n/a"));
+                        else if (err.empty())
+                            err = "the model streamed reasoning but produced no answer (no content or tool call) — likely a context-window cutoff or a local thinking-model quirk";
+                        ok = false;
+                        attempt = kMaxRetries - 1; // a reasoning-only response won't improve on retry: fail fast
+                    }
                     // context overflow: compress and retry immediately instead of
                     // burning retry attempts on an error that compaction can fix
                     if (!ok && !compacted_this_round && cell::chat::is_context_overflow(err) &&
@@ -23182,7 +23358,7 @@ int repl::run()
                 // The user's message stays on disk, the shell's turn-failure path
                 // (rc=1 + turn_error) says what happened, and no empty assistant
                 // record is written for every client to render as silence.
-                if (!cell::chat::reply_carries_content(reply, tool_calls))
+                if (!cell::chat::reply_carries_content(reply, tool_calls) || !cell::chat::reply_carries_answer(reply, tool_calls))
                 {
                     log.error("llm", std::format("empty_reply model={} round={} attempts={} err={}", cfg.model_label(), rounds, attempt + 1, err.empty() ? "n/a" : err));
                     // prefer the provider's real diagnostic (finish_reason / prompt_tokens / context
