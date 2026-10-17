@@ -20773,6 +20773,48 @@ static int run_selftest()
                                                    nlohmann::json::array({{{"id", "c"}, {"type", "function"}}})),
                  "empty-reply guard: tool calls carry content");
 
+        // empty-completion diagnostic: the kernel must name the provider's real
+        // reason (finish_reason / prompt_tokens) instead of a bare "empty reply",
+        // and flag context-window pressure so the turn can auto-compact.
+        {
+            bool cp = false;
+            std::string d = cell::llm::empty_completion_diagnostic("length", {{"prompt_tokens", 4000}}, cp);
+            R.expect(cp, "empty-completion diagnostic: finish_reason=length is context pressure");
+            R.expect(d.find("finish_reason=length") != std::string::npos, "empty-completion diagnostic: names finish_reason");
+            R.expect(d.find("prompt_tokens=4000") != std::string::npos, "empty-completion diagnostic: reports prompt_tokens");
+        }
+        {
+            bool cp = false;
+            std::string d = cell::llm::empty_completion_diagnostic("stop", {{"prompt_tokens", 3969}}, cp);
+            R.expect(cp, "empty-completion diagnostic: large prompt_tokens with no content implies context pressure");
+        }
+        {
+            bool cp = false;
+            std::string d = cell::llm::empty_completion_diagnostic("stop", {{"prompt_tokens", 500}}, cp);
+            R.expect(!cp, "empty-completion diagnostic: small prompt is not context pressure");
+            R.expect(d.find("prompt_tokens=500") != std::string::npos, "empty-completion diagnostic: reports prompt_tokens even when not pressure");
+        }
+        {
+            // Anthropic / Responses report input tokens as input_tokens: the same
+            // large-prompt threshold must still flag context pressure for those clients
+            bool cp = false;
+            std::string d = cell::llm::empty_completion_diagnostic("stop", {{"input_tokens", 4100}}, cp);
+            R.expect(cp, "empty-completion diagnostic: large input_tokens implies context pressure");
+            R.expect(d.find("input_tokens") != std::string::npos || d.find("prompt_tokens") != std::string::npos, "empty-completion diagnostic: reports the token count");
+        }
+        {
+            bool cp = false;
+            std::string d = cell::llm::empty_completion_diagnostic("", nlohmann::json::object(), cp);
+            R.expect(!cp, "empty-completion diagnostic: unknown finish_reason with no usage is not pressure");
+            R.expect(d.find("finish_reason=unknown") != std::string::npos, "empty-completion diagnostic: unknown finish_reason is reported");
+        }
+        {
+            bool cp = false;
+            std::string d = cell::llm::empty_completion_diagnostic("content_filter", {{"prompt_tokens", 100}}, cp);
+            R.expect(!cp, "empty-completion diagnostic: content_filter is not context pressure");
+            R.expect(d.find("filtered") != std::string::npos, "empty-completion diagnostic: names content_filter");
+        }
+
         // session state injected mid-conversation (notices, skills, interrupt
         // notes, compaction summaries) must end up in the leading system block:
         // chat templates reject a system message that follows a real turn
