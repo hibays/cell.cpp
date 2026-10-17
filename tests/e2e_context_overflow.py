@@ -139,7 +139,8 @@ class Serve:
         self.mock = ThreadingHTTPServer(("127.0.0.1", self.mock_port), MockLLM)
         threading.Thread(target=self.mock.serve_forever, daemon=True).start()
         cfg = {"providers": [{"name": "mock", "style": "openai",
-                              "base": f"http://127.0.0.1:{self.mock_port}/v1"}],
+                              "base": f"http://127.0.0.1:{self.mock_port}/v1",
+                              "context_window": 4096}],
                "current_provider": "mock", "current_model": "mock-model"}
         (Path(root) / "config.json").write_text(json.dumps(cfg))
         env = dict(os.environ)
@@ -181,6 +182,7 @@ class Serve:
 
     def turn(self, sid, text="hi"):
         out, errors, done = [], [], None
+        self.usage = None
         with self.api("POST", f"/sessions/{sid}/turn", {"text": text}, stream=True) as r:
             for raw in r:
                 line = raw.decode("utf-8", "replace").strip()
@@ -196,6 +198,8 @@ class Serve:
                     out.append(ev.get("data", {}).get("text", ""))
                 elif ev.get("type") == "error":
                     errors.append(ev.get("data", {}))
+                elif ev.get("type") == "usage":
+                    self.usage = ev.get("data", {})
                 elif ev.get("type") == "turn_done":
                     done = ev.get("data")
         return "".join(out), errors, done
@@ -236,6 +240,11 @@ def main():
             check("single-turn normal: rc=0", done and done.get("rc") == 0, done)
             check("single-turn normal: answer streamed", "hello from mock" in out, out)
             check("single-turn normal: no error", not errors, errors)
+            check("usage frame carries context_window (manual 4096)",
+                  bool(srv.usage) and srv.usage.get("context_window") == 4096, srv.usage)
+            check("usage frame carries context_tokens + context_pct",
+                  bool(srv.usage) and srv.usage.get("context_tokens") is not None
+                  and srv.usage.get("context_pct") is not None, srv.usage)
 
             # ---- single-turn: reasoning-only (Ollama delta.reasoning) ----
             srv.set_mode("reasoning_only")
