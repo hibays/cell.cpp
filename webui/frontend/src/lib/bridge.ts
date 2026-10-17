@@ -41,7 +41,9 @@ export const bridge = {
 
   async reveal(path: string): Promise<void> {
     if (!hasBridge()) return
-    await resolveNative('cell_reveal')!(path)
+    const raw = await resolveNative('cell_reveal')!(path)
+    const r = parseJson<{ ok?: boolean; error?: string }>(raw ?? '')
+    if (r && r.ok === false) throw new Error(r.error ?? 'the file manager did not open')
   },
 
   async openExternal(url: string): Promise<void> {
@@ -49,7 +51,9 @@ export const bridge = {
       window.open(url, '_blank', 'noopener')
       return
     }
-    await resolveNative('cell_open_external')!(url)
+    const raw = await resolveNative('cell_open_external')!(url)
+    const r = parseJson<{ ok?: boolean; error?: string }>(raw ?? '')
+    if (r && r.ok === false) throw new Error(r.error ?? 'no application accepted the url')
   },
 
   async capabilities(): Promise<Record<string, unknown>> {

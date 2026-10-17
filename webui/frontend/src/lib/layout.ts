@@ -16,6 +16,25 @@ export const SIDEBAR_AUTO_COLLAPSE = 1024
 export const RIGHTBAR_MAX_RATIO = 0.7
 export const RIGHTBAR_DEFAULT_RATIO = 0.45
 
+/**
+ * The frame's five grid slots. The template always has five columns — the two
+ * handle columns are 0px and the handles themselves overflow them by design
+ * (width 6px, margin -3px) — so a child's column never depends on which of the
+ * others happen to be rendered. Auto-placement does exactly that: with a
+ * three-column template and a conditionally rendered left handle, the main
+ * column used to land in the 0px rightbar slot (the whole conversation
+ * invisible) whenever the sidebar was expanded. Every child therefore carries
+ * its slot explicitly, and this table is the single source both the template
+ * and the components read — layout.test pins the two against each other.
+ */
+export const SLOT = {
+  sidebar: 1,
+  handleSidebar: 2,
+  main: 3,
+  handleRightbar: 4,
+  rightbar: 5,
+} as const
+
 export interface Columns {
   sidebar: number
   rightbar: number
@@ -58,8 +77,13 @@ export function solveColumns(input: ColumnInput): Columns {
   return { sidebar, rightbar, collapsed }
 }
 
-/** The grid template the frame hands to CSS; `0px` keeps a closed column addressable. */
+/**
+ * The grid template the frame hands to CSS. Always five columns (see SLOT):
+ * a closed column is `0px` rather than absent, so the slot numbers stay valid
+ * whichever children are mounted, and CSS Grid — not the JS — does the
+ * squeezing between the sidebar, the centre's minimum and the right bar.
+ */
 export function gridTemplate(cols: Columns): string {
   const right = cols.rightbar > 0 ? `minmax(0px, ${cols.rightbar}px)` : '0px'
-  return `${cols.sidebar}px minmax(${CENTER_MIN}px, 1fr) ${right}`
+  return `${cols.sidebar}px 0px minmax(${CENTER_MIN}px, 1fr) 0px ${right}`
 }

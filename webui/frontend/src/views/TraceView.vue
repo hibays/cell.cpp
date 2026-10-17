@@ -87,6 +87,7 @@ function stepLabel(s: TraceStep): string {
               <template v-else>
                 <div class="answer">
                   <span class="badge answer-badge">{{ stepLabel(s) }}</span>
+                  <span v-if="s.empty" class="dim">（空回复 — 模型没有返回内容）</span>
                   <div class="md" v-html="renderMarkdown(s.text ?? '')" />
                 </div>
               </template>

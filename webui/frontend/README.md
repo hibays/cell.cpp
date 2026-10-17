@@ -75,11 +75,11 @@ src/
 
 | JS call | Native behaviour |
 | --- | --- |
-| `cell_bootstrap()` | version, api base URL + bearer token, platform |
-| `cell_export_session(id)` | renders the session HTML through cell.cpp's own exporter |
-| `cell_export_batch([ids])` | batch export |
-| `cell_export_all()` | every session on disk |
-| `cell_reveal(path)` | show the exported file in the file manager |
-| `cell_open_external(url)` | open a URL in the default browser |
-| `cell_native_capabilities()` | what the native layer provides today |
+| `cell_bootstrap()` | version, api base URL + bearer token, platform, the host shell that actually came up (`webview2` / `browser`) |
+| `cell_export_session(id)` | renders the session HTML through cell.cpp's own exporter; lands in the user's Downloads folder unless a path is given |
+| `cell_export_batch([ids])` | batch export (same destination) |
+| `cell_export_all()` | every session on disk (same destination) |
+| `cell_reveal(path)` | show the exported file in the file manager; `{ok}` / `{ok:false,error}` — failures are said, not swallowed |
+| `cell_open_external(url)` | open a URL in the default browser; same result shape |
+| `cell_native_capabilities()` | what the native layer provides today (reports the real shell, not the hoped-for one) |
 | `cell_notify(text)` | placeholder for native notifications (in-app toast for now) |

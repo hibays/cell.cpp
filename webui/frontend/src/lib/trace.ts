@@ -25,6 +25,8 @@ export interface TraceStep {
   ts?: number
   /** Reasoning or answer text. */
   text?: string
+  /** An answer step whose record carried nothing — shown as an explicit gap. */
+  empty?: boolean
 }
 
 export interface TraceTurn {
@@ -90,6 +92,10 @@ export function buildTurns(messages: UiMessage[]): TraceTurn[] {
     }
     if (m.text && m.text.trim()) {
       current.steps.push({ key: `${current.key}-a${idx++}`, kind: 'answer', text: m.text, ts: m.ts })
+    } else if (m.empty) {
+      // the turn "finished" with nothing in it: an explicit step beats a turn
+      // that looks like it never answered
+      current.steps.push({ key: `${current.key}-a${idx++}`, kind: 'answer', text: '', empty: true, ts: m.ts })
     }
   }
   return turns

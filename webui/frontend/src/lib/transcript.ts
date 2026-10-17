@@ -26,6 +26,10 @@ export interface UiMessage {
   text: string
   reasoning?: string
   tools?: UiToolCall[]
+  /** A recognised record that carries nothing: rendered as an explicit gap,
+   *  never silently dropped (older kernels persisted these; the questions in
+   *  such a session must not look answered-by-design). */
+  empty?: boolean
   ts?: number
 }
 
@@ -186,7 +190,23 @@ export function normalizeTranscript(raw: unknown): UiMessage[] {
       continue
     }
 
-    if (!text && !reasoning && tools.length === 0) continue
+    if (!text && !reasoning && tools.length === 0) {
+      // A recognised assistant record that carries nothing. The kernel always
+      // writes a content key, so a present-but-empty one (null, "") is a real
+      // "the model returned nothing" round — dropping it would make the
+      // question before it look answered-by-design, so it stays and renders as
+      // an explicit marker (MessageItem). A record without any content key is
+      // malformed instead and goes the way of every unrecognised record.
+      if (!('content' in m)) continue
+      out.push({
+        key: `k${out.length}`,
+        role: 'assistant',
+        text: '',
+        empty: true,
+        ts: typeof m.ts === 'number' ? m.ts : undefined,
+      })
+      continue
+    }
     for (const t of tools) byId.set(t.id, t)
     out.push({
       key: `k${out.length}`,

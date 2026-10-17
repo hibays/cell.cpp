@@ -51,6 +51,8 @@ interface State {
   sessions: SessionSummary[]
   currentSession: string | null
   messages: UiMessage[]
+  /** Why the transcript on screen could not be loaded (empty when it did). */
+  messagesError: string
   loadingMessages: boolean
   streaming: boolean
   /** The turn in flight, folded from the kernel's semantic events. */
@@ -113,6 +115,7 @@ const state = reactive<State>({
   sessions: [],
   currentSession: null,
   messages: [],
+  messagesError: '',
   loadingMessages: false,
   streaming: false,
   live: null,
@@ -266,6 +269,7 @@ export async function removeSession(sid: string): Promise<boolean> {
     if (state.currentSession === sid) {
       state.currentSession = null
       state.messages = []
+      state.messagesError = ''
       state.jobs = []
       state.workerReport = null
       state.approvalsLog = []
@@ -447,12 +451,30 @@ export async function refreshLogs(tail = 300): Promise<void> {
   state.logsTruncated = out.truncated
 }
 
-/** Re-read the transcript of the session on screen (after a turn, or on demand). */
-export async function reloadMessages(): Promise<void> {
-  const id = state.currentSession
+/**
+ * Re-read the transcript of the session on screen (after a turn, or on demand).
+ * A failed read keeps what is on screen: emptying it would make a hiccup look
+ * like the conversation vanished, and the error is said out loud instead. The
+ * optional id pins the session — the send path passes the one it streamed into,
+ * because the reader may have switched sessions while the turn was running.
+ */
+export async function reloadMessages(sid?: string): Promise<void> {
+  const id = sid ?? state.currentSession
   if (!id) return
-  const { messages } = await api.sessionMessages(id).catch(() => ({ messages: [] }))
-  state.messages = normalizeTranscript(messages)
+  try {
+    const { messages } = await api.sessionMessages(id)
+    state.messages = normalizeTranscript(messages)
+    state.messagesError = ''
+  } catch (e) {
+    // a brand-new session has no transcript yet: that is not a failure
+    if (classifyError(e).code === 'not_found') {
+      state.messages = []
+      state.messagesError = ''
+      return
+    }
+    state.messagesError = friendlyError(e)
+    toast('bad', `会话记录加载失败：${state.messagesError}`)
+  }
 }
 
 /**
@@ -513,6 +535,7 @@ export async function clearCurrentSession(): Promise<boolean> {
   try {
     const r = await api.clearSession(id)
     state.messages = []
+    state.messagesError = ''
     state.lastInterrupted = false
     state.jobs = []
     void refreshUsage()
@@ -633,11 +656,18 @@ export async function selectSession(id: string): Promise<void> {
   try {
     const { messages } = await api.sessionMessages(id)
     state.messages = normalizeTranscript(messages)
+    state.messagesError = ''
   } catch (e) {
-    state.messages = []
-    if (String(e).includes('404')) {
-      // a brand-new session has no transcript yet
+    // a brand-new session has no transcript yet — an empty view is the truth
+    // there; anything else is a failure the user must see, because a blank
+    // transcript that is not blank looks exactly like a new session
+    if (classifyError(e).code === 'not_found') {
       state.messages = []
+      state.messagesError = ''
+    } else {
+      state.messages = []
+      state.messagesError = friendlyError(e)
+      toast('bad', `会话记录加载失败：${state.messagesError}`)
     }
   } finally {
     state.loadingMessages = false
@@ -651,6 +681,7 @@ export async function newSession(): Promise<string | null> {
     const { id } = await api.createSession()
     state.currentSession = id
     state.messages = []
+    state.messagesError = ''
     await refreshSessions()
     toast('ok', `new session ${id.slice(-6)}`)
     return id
@@ -666,6 +697,7 @@ export async function deleteSession(id: string): Promise<void> {
     if (state.currentSession === id) {
       state.currentSession = null
       state.messages = []
+      state.messagesError = ''
     }
     await refreshSessions()
     toast('ok', 'session deleted')
@@ -795,13 +827,18 @@ export async function send(text: string): Promise<void> {
     }
   } finally {
     // the streamed text is already persisted server-side: reload the transcript
-    // so tool calls, reasoning and usage all show up in their structured form
+    // so tool calls, reasoning and usage all show up in their structured form.
+    // The shared loader keeps the view on a hiccup instead of blanking it — but
+    // only while this session is still the one on screen: a reader who switched
+    // away mid-turn must not see the old session's transcript land on theirs
+    // (it stays on disk; reopening the session shows it).
     endStream()
-    const { messages } = await api.sessionMessages(id).catch(() => ({ messages: [] }))
-    state.messages = normalizeTranscript(messages)
-    // a failed turn leaves no assistant record on disk: without this the reload
-    // above would show the user's message followed by nothing
-    if (watch.failures.length) state.messages.push(turnFailureBubble(watch.failures, `m${msgSeq++}`))
+    if (state.currentSession === id) {
+      await reloadMessages(id)
+      // a failed turn leaves no assistant record on disk: without this the
+      // reload above would show the user's message followed by nothing
+      if (watch.failures.length) state.messages.push(turnFailureBubble(watch.failures, `m${msgSeq++}`))
+    }
     state.streaming = false
     state.live = null
     state.approvals = []

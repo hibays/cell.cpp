@@ -4,7 +4,7 @@
 // Extracted from the old single-file shell so the frame (AppShell) can switch
 // between this and the trace view without either owning the other's chrome.
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
-import { interrupt, newSession, resume, selectSession, send, store, toast } from '../store'
+import { interrupt, newSession, reloadMessages, resume, selectSession, send, store, toast } from '../store'
 import MessageItem from '../components/MessageItem.vue'
 import Composer from '../components/Composer.vue'
 import ApprovalCard from '../components/ApprovalCard.vue'
@@ -121,6 +121,11 @@ function jumpToLatest(): void {
   void scrollToBottom()
 }
 
+/** Retry a failed transcript load — the error card's only button. */
+async function retryMessages(): Promise<void> {
+  await reloadMessages()
+}
+
 watch(
   () => [streamMessage.value.text.length, streamMessage.value.tools?.length ?? 0, store.messages.length] as const,
   async () => {
@@ -195,7 +200,14 @@ onUnmounted(() => observer?.disconnect())
           @copy="toast('ok', $event)"
         />
         <ApprovalCard v-for="a in store.approvals" :key="a.request_id" :approval="a" />
-        <div v-if="!store.messages.length && !store.streaming" class="welcome">
+        <!-- a failed load must not look like a new session: say what happened,
+             and offer the one action that can fix it -->
+        <div v-if="store.messagesError" class="load-error" role="alert">
+          <p class="why">会话记录加载失败</p>
+          <p class="detail">{{ store.messagesError }}</p>
+          <button class="retry" type="button" @click="retryMessages()">重试</button>
+        </div>
+        <div v-if="!store.messages.length && !store.streaming && !store.messagesError" class="welcome">
           <h2>开始吧</h2>
           <p>选择一个起点，或直接输入：</p>
           <div class="chips">
@@ -269,6 +281,43 @@ onUnmounted(() => observer?.disconnect())
   padding: 8vh 0;
   color: var(--cell-alias-ink-dim);
   animation: cell-fade-in 0.4s ease both;
+}
+
+.load-error {
+  margin: 8vh auto 0;
+  max-width: 42em;
+  text-align: center;
+  border: 1px solid var(--cell-alias-bad-soft);
+  border-radius: var(--cell-radius-md);
+  background: var(--cell-alias-bg-raised);
+  padding: 22px 26px;
+}
+
+.load-error .why {
+  margin: 0 0 6px;
+  color: var(--cell-alias-bad);
+  font-weight: 600;
+}
+
+.load-error .detail {
+  margin: 0 0 14px;
+  color: var(--cell-alias-ink-dim);
+  font-size: var(--cell-font-size-sm);
+}
+
+.load-error .retry {
+  border: 1px solid var(--cell-alias-line);
+  border-radius: var(--cell-radius-pill);
+  background: none;
+  color: var(--cell-alias-ink);
+  font: inherit;
+  font-size: var(--cell-font-size-sm);
+  padding: 4px 18px;
+}
+
+.load-error .retry:hover {
+  border-color: var(--cell-alias-accent);
+  color: var(--cell-alias-accent);
 }
 
 .welcome h2 {

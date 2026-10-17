@@ -77,6 +77,11 @@ function copyMessage(): void {
         <div class="reasoning-body">{{ message.reasoning }}</div>
       </details>
       <div v-if="message.text" class="markdown md-body" v-html="html" />
+      <!-- an empty record is a fact, not layout noise: say it instead of
+           rendering an invisible row the reader reads as "nothing happened" -->
+      <p v-else-if="message.empty" class="empty-note" role="note">
+        （模型返回了空内容 — 该轮没有可显示的回答）
+      </p>
       <span v-else-if="streaming && message.role === 'assistant'" class="cursor" />
       <ToolCallCard v-for="t in message.tools" :key="t.id" :tool="t" />
 
@@ -148,6 +153,15 @@ function copyMessage(): void {
   border-radius: 2px;
   animation: cell-blink 1s steps(2) infinite;
   vertical-align: text-bottom;
+}
+
+.empty-note {
+  margin: 0;
+  color: var(--cell-alias-ink-faint);
+  font-size: var(--cell-font-size-sm);
+  font-style: italic;
+  border-left: 2px solid var(--cell-alias-line);
+  padding-left: 10px;
 }
 
 .reasoning {

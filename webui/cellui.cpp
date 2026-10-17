@@ -73,8 +73,39 @@ namespace cellui
         std::string serve_error;
         std::mutex err_m;
         long long started_at = (long long)std::time(nullptr);
+        // which front-end host actually came up: webui_show_wv (WebView2) or the
+        // browser fallback. Reported by the bridge, because a capability that
+        // claims WebView2 inside a browser window is a lie the UI cannot see
+        // through.
+        std::string shell = "unknown";
     };
     static state g_state;
+
+    // Where exports land when the caller does not name a file. The process CWD
+    // is a trap for a GUI: launched from Explorer it is the executable's
+    // directory (often Program Files), launched from a shell it is wherever the
+    // shell happened to stand. The user's Downloads folder is the one place
+    // both a file manager and a "reveal in Explorer" understand.
+    static std::filesystem::path default_export_dir()
+    {
+        std::error_code ec;
+        std::filesystem::path home;
+#ifdef _WIN32
+        if (const char *p = std::getenv("USERPROFILE"); p && *p)
+            home = p;
+#else
+        if (const char *p = std::getenv("HOME"); p && *p)
+            home = p;
+#endif
+        if (!home.empty())
+        {
+            std::filesystem::path downloads = home / "Downloads";
+            if (std::filesystem::exists(downloads, ec))
+                return downloads;
+            return home;
+        }
+        return std::filesystem::current_path();
+    }
 
     // Wait for .cell/server.json (written by the service layer on startup) and
     // cache the port + token for the front-end.
@@ -133,39 +164,46 @@ namespace cellui
     }
 
     // ---- shell integration ----------------------------------------------------
-    static void reveal_in_shell(const std::string &path)
+    // Both return false when the shell refused, so the bridge can say so
+    // instead of a bare "ok" that means nothing to a caller showing a toast.
+    static bool reveal_in_shell(const std::string &path)
     {
         std::error_code ec;
         auto abs = std::filesystem::absolute(path, ec);
         if (ec)
-            return;
+            return false;
 #ifdef _WIN32
         std::wstring w(abs.wstring());
-        ShellExecuteW(nullptr, L"explore", w.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+        // ShellExecuteW signals failure by returning <= 32, not by a null handle
+        auto rc = reinterpret_cast<INT_PTR>(
+            ShellExecuteW(nullptr, L"explore", w.c_str(), nullptr, nullptr, SW_SHOWNORMAL));
+        return rc > 32;
 #elif defined(__APPLE__)
         std::string cmd = "open -R '" + abs.string() + "'";
         const int rc = std::system(cmd.c_str()); // best effort shell integration
-        (void)rc;
+        return rc == 0;
 #else
         std::string cmd = "xdg-open '" + abs.parent_path().string() + "'";
         const int rc = std::system(cmd.c_str()); // best effort shell integration
-        (void)rc;
+        return rc == 0;
 #endif
     }
 
-    static void open_external(const std::string &url)
+    static bool open_external(const std::string &url)
     {
 #ifdef _WIN32
         std::wstring w(url.begin(), url.end());
-        ShellExecuteW(nullptr, L"open", w.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+        auto rc = reinterpret_cast<INT_PTR>(
+            ShellExecuteW(nullptr, L"open", w.c_str(), nullptr, nullptr, SW_SHOWNORMAL));
+        return rc > 32;
 #elif defined(__APPLE__)
         std::string cmd = "open '" + url + "'";
         const int rc = std::system(cmd.c_str()); // best effort shell integration
-        (void)rc;
+        return rc == 0;
 #else
         std::string cmd = "xdg-open '" + url + "'";
         const int rc = std::system(cmd.c_str()); // best effort shell integration
-        (void)rc;
+        return rc == 0;
 #endif
     }
 
@@ -292,6 +330,10 @@ namespace cellui
             // every launch.
             {"root", cell::root.string()},
             {"root_writable", cell::root_writable()},
+            // which host is actually running (webview2 / browser): the UI reads
+            // this instead of assuming, and the browser fallback path stops
+            // pretending to be WebView2
+            {"shell", g_state.shell},
             {"platform",
              {
 #ifdef _WIN32
@@ -314,7 +356,7 @@ namespace cellui
         std::string out_arg = webui_get_string_at(e, 1) ? webui_get_string_at(e, 1) : "";
         std::string err;
         std::filesystem::path out = out_arg.empty()
-                                        ? std::filesystem::current_path() / std::format("cell-{}.html", sanitize_filename(sid))
+                                        ? default_export_dir() / std::format("cell-{}.html", sanitize_filename(sid))
                                         : std::filesystem::path(out_arg);
         if (export_session_html(sid, out, err))
             reply_json(e, nlohmann::json{{"ok", true}, {"path", out.string()}});
@@ -336,7 +378,7 @@ namespace cellui
                     if (!sid.is_string())
                         continue;
                     std::string err;
-                    std::filesystem::path out = std::filesystem::current_path() /
+                    std::filesystem::path out = default_export_dir() /
                                                 std::format("cell-{}.html", sanitize_filename(sid.get<std::string>()));
                     nlohmann::json one{{"id", sid.get<std::string>()}};
                     if (export_session_html(sid.get<std::string>(), out, err))
@@ -380,7 +422,7 @@ namespace cellui
         for (auto &[sid, mt] : sids)
         {
             std::string err;
-            std::filesystem::path out = std::filesystem::current_path() / std::format("cell-{}.html", sanitize_filename(sid));
+            std::filesystem::path out = default_export_dir() / std::format("cell-{}.html", sanitize_filename(sid));
             nlohmann::json one{{"id", sid}};
             if (export_session_html(sid, out, err))
                 one["path"] = out.string();
@@ -394,17 +436,29 @@ namespace cellui
     static void bind_reveal(webui_event_t *e)
     {
         const char *p = webui_get_string(e);
-        if (p != nullptr && *p)
-            reveal_in_shell(p);
-        webui_return_string(e, "ok");
+        if (p == nullptr || !*p)
+        {
+            reply_json(e, nlohmann::json{{"ok", false}, {"error", "reveal: no path given"}});
+            return;
+        }
+        if (reveal_in_shell(p))
+            reply_json(e, nlohmann::json{{"ok", true}});
+        else
+            reply_json(e, nlohmann::json{{"ok", false}, {"error", "the file manager did not open"}});
     }
 
     static void bind_open_external(webui_event_t *e)
     {
         const char *p = webui_get_string(e);
-        if (p != nullptr && *p)
-            open_external(p);
-        webui_return_string(e, "ok");
+        if (p == nullptr || !*p)
+        {
+            reply_json(e, nlohmann::json{{"ok", false}, {"error", "open: no url given"}});
+            return;
+        }
+        if (open_external(p))
+            reply_json(e, nlohmann::json{{"ok", true}});
+        else
+            reply_json(e, nlohmann::json{{"ok", false}, {"error", "no application accepted the url"}});
     }
 
     // ---- native GUI placeholders ---------------------------------------------
@@ -415,7 +469,10 @@ namespace cellui
     static void bind_native_capabilities(webui_event_t *e)
     {
         nlohmann::json j{
-            {"shell", "webview2"}, // Windows: WebView2 (static loader). Others: webui default
+            // the host that actually came up, not the one we hoped for: on the
+            // browser-fallback path this reads "browser", so the UI never
+            // offers a WebView-only affordance inside someone else's window
+            {"shell", g_state.shell},
             {"native_menu", false},
             {"tray", false},
             {"notifications", false},
@@ -706,6 +763,8 @@ namespace cellui
         if (!force_browser)
         {
             shown = webui_show_wv(w, html.c_str());
+            if (shown)
+                g_state.shell = "webview2";
             if (!shown)
                 std::fprintf(stderr,
                              "cellui: WebView2 did not open (runtime missing, %%TEMP%% unwritable,\n"
@@ -715,12 +774,16 @@ namespace cellui
         {
             // app-mode browser window: the path DSHL ships on
             shown = webui_show_browser(w, html.c_str(), AnyBrowser);
+            if (shown)
+                g_state.shell = "browser";
         }
         if (!shown && !force_browser)
         {
             // webui's show() outcome depends on how this process was started
             // (console / detached / redirected handles); one retry is cheap
             shown = webui_show_wv(w, html.c_str());
+            if (shown)
+                g_state.shell = "webview2";
         }
         if (!shown)
         {

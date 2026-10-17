@@ -27,7 +27,7 @@ import ExportPanel from '../components/ExportPanel.vue'
 import ConversationView from './ConversationView.vue'
 import TraceView from './TraceView.vue'
 import SettingsView from './SettingsView.vue'
-import { SIDEBAR_MAX, SIDEBAR_MIN, gridTemplate, solveColumns } from '../lib/layout'
+import { SIDEBAR_MAX, SIDEBAR_MIN, SLOT, gridTemplate, solveColumns } from '../lib/layout'
 import { useDragHandle } from '../lib/useDrag'
 import { sessionTitle } from '../lib/format'
 
@@ -104,19 +104,28 @@ onUnmounted(() => {
 
 <template>
   <div class="shell">
+    <!--
+      Every child carries its grid slot explicitly (lib/layout.ts SLOT): the
+      template always has five columns, so a conditionally rendered handle can
+      never push the main column into the 0px rightbar slot. That is exactly
+      what auto-placement did before — with the sidebar expanded and the right
+      bar closed, the left handle took the centre column and the whole
+      conversation vanished into a zero-width cell.
+    -->
     <div ref="frame" class="frame" :style="{ gridTemplateColumns: template }">
-      <Sidebar v-if="frameWidth === 0 || cols.sidebar > 0" @export="exportOpen = true" />
+      <Sidebar v-if="frameWidth === 0 || cols.sidebar > 0" :style="{ gridColumn: SLOT.sidebar }" @export="exportOpen = true" />
 
       <div
         v-if="!cols.collapsed"
         class="handle"
         :class="{ dragging: sidebarDragging }"
+        :style="{ gridColumn: SLOT.handleSidebar }"
         role="separator"
         aria-orientation="vertical"
         @pointerdown="onSidebarDrag"
       />
 
-      <main class="main">
+      <main class="main" :style="{ gridColumn: SLOT.main }">
         <header class="top">
           <button v-if="cols.collapsed" class="icon-open" title="展开侧栏 (Ctrl+B)" @click="toggleSidebar()">
             ☰
@@ -141,27 +150,6 @@ onUnmounted(() => {
 
           <span class="spacer" />
 
-          <div class="tabs" role="tablist">
-            <button
-              class="tab"
-              :class="{ on: store.view === 'chat' }"
-              role="tab"
-              :aria-selected="store.view === 'chat'"
-              @click="setView('chat')"
-            >
-              对话
-            </button>
-            <button
-              class="tab"
-              :class="{ on: store.view === 'trace' }"
-              role="tab"
-              :aria-selected="store.view === 'trace'"
-              @click="setView('trace')"
-            >
-              轨迹
-            </button>
-          </div>
-
           <button class="tool" title="新建会话 (Ctrl+N)" @click="newSession()">＋</button>
           <button class="tool" title="导出会话" @click="exportOpen = true">导出</button>
           <button class="tool" title="设置" @click="openSettings(true)">设置</button>
@@ -175,6 +163,30 @@ onUnmounted(() => {
           </button>
         </header>
 
+        <!-- the view switch lives on its own row under the header (the reference
+             shell's 对话 | 轨迹): the header keeps title and tools, the row owns
+             what you are looking at -->
+        <nav class="viewbar" role="tablist" aria-label="视图">
+          <button
+            class="tab"
+            :class="{ on: store.view === 'chat' }"
+            role="tab"
+            :aria-selected="store.view === 'chat'"
+            @click="setView('chat')"
+          >
+            对话
+          </button>
+          <button
+            class="tab"
+            :class="{ on: store.view === 'trace' }"
+            role="tab"
+            :aria-selected="store.view === 'trace'"
+            @click="setView('trace')"
+          >
+            轨迹
+          </button>
+        </nav>
+
         <!-- both views stay mounted: the conversation owns scroll position and
              its row-height cache, and remounting it would throw both away -->
         <ConversationView v-show="store.view === 'chat'" @export="exportOpen = true" />
@@ -185,12 +197,13 @@ onUnmounted(() => {
         v-if="cols.rightbar > 0"
         class="handle"
         :class="{ dragging: rightbarDragging }"
+        :style="{ gridColumn: SLOT.handleRightbar }"
         role="separator"
         aria-orientation="vertical"
         @pointerdown="onRightbarDrag"
       />
 
-      <aside v-if="cols.rightbar > 0" class="rightbar">
+      <aside v-if="cols.rightbar > 0" class="rightbar" :style="{ gridColumn: SLOT.rightbar }">
         <SidePanel />
       </aside>
     </div>
@@ -321,13 +334,12 @@ onUnmounted(() => {
   white-space: nowrap;
 }
 
-.tabs {
+.viewbar {
   display: flex;
-  gap: 2px;
-  padding: 2px;
-  border: 1px solid var(--cell-alias-line);
-  border-radius: var(--cell-radius-pill);
-  background: var(--cell-alias-bg-base);
+  gap: 18px;
+  padding: 0 16px;
+  border-bottom: 1px solid var(--cell-alias-line-soft);
+  background: var(--cell-alias-bg-raised);
 }
 
 .tab {
@@ -335,13 +347,14 @@ onUnmounted(() => {
   background: none;
   color: var(--cell-alias-ink-dim);
   font-size: var(--cell-font-size-sm);
-  border-radius: var(--cell-radius-pill);
-  padding: 2px 12px;
+  padding: 8px 2px 7px;
+  border-bottom: 2px solid transparent;
+  margin-bottom: -1px;
 }
 
 .tab.on {
-  background: var(--cell-alias-accent-soft);
   color: var(--cell-alias-accent);
+  border-bottom-color: var(--cell-alias-accent);
   font-weight: 600;
 }
 

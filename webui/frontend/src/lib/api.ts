@@ -27,6 +27,8 @@ export interface Bootstrap {
   serve_ok: boolean
   serve_error: string
   uptime_s: number
+  /** Which host actually came up ("webview2" | "browser" | …) — reported, not assumed. */
+  shell?: string
   platform: [string, number]
   api?: { base: string; token: string }
 }

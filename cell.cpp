@@ -10819,6 +10819,36 @@ details{break-inside:avoid}
                     return false;
             return true;
         }
+        // Whether an assistant reply the model just returned carries anything a
+        // human could see: text (string or text block), reasoning, or tool calls.
+        // A round that ends "ok" with none of these is a failed round wearing a
+        // success — persisting it would write an empty assistant record that
+        // every client renders as silence (the "why do you return empty
+        // messages" report), so the turn loop fails the round instead.
+        static bool reply_carries_content(const nlohmann::json &reply, const nlohmann::json &tool_calls)
+        {
+            if (tool_calls.is_array() && !tool_calls.empty())
+                return true;
+            auto it = reply.find("content");
+            if (it == reply.end() || it->is_null())
+                return false;
+            if (it->is_string())
+                return !it->get_ref<const std::string &>().empty();
+            if (!it->is_array())
+                return false;
+            for (auto &b : *it)
+            {
+                if (!b.is_object())
+                    continue;
+                std::string t = b.value("type", "");
+                if (t == "text" && !b.value("text", std::string()).empty())
+                    return true;
+                if ((t == "reasoning" || t == "thinking") &&
+                    !(b.value("reasoning", std::string()).empty() && b.value("thinking", std::string()).empty()))
+                    return true;
+            }
+            return false;
+        }
         static void repair_tool_pairing(nlohmann::json &messages)
         {
             for (size_t i = 0; i < messages.size(); i++)
@@ -20567,6 +20597,30 @@ static int run_selftest()
         R.expect(!cell::chat::is_user_turn({{"role", "user"}, {"content", nlohmann::json::array()}}),
                  "user turn: an empty content array does not count");
 
+        // the empty-reply guard: a round that comes back "ok" with nothing a
+        // human could see is failed by run_turn instead of being persisted
+        R.expect(cell::chat::reply_carries_content({{"role", "assistant"}, {"content", "hi"}}, nlohmann::json::array()),
+                 "empty-reply guard: a text string carries content");
+        R.expect(!cell::chat::reply_carries_content({{"role", "assistant"}, {"content", ""}}, nlohmann::json::array()),
+                 "empty-reply guard: an empty string does not");
+        R.expect(!cell::chat::reply_carries_content({{"role", "assistant"}, {"content", nullptr}}, nlohmann::json::array()),
+                 "empty-reply guard: a null content does not");
+        R.expect(!cell::chat::reply_carries_content({{"role", "assistant"}}, nlohmann::json::array()),
+                 "empty-reply guard: a missing content does not");
+        R.expect(!cell::chat::reply_carries_content({{"role", "assistant"}, {"content", nlohmann::json::array()}}, nlohmann::json::array()),
+                 "empty-reply guard: an empty block array does not");
+        R.expect(cell::chat::reply_carries_content(
+                     {{"role", "assistant"}, {"content", nlohmann::json::array({{{"type", "text"}, {"text", "answer"}}})}},
+                     nlohmann::json::array()),
+                 "empty-reply guard: a text block carries content");
+        R.expect(cell::chat::reply_carries_content(
+                     {{"role", "assistant"}, {"content", nlohmann::json::array({{{"type", "reasoning"}, {"reasoning", "hmm"}}})}},
+                     nlohmann::json::array()),
+                 "empty-reply guard: reasoning carries content (it renders)");
+        R.expect(cell::chat::reply_carries_content({{"role", "assistant"}, {"content", nullptr}},
+                                                   nlohmann::json::array({{{"id", "c"}, {"type", "function"}}})),
+                 "empty-reply guard: tool calls carry content");
+
         // session state injected mid-conversation (notices, skills, interrupt
         // notes, compaction summaries) must end up in the leading system block:
         // chat templates reject a system message that follows a real turn
@@ -22929,6 +22983,20 @@ int repl::run()
                 }
                 if (done || ui.cancelled)
                     break;
+                // A round that reports success but carries nothing — no text, no
+                // reasoning, no tool calls — is a failed round wearing a success.
+                // The user's message stays on disk, the shell's turn-failure path
+                // (rc=1 + turn_error) says what happened, and no empty assistant
+                // record is written for every client to render as silence.
+                if (!cell::chat::reply_carries_content(reply, tool_calls))
+                {
+                    log.error("llm", std::format("empty_reply model={} round={} attempts={}", cfg.model_label(), rounds, attempt + 1));
+                    cell::sys::error("[empty reply] the model returned no content after {} attempt(s) — resend to try again", attempt + 1);
+                    turn_error = "the model returned an empty reply (no text, reasoning, or tool calls)";
+                    natural_end = false;
+                    done = true;
+                    break;
+                }
                 cell::sys::println();
                 long long out_chars = reply_text_len(reply);
                 h.now().msg().push_back(reply);

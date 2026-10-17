@@ -60,8 +60,9 @@ onMounted(async () => {
     </div>
     <footer class="foot">
       <span v-if="store.bootstrap?.platform">
-        {{ store.bootstrap.platform[0] }} · {{ store.bootstrap.platform[1] }}bit
-      </span>
+        {{ store.bootstrap.platform[0] }} · {{ store.bootstrap.platform[1] }}bit</span
+      >
+      <span v-if="store.bootstrap?.shell"> · {{ store.bootstrap.shell }}</span>
     </footer>
   </div>
 </template>
