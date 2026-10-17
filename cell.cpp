@@ -7661,6 +7661,34 @@ namespace cell
         // must never decide how far we grow (tool_calls / content blocks)
         constexpr size_t kMaxStreamSlots = 128;
 
+        // Build a human-readable diagnostic for an HTTP 200 response that carried
+        // no content (text, reasoning, and tool calls all empty). Small local
+        // models (e.g. gemma / qwen) return exactly this once the conversation
+        // outgrows their context window: the provider still reports output
+        // tokens in usage, but the streamed content deltas are empty. ctx_pressure
+        // reports whether the cause is context-window overflow so the caller can
+        // auto-compact and retry instead of failing the turn.
+        static std::string empty_completion_diagnostic(const std::string &finish_reason,
+                                                        const nlohmann::json &usage, bool &ctx_pressure)
+        {
+            long long pt = -1;
+            if (usage.contains("prompt_tokens") && usage["prompt_tokens"].is_number_integer())
+                pt = (long long)usage["prompt_tokens"];
+            else if (usage.contains("input_tokens") && usage["input_tokens"].is_number_integer())
+                pt = (long long)usage["input_tokens"]; // Anthropic / Responses report input tokens this way
+            std::string diag = std::format("provider returned an empty completion (finish_reason={})",
+                                           finish_reason.empty() ? "unknown" : finish_reason);
+            if (pt > 0)
+                diag += std::format("; prompt_tokens={}", pt);
+            if (finish_reason == "content_filter")
+                diag += " — the response was filtered by the provider";
+            // finish_reason=length is the definitive overflow signal; for local
+            // models a large prompt with no content is almost always the same
+            // cause, so compact and retry rather than report a dead end.
+            ctx_pressure = (finish_reason == "length") || (pt > 0 && pt >= 3072);
+            return diag;
+        }
+
         // Flatten request-local content formats into the text forms accepted by
         // OpenAI-compatible APIs. Sessions can contain reasoning arrays and legacy
         // Anthropic tool_result blocks, neither of which should reach the wire.
@@ -7896,7 +7924,10 @@ namespace cell
                 {
                     auto j = nlohmann::json::parse(buf);
                     if (!j.contains("choices") || j["choices"].empty())
+                    {
+                        err = "provider returned an empty completion (no choices)";
                         return false;
+                    }
                     reply = j["choices"][0]["message"];
                     if (reply.contains("tool_calls"))
                         tool_calls = reply["tool_calls"];
@@ -7919,6 +7950,7 @@ namespace cell
                 std::string reasoning;
                 std::string sse_buf;
                 std::string stream_err;
+                std::string finish_reason;
                 size_t sse_base = 0;
                 std::string url = api_base + "/chat/completions";
                 net::StreamCallback cb = [&](std::span<const char> data)
@@ -7939,6 +7971,14 @@ namespace cell
                         if (!j.contains("choices") || !j["choices"].is_array() || j["choices"].empty() ||
                             !j["choices"][0].contains("delta") || !j["choices"][0]["delta"].is_object())
                             return;
+                        {
+                            // the final chunk carries the stop reason; capture it so an
+                            // empty completion can name the cause (e.g. length = context overflow)
+                            auto &c0 = j["choices"][0];
+                            if (c0.contains("finish_reason") && c0["finish_reason"].is_string() &&
+                                !c0["finish_reason"].get<std::string>().empty())
+                                finish_reason = c0["finish_reason"].get<std::string>();
+                        }
                         auto &delta = j["choices"][0]["delta"];
                         // chain-of-thought: reasoning models stream delta.reasoning_content
                         if (delta.contains("reasoning_content") && delta["reasoning_content"].is_string())
@@ -8008,6 +8048,51 @@ namespace cell
                 }
                 if (!ok && err.empty())
                     err = "stream request failed";
+                // An HTTP 200 that streamed no content is a failed round wearing a
+                // success: small local models return exactly this once the prompt
+                // outgrows their context window (usage still reports output tokens,
+                // but the content deltas are empty). Surface the provider's real
+                // diagnostic, and when the cause is context-window pressure let the
+                // caller auto-compact and retry instead of ending on a dead end.
+                if (ok && text.empty() && reasoning.empty() && tool_calls.empty())
+                {
+                    // Some OpenAI-compatible servers answer stream=true with a single
+                    // JSON body (no SSE frames): recover its content/tool_calls/usage.
+                    nlohmann::json one;
+                    if (!sse_buf.empty() && sse_buf.front() == '{' &&
+                        (one = nlohmann::json::parse(sse_buf, nullptr, false)).is_object() && one.contains("choices"))
+                    {
+                        auto &ch = one["choices"];
+                        if (ch.is_array() && !ch.empty() && ch[0].contains("message"))
+                        {
+                            auto &m = ch[0]["message"];
+                            if (m.contains("content") && m["content"].is_string())
+                                text = m["content"].get<std::string>();
+                            else if (m.contains("content") && m["content"].is_array())
+                                for (auto &b : m["content"])
+                                    if (b.value("type", "") == "text" && b.contains("text") && b["text"].is_string())
+                                        text += b["text"].get<std::string>();
+                            if (m.contains("tool_calls"))
+                                tool_calls = m["tool_calls"];
+                        }
+                        if (one.contains("usage") && one["usage"].is_object())
+                            usage = one["usage"];
+                    }
+                    if (text.empty() && reasoning.empty())
+                    {
+                        bool ctx_pressure = false;
+                        std::string diag = empty_completion_diagnostic(finish_reason, usage, ctx_pressure);
+                        if (ctx_pressure)
+                        {
+                            err = diag + " — the conversation likely exceeded the model context window; auto-compacting and retrying";
+                            ok = false; // run_turn's is_context_overflow(err) compacts + retries
+                        }
+                        else if (err.empty())
+                        {
+                            err = diag; // ok stays true: run_turn reports this diagnostic and fails the turn
+                        }
+                    }
+                }
                 // assemble the reply even after a failed/aborted transfer so partial text survives
                 reply["role"] = "assistant";
                 if (text.empty() && reasoning.empty())
@@ -8346,6 +8431,7 @@ namespace cell
                 std::string reasoning; // accumulated reasoning summary text
                 std::string sse_buf;
                 std::string stream_err;
+                std::string finish_reason;
                 size_t sse_base = 0;
                 // track function_call deltas by item_id (OpenAI Responses streaming
                 // keys the argument deltas with item_id; the call_id that the
@@ -8373,6 +8459,14 @@ namespace cell
                             // usage arrives here (Responses API does not use stream_options)
                             if (resp.contains("usage") && resp["usage"].is_object())
                                 usage = resp["usage"];
+                            // a non-"completed" status names the real stop reason; map the
+                            // context/output-limit case onto the Chat Completions vocabulary
+                            // so an empty completion can be diagnosed and auto-compacted.
+                            std::string rstatus = resp.value("status", "");
+                            if (rstatus == "incomplete")
+                                finish_reason = "length";
+                            else if (!rstatus.empty())
+                                finish_reason = rstatus;
                             // function_call names are also available in the final response
                             if (resp.contains("output") && resp["output"].is_array())
                             {
@@ -8563,6 +8657,24 @@ namespace cell
                         push_call(item_id);
                 if (!tool_calls.empty())
                     reply["tool_calls"] = tool_calls;
+                // An HTTP 200 that streamed no content is a failed round wearing a
+                // success: some OpenAI Responses proxies return an empty output once
+                // the prompt outgrows the model context window. Surface the provider's
+                // real diagnostic and let the caller auto-compact + retry on pressure.
+                if (ok && text.empty() && reasoning.empty() && tool_calls.empty())
+                {
+                    bool ctx_pressure = false;
+                    std::string diag = empty_completion_diagnostic(finish_reason, usage, ctx_pressure);
+                    if (ctx_pressure)
+                    {
+                        err = diag + " — the conversation likely exceeded the model context window; auto-compacting and retrying";
+                        ok = false; // run_turn's is_context_overflow(err) compacts + retries
+                    }
+                    else if (err.empty())
+                    {
+                        err = diag; // ok stays true: run_turn reports this diagnostic and fails the turn
+                    }
+                }
                 return ok;
             }
         };
@@ -8799,6 +8911,7 @@ namespace cell
                 std::vector<nlohmann::json> blocks;
                 std::string sse_buf;
                 std::string stream_err;
+                std::string finish_reason;
                 size_t sse_base = 0;
                 std::string url = api_base + "/v1/messages";
                 net::StreamCallback cb = [&](std::span<const char> data)
@@ -8811,8 +8924,19 @@ namespace cell
                             usage["input_tokens"] = (long long)num_arg(ev["message"]["usage"], "input_tokens", 0);
                             usage["cache_read_input_tokens"] = (long long)num_arg(ev["message"]["usage"], "cache_read_input_tokens", 0);
                         }
-                        else if (type == "message_delta" && ev.contains("usage"))
-                            usage["output_tokens"] = (long long)num_arg(ev["usage"], "output_tokens", 0);
+                        else if (type == "message_delta")
+                        {
+                            if (ev.contains("usage"))
+                                usage["output_tokens"] = (long long)num_arg(ev["usage"], "output_tokens", 0);
+                            // the final chunk carries the stop reason; capture it so an
+                            // empty completion can name the cause (max_tokens = context
+                            // output limit) and trigger auto-compact + retry.
+                            if (ev.contains("stop_reason") && ev["stop_reason"].is_string())
+                            {
+                                std::string sr = ev["stop_reason"].get<std::string>();
+                                finish_reason = (sr == "max_tokens") ? "length" : sr;
+                            }
+                        }
                         else if (type == "error" && ev.contains("error"))
                         {
                             // an error event can arrive mid-stream (200 status) and
@@ -8936,6 +9060,34 @@ namespace cell
                     }
                     tc["function"]["arguments"] = args;
                     tool_calls.push_back(tc);
+                }
+                // An HTTP 200 that streamed no content is a failed round wearing a
+                // success: small/legacy models can return this once the prompt outgrows
+                // the context window. Surface the provider's real diagnostic and let the
+                // caller auto-compact + retry on context-window pressure.
+                bool anthropic_has_content = false;
+                for (auto &b : blocks)
+                    if (b.is_object())
+                    {
+                        std::string bt = b.value("type", "");
+                        if (bt == "text" && !b.value("text", std::string()).empty())
+                            anthropic_has_content = true;
+                        else if (bt == "thinking" && !b.value("thinking", std::string()).empty())
+                            anthropic_has_content = true;
+                    }
+                if (ok && !anthropic_has_content && tool_calls.empty())
+                {
+                    bool ctx_pressure = false;
+                    std::string diag = empty_completion_diagnostic(finish_reason, usage, ctx_pressure);
+                    if (ctx_pressure)
+                    {
+                        err = diag + " — the conversation likely exceeded the model context window; auto-compacting and retrying";
+                        ok = false; // run_turn's is_context_overflow(err) compacts + retries
+                    }
+                    else if (err.empty())
+                    {
+                        err = diag; // ok stays true: run_turn reports this diagnostic and fails the turn
+                    }
                 }
                 return ok;
             }
@@ -22990,9 +23142,11 @@ int repl::run()
                 // record is written for every client to render as silence.
                 if (!cell::chat::reply_carries_content(reply, tool_calls))
                 {
-                    log.error("llm", std::format("empty_reply model={} round={} attempts={}", cfg.model_label(), rounds, attempt + 1));
-                    cell::sys::error("[empty reply] the model returned no content after {} attempt(s) — resend to try again", attempt + 1);
-                    turn_error = "the model returned an empty reply (no text, reasoning, or tool calls)";
+                    log.error("llm", std::format("empty_reply model={} round={} attempts={} err={}", cfg.model_label(), rounds, attempt + 1, err.empty() ? "n/a" : err));
+                    // prefer the provider's real diagnostic (finish_reason / prompt_tokens / context
+                    // overflow) over the generic message when chat_stream captured one
+                    turn_error = err.empty() ? "the model returned an empty reply (no text, reasoning, or tool calls)" : err;
+                    cell::sys::error("[empty reply] {}", turn_error);
                     natural_end = false;
                     done = true;
                     break;
