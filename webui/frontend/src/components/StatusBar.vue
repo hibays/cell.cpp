@@ -26,6 +26,8 @@ interface Health {
   sandbox_mode: string
   turn_active: boolean
   uptime_s: number
+  /** Resolved model context window (0/undefined = unknown). */
+  context_window?: number
 }
 
 const health = ref<Health | null>(null)
@@ -72,15 +74,21 @@ const shownTokens = computed(() => {
 // kernel has reported the denominator, so an unknown window renders nothing
 // rather than a plausible zero.
 const contextUsage = computed(() => store.live?.usage ?? null)
+// The denominator can come from /v1/health before any request reports usage
+// (Ollama's OpenAI-compatible endpoint reports none): show the window, and leave
+// occupancy as a dash until a real request supplies the numerator.
+const contextWindow = computed(() => contextUsage.value?.contextWindow ?? health.value?.context_window ?? 0)
+const contextTokens = computed(() => contextUsage.value?.contextTokens)
 const contextLabel = computed(() => {
-  const u = contextUsage.value
-  if (!u || !u.contextWindow) return ''
-  return `ctx ${u.contextPct ?? 0}%`
+  if (!contextWindow.value) return ''
+  if (contextTokens.value === undefined) return 'ctx —'
+  return `ctx ${contextUsage.value?.contextPct ?? 0}%`
 })
 const contextHint = computed(() => {
-  const u = contextUsage.value
-  if (!u || !u.contextWindow) return ''
-  return `上下文占用 ${formatCompact(u.contextTokens ?? 0)} / ${formatCompact(u.contextWindow)} tokens（${u.contextPct ?? 0}%）`
+  if (!contextWindow.value) return ''
+  if (contextTokens.value === undefined)
+    return `上下文窗口 ${formatCompact(contextWindow.value)} tokens（本轮尚未报告用量）`
+  return `上下文占用 ${formatCompact(contextTokens.value)} / ${formatCompact(contextWindow.value)} tokens（${contextUsage.value?.contextPct ?? 0}%）`
 })
 
 /** Install-wide totals, for the tooltip — the strip itself is session-scoped. */
@@ -174,7 +182,7 @@ onUnmounted(() => {
     <span v-if="contextLabel" class="item" :title="contextHint">
       {{ contextLabel }}
       <span class="dim">
-        {{ formatCompact(contextUsage?.contextTokens ?? 0) }}/{{ formatCompact(contextUsage?.contextWindow ?? 0) }}
+        {{ contextTokens === undefined ? '—' : formatCompact(contextTokens) }}/{{ formatCompact(contextWindow) }}
       </span>
     </span>
     <span v-if="health" class="item mono dim" :title="`版本 ${health.version} · 会话 ${store.currentSession ?? '—'}`">
