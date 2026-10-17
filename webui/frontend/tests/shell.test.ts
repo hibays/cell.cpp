@@ -223,7 +223,7 @@ describe('trace ledger — transcript folded into turns', () => {
   })
 
   test('status prefers "still running", then "blocked", else ok', () => {
-    const tool = (status: 'ok' | 'blocked' | 'running') => ({
+    const tool = (_status: 'ok' | 'blocked' | 'running') => ({
       key: 'u', role: 'user' as const, text: 'x',
     })
     const t = (status: 'ok' | 'blocked' | 'running') => ({
