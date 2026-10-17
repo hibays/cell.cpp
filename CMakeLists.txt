@@ -627,6 +627,16 @@ if(CELL_BUILD_TESTS)
         set_tests_properties(cell.e2e_serve PROPERTIES
             ENVIRONMENT "CELL_BIN=$<TARGET_FILE:cell_cli>"
             TIMEOUT 180)
+
+        # Context-window / empty-completion e2e: empty completion, reasoning-only
+        # (Ollama delta.reasoning and DeepSeek delta.reasoning_content), content
+        # filter, a provider that ignores stream=true, and multi-turn recovery
+        # after a failed turn — all against a mock provider on loopback.
+        add_test(NAME cell.e2e_context_overflow
+            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/e2e_context_overflow.py")
+        set_tests_properties(cell.e2e_context_overflow PROPERTIES
+            ENVIRONMENT "CELL_BIN=$<TARGET_FILE:cell_cli>"
+            TIMEOUT 180)
     endif()
 
     # cellui smoke: proves the desktop shell really carries the built front-end
