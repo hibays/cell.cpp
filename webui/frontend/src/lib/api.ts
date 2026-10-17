@@ -152,6 +152,11 @@ export interface UsageEvent {
   prompt_tokens: number
   request_ms: number
   decode_ms: number
+  /** The model's context window, this request's prompt size, and the resulting
+   *  occupancy percent (the reference harness's contextWindow / contextPressure). */
+  context_window?: number
+  context_tokens?: number
+  context_pct?: number
 }
 
 export type TurnEvent =

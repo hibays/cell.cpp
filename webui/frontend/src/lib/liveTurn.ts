@@ -23,6 +23,10 @@ export interface LiveUsage {
   /** Wall time of the requests themselves, and of the decode windows inside them. */
   requestMs: number
   decodeMs: number
+  /** Last-wins context occupancy (not summed): the newest request is the truth. */
+  contextWindow?: number
+  contextTokens?: number
+  contextPct?: number
 }
 
 export interface LiveTurn {
@@ -94,6 +98,10 @@ function accumulate(prev: LiveUsage | null, e: UsageEvent): LiveUsage {
     promptTokens: base.promptTokens + e.prompt_tokens,
     requestMs: base.requestMs + e.request_ms,
     decodeMs: base.decodeMs + e.decode_ms,
+    // last-wins: the newest request describes the context as it stands now
+    contextWindow: e.context_window ?? base.contextWindow,
+    contextTokens: e.context_tokens ?? base.contextTokens,
+    contextPct: e.context_pct ?? base.contextPct,
   }
 }
 

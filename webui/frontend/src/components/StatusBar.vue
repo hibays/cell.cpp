@@ -67,6 +67,22 @@ const shownTokens = computed(() => {
   return sessionUsage.value?.totalTokens
 })
 
+// Context occupancy of the newest request: the kernel's contextWindow /
+// contextPressure pair. It is last-wins (not summed) and only appears once the
+// kernel has reported the denominator, so an unknown window renders nothing
+// rather than a plausible zero.
+const contextUsage = computed(() => store.live?.usage ?? null)
+const contextLabel = computed(() => {
+  const u = contextUsage.value
+  if (!u || !u.contextWindow) return ''
+  return `ctx ${u.contextPct ?? 0}%`
+})
+const contextHint = computed(() => {
+  const u = contextUsage.value
+  if (!u || !u.contextWindow) return ''
+  return `上下文占用 ${formatCompact(u.contextTokens ?? 0)} / ${formatCompact(u.contextWindow)} tokens（${u.contextPct ?? 0}%）`
+})
+
 /** Install-wide totals, for the tooltip — the strip itself is session-scoped. */
 const installHint = computed(() => {
   const all = store.usage?.all
@@ -154,6 +170,12 @@ onUnmounted(() => {
     <span class="item" :title="installHint">
       {{ shownTokens === undefined ? '—' : formatCompact(shownTokens) }} tok
       <span class="dim">缓存命中 {{ shownHit === undefined ? '—' : formatPercent(shownHit) }}</span>
+    </span>
+    <span v-if="contextLabel" class="item" :title="contextHint">
+      {{ contextLabel }}
+      <span class="dim">
+        {{ formatCompact(contextUsage?.contextTokens ?? 0) }}/{{ formatCompact(contextUsage?.contextWindow ?? 0) }}
+      </span>
     </span>
     <span v-if="health" class="item mono dim" :title="`版本 ${health.version} · 会话 ${store.currentSession ?? '—'}`">
       {{ health.version }} · {{ store.currentSession?.slice(-6) ?? '—' }}

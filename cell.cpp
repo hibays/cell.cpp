@@ -6373,6 +6373,7 @@ namespace cell
             std::string base;             // api base url
             std::string key_id;           // vault map key for the api key (optional)
             std::string proxy;            // http(s) proxy url, e.g. http://user:pass@host:port (optional)
+            long long context_window = 0; // model context window in tokens; 0 = auto-detect
 
             // derive api_style from legacy style field; called after construction when api_style is not set
             void normalize_api_style()
@@ -6486,6 +6487,8 @@ namespace cell
                     j["key"] = key_id;
                 if (!proxy.empty())
                     j["proxy"] = proxy;
+                if (context_window > 0)
+                    j["context_window"] = context_window;
                 return j;
             }
             static provider_entry from_json(const nlohmann::json &j)
@@ -6497,6 +6500,7 @@ namespace cell
                 e.base = json_str(j, "base", "");
                 e.key_id = json_str(j, "key", "");
                 e.proxy = json_str(j, "proxy", "");
+                e.context_window = num_arg(j, "context_window", 0);
                 if (e.api_style.empty())
                     e.normalize_api_style();
                 return e;
@@ -6803,6 +6807,24 @@ namespace cell
             // that mattered: a failed load falls back to defaults, and the next save
             // would then persist an empty provider list over the real one.
             return plat::write_file_atomic(file(), j.dump(2));
+        }
+
+        // ---- model context window -------------------------------------------
+        // The capacity is metadata for accounting and compaction, aligned with the
+        // reference harness's contextWindow / contextPressure. A configured value
+        // wins; otherwise the provider is asked (Ollama reports its runtime window
+        // on /api/ps). 0 means "unknown", and the 4k-era threshold stays the floor
+        // so a local model with a small window keeps auto-compacting.
+        static long long context_compact_threshold(long long window)
+        {
+            return window > 0 ? (window * 3) / 4 : 3072; // 75% of the window, or the 4k default
+        }
+        static int context_percent(long long tokens, long long window)
+        {
+            if (tokens <= 0 || window <= 0)
+                return 0;
+            long long pct = (tokens * 100 + window - 1) / window; // ceil, so 3969/4096 reads 97
+            return (int)(pct > 100 ? 100 : pct);
         }
     } // namespace config
     // =========================================================================
@@ -7687,6 +7709,119 @@ namespace cell
             // cause, so compact and retry rather than report a dead end.
             ctx_pressure = (finish_reason == "length") || (pt > 0 && pt >= 3072);
             return diag;
+        }
+        // Auto-detect the runtime context window of a local Ollama server. Ollama's
+        // OpenAI-compatible base ends in /v1; the native API lives at the sibling
+        // /api/ps (the loaded instance's runtime window, honouring num_ctx) and
+        // /api/show (the model's maximum). A failed or non-Ollama endpoint is cached
+        // as 0, so a turn never pays the probe twice.
+        static long long detect_context_window(const std::string &base, const std::string &model,
+                                               const std::string &proxy, std::string &source)
+        {
+            source.clear();
+            if (base.empty() || model.empty())
+                return 0;
+            static std::unordered_map<std::string, std::pair<long long, std::string>> cache;
+            const std::string key = base + "|" + model;
+            if (auto it = cache.find(key); it != cache.end())
+            {
+                source = it->second.second;
+                return it->second.first;
+            }
+            std::string root = base;
+            while (!root.empty() && root.back() == '/')
+                root.pop_back();
+            if (root.ends_with("/v1"))
+                root.resize(root.size() - 3);
+            auto remember = [&](long long v, const char *src)
+            {
+                source = v > 0 ? src : "";
+                cache[key] = {v, source};
+                return v;
+            };
+            // Only probe a local server: a cloud OpenAI-compatible base has no
+            // /api/ps and must not receive an unexpected request for metadata.
+            bool local = base.find("://127.0.0.1") != std::string::npos ||
+                         base.find("://localhost") != std::string::npos ||
+                         base.find("://[::1]") != std::string::npos;
+            if (!local)
+                return remember(0, "");
+            CURL *c = curl_easy_init();
+            if (!c)
+                return remember(0, "");
+            const char *px = proxy.empty() ? nullptr : proxy.c_str();
+            // 1) /api/ps: the loaded instance's runtime context window (num_ctx)
+            {
+                std::string buf, err;
+                long code = 0;
+                bool ok = net::CURL_get(c, (root + "/api/ps").c_str(), {}, buf, &code, &err, px, 5);
+                if (ok && code == 200)
+                {
+                    auto j = nlohmann::json::parse(buf, nullptr, false);
+                    if (j.is_object() && j.contains("models") && j["models"].is_array())
+                        for (auto &m : j["models"])
+                        {
+                            std::string name = m.value("name", m.value("model", ""));
+                            if (name == model || name.rfind(model + ":", 0) == 0 || model.rfind(name + ":", 0) == 0)
+                            {
+                                long long v = num_arg(m, "context_length", 0);
+                                if (v > 0)
+                                {
+                                    curl_easy_cleanup(c);
+                                    return remember(v, "ollama /api/ps");
+                                }
+                            }
+                        }
+                }
+            }
+            // 2) /api/show: a Modelfile's num_ctx, else Ollama's default runtime window.
+            // The model_info.*.context_length is the architectural maximum (gemma4
+            // reports 131072 there while actually running with 4096), so it must NOT
+            // be used as the runtime denominator.
+            {
+                std::string buf, err;
+                long code = 0;
+                std::vector<std::string> hdrs = {"Content-Type: application/json"};
+                bool ok = net::CURL_post(c, (root + "/api/show").c_str(),
+                                         nlohmann::json{{"model", model}}.dump(), buf, hdrs, &err, px, &code);
+                if (ok && code == 200)
+                {
+                    auto j = nlohmann::json::parse(buf, nullptr, false);
+                    if (j.is_object())
+                    {
+                        std::string params = j.value("parameters", std::string());
+                        auto at = params.find("num_ctx");
+                        if (at != std::string::npos)
+                        {
+                            size_t i = at + 7;
+                            while (i < params.size() && (params[i] == ' ' || params[i] == '\t'))
+                                i++;
+                            long long v = 0;
+                            bool any = false;
+                            while (i < params.size() && params[i] >= '0' && params[i] <= '9')
+                            {
+                                v = v * 10 + (params[i] - '0');
+                                i++;
+                                any = true;
+                            }
+                            if (any && v > 0)
+                            {
+                                curl_easy_cleanup(c);
+                                return remember(v, "ollama num_ctx");
+                            }
+                        }
+                        if (j.contains("model_info") && j["model_info"].is_object())
+                        {
+                            // Ollama answers /api/show with model_info: its default
+                            // runtime window is 4k, which is what actually gets enforced
+                            curl_easy_cleanup(c);
+                            return remember(4096, "ollama default");
+                        }
+                    }
+                }
+            }
+            curl_easy_cleanup(c);
+            return remember(0, "");
         }
 
         // Flatten request-local content formats into the text forms accepted by
@@ -16938,6 +17073,7 @@ details{break-inside:avoid}
             // /v1/health snapshot, written by the core thread
             std::mutex snap_m;
             std::string provider_label, model_label, session_id, sandbox_mode;
+            long long context_window = 0; // resolved model context window; 0 = unknown
             long long started_at = (long long)std::time(nullptr);
 
             struct approval
@@ -16983,11 +17119,17 @@ details{break-inside:avoid}
                 session_id = s;
                 sandbox_mode = sandbox;
             }
+            void set_context_window(long long w)
+            {
+                std::lock_guard<std::mutex> lk(snap_m);
+                context_window = w;
+            }
             nlohmann::json snapshot_json()
             {
                 std::lock_guard<std::mutex> lk(snap_m);
                 return nlohmann::json{{"provider", provider_label}, {"model", model_label},
-                                      {"session", session_id}, {"sandbox_mode", sandbox_mode}};
+                                      {"session", session_id}, {"sandbox_mode", sandbox_mode},
+                                      {"context_window", context_window}};
             }
             void set_current(std::shared_ptr<turn_stream> ts)
             {
@@ -17749,6 +17891,7 @@ static void print_help()
     cell::sys::println("  /compact                    compress the current session context");
     cell::sys::println("  /compact auto [on|off]      show or toggle automatic compaction after long runs (default on)");
     cell::sys::println("  /compact model provider:model  set the compression model (registered providers only; `inherit` resets it)");
+    cell::sys::println("  /context [auto|N]           show the model context window and occupancy, or set it (auto re-detects)");
     cell::sys::println("  /ins TEXT                   interject user message and get a response");
     cell::sys::println("  /reload                     resume the interrupted turn (partial reply + interrupt notice are already in the transcript)");
     cell::sys::println("  /skills                     list available skills (.cell/skills/*.md)");
@@ -21017,6 +21160,25 @@ static int run_selftest()
         R.expect(!cell::chat::is_context_overflow("connection reset by peer") &&
                      !cell::chat::is_context_overflow(""),
                  "overflow: unrelated errors are not matches");
+        // model context window (manual / auto): the compaction threshold follows the
+        // resolved window at 75%, and the percent is the contextPressure ratio the GUI
+        // renders (3969/4096 -> 97%, clamped at 100%).
+        R.expect(cell::config::context_compact_threshold(4096) == 3072, "context: 4k window -> 75% threshold");
+        R.expect(cell::config::context_compact_threshold(8192) == 6144, "context: 8k window -> 75% threshold");
+        R.expect(cell::config::context_compact_threshold(0) == 3072, "context: unknown window -> 4k default");
+        R.expect(cell::config::context_percent(3969, 4096) == 97, "context: 3969/4096 -> 97%");
+        R.expect(cell::config::context_percent(0, 4096) == 0, "context: no tokens -> 0%");
+        R.expect(cell::config::context_percent(5000, 4096) == 100, "context: over the window -> clamped to 100%");
+        R.expect(cell::config::context_percent(100, 0) == 0, "context: unknown window -> 0%");
+        {
+            // manual context_window survives a config round-trip
+            cell::config::provider_entry pe;
+            pe.name = "ctx-test";
+            pe.base = "http://127.0.0.1:1/v1";
+            pe.context_window = 32768;
+            auto back = cell::config::provider_entry::from_json(pe.to_json());
+            R.expect(back.context_window == 32768, "context: manual context_window round-trips through config.json");
+        }
         {
             nlohmann::json parts = nlohmann::json::array({
                 {{"role", "assistant"}, {"content", nlohmann::json::array({
@@ -22095,6 +22257,19 @@ int repl::run()
         if (env && *env)
             return cell::encrypt::secure_string(env);
         return vault.get("api_key");
+    };
+
+    // The effective model context window, aligned with the reference harness's
+    // contextWindow: a configured value wins, otherwise the provider is asked
+    // (Ollama's /api/ps reports its runtime window), and 0 means "unknown".
+    auto resolve_ctx_window = [&](const cell::config::provider_entry &p,
+                                  const std::string &model) -> std::pair<long long, std::string>
+    {
+        if (p.context_window > 0)
+            return {p.context_window, "manual"};
+        std::string src;
+        long long v = cell::llm::detect_context_window(p.base, model, p.proxy, src);
+        return {v > 0 ? v : 0, v > 0 ? src : "unknown"};
     };
 
     // tool definitions for all API styles
@@ -23214,6 +23389,14 @@ int repl::run()
                         ui.timer_line = false;
                         ui.tok_line = false;
                     }
+                    // Resolve the model's context window once per request (the
+                    // detector caches it) so the usage frame carries the denominator
+                    // the CLI and the GUI render as context occupancy.
+                    long long ctx_window = 0;
+                    std::string ctx_source;
+                    if (p)
+                        std::tie(ctx_window, ctx_source) = resolve_ctx_window(*p, cfg.current_model);
+                    serve_bridge.set_context_window(ctx_window); // /v1/health carries it
                     // What this request cost. The strip's decode rate and cache
                     // hit come from here; the decoder window is measured from the
                     // first token, not from the request, which also includes the
@@ -23221,12 +23404,16 @@ int repl::run()
                     if (usage.is_object() && !usage.empty())
                     {
                         auto cc = usage_cache_counts(usage);
+                        long long ctx_tokens = usage_in(usage).value_or(0);
                         cell::events::emit("usage",
-                                           {{"in_tokens", usage_in(usage).value_or(0)},
+                                           {{"in_tokens", ctx_tokens},
                                             {"out_tokens", usage_out(usage).value_or(0)},
                                             {"total_tokens", usage_total(usage).value_or(0)},
                                             {"cached_tokens", cc ? cc->first : 0},
                                             {"prompt_tokens", cc ? cc->second : 0},
+                                            {"context_window", ctx_window},
+                                            {"context_tokens", ctx_tokens},
+                                            {"context_pct", cell::config::context_percent(ctx_tokens, ctx_window)},
                                             {"request_ms", cell::sys::elapsed_ms(ui.t0)},
                                             {"decode_ms", ui.got ? cell::sys::elapsed_ms(ui.tok0) : 0}});
                     }
@@ -23246,7 +23433,10 @@ int repl::run()
                         // Ollama's OpenAI-compatible endpoint reports no usage, so fall
                         // back to the prompt's character count (~4 chars/token) to keep
                         // the 4k-window case on the auto-compact path instead of failing.
-                        bool ctx_pressure = (pt > 0 && pt >= 3072) || (pt < 0 && in_chars >= 12000);
+                        // The threshold follows the resolved window (75%), not a fixed
+                        // 3072, so a configured/detected 8k window compacts later.
+                        long long thr = cell::config::context_compact_threshold(ctx_window);
+                        bool ctx_pressure = (pt > 0 && pt >= thr) || (pt < 0 && in_chars >= thr * 4);
                         if (ctx_pressure)
                             err = std::format("provider returned reasoning but no answer (prompt_tokens={}) — the conversation likely exceeded the model context window; auto-compacting and retrying", pt > 0 ? std::to_string(pt) : std::string("n/a"));
                         else if (err.empty())
@@ -23745,6 +23935,42 @@ int repl::run()
             {"/help", [&](const std::vector<std::string> &, std::string &) -> cmd_flow
             {
                     print_help();
+                    return cmd_flow::handled;
+            }},
+            {"/context", [&](const std::vector<std::string> &toks, std::string &) -> cmd_flow
+            {
+                    cell::config::provider_entry *p = cfg.current_provider_entry();
+                    if (!p)
+                    {
+                            cell::sys::println("no provider configured - add one with /provider first");
+                            return cmd_flow::handled;
+                    }
+                    if (toks.size() >= 2)
+                    {
+                            std::string arg = cell::box::to_lower(cell::text::trim(toks[1]));
+                            long long v = 0;
+                            if (arg != "auto")
+                            {
+                                    try { v = std::stoll(arg); } catch (...) { v = -1; }
+                                    if (v <= 0)
+                                    {
+                                            cell::sys::error("usage: /context [auto|<tokens>]  (e.g. /context 4096)");
+                                            return cmd_flow::handled;
+                                    }
+                            }
+                            p->context_window = v;
+                            if (!cell::config::save(cfg))
+                                    cell::sys::error("cannot save config.json");
+                            else
+                                    cell::sys::println("context window: {}", v > 0 ? std::format("{} (manual)", v) : "auto");
+                    }
+                    auto [win, src] = resolve_ctx_window(*p, cfg.current_model);
+                    cell::sys::println("model: {}", cfg.model_label());
+                    if (win > 0)
+                            cell::sys::println("context window: {} tokens ({})", win, src);
+                    else
+                            cell::sys::println("context window: unknown (set one with /context <tokens>)");
+                    cell::sys::println("auto-compact threshold: {} tokens (~75%)", cell::config::context_compact_threshold(win));
                     return cmd_flow::handled;
             }},
             {"/save", [&](const std::vector<std::string> &, std::string &) -> cmd_flow
@@ -25370,6 +25596,9 @@ int repl::run()
                                    {"model", snap["model"]},
                                    {"session", snap["session"]},
                                    {"sandbox_mode", snap["sandbox_mode"]},
+                                   // the resolved model context window (0 = unknown),
+                                   // so a client can render occupancy without a turn
+                                   {"context_window", snap["context_window"]},
                                    // where the state lives and whether settings can
                                    // be written at all: a client that cannot save
                                    // should say so instead of asking again later

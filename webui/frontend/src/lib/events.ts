@@ -113,6 +113,9 @@ export function parseEvent(raw: unknown): TurnEvent | null {
           prompt_tokens: num(data['prompt_tokens']),
           request_ms: num(data['request_ms']),
           decode_ms: num(data['decode_ms']),
+          context_window: num(data['context_window']),
+          context_tokens: num(data['context_tokens']),
+          context_pct: num(data['context_pct']),
         },
       }
     case 'interrupt':
