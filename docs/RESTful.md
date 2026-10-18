@@ -108,7 +108,7 @@ was refused.
 
 | Status | Endpoint | Notes |
 | --- | --- | --- |
-| ✅ | `GET /v1/health` | liveness plus `{root, root_writable}` — where settings/sessions/vault live and whether that place accepts a write. A root that cannot be written is why a client would re-ask for its endpoint on every launch, so it is reported rather than discovered | **no auth**; `{status, version, uptime_s, provider, model, session, sandbox_mode, turn_active}` — snapshot refreshed by the core thread |
+| ✅ | `GET /v1/health` | liveness plus `{root, root_writable}` — where settings/sessions/vault live and whether that place accepts a write. A root that cannot be written is why a client would re-ask for its endpoint on every launch, so it is reported rather than discovered | **no auth**; `{status, version, uptime_s, provider, model, session, sandbox_mode, context_window, turn_active}` — snapshot refreshed by the core thread (`context_window` is 0 until a turn resolves it) |
 | ✅ | `GET /v1/version` | `{version}` |
 | ✅ | `POST /v1/shutdown` | graceful stop; the core loop drains, the server closes, exit code 0 |
 
@@ -293,10 +293,10 @@ Each event is one `data: <json>` line; the JSON is `{"type": …, "data": {…}}
 | ✅ | `turn_done` | `{rc, interrupted}` | terminal: the turn's verdict — `rc` 0 finished, 1 aborted (no model/key, provider error, round limit); `interrupted` marks a user cancel, the one abort that is not a failure (§3.5) |
 | ✅ | `error` | `{code, message}` | on an aborted turn, immediately before `turn_done`: `turn_error` names the cause (and for a 404, the `/v1` fix). Also raised for capture/internal failures inside a turn |
 | ✅ | `token` | `{text}` | one assistant text delta, as decoded from the provider stream. A GUI renders this instead of the raw `output` capture |
-| ✅ | `reasoning` | `{text}` | one chain-of-thought delta (OpenAI `reasoning_content`, Anthropic thinking) |
+| ✅ | `reasoning` | `{text}` | one chain-of-thought delta (`reasoning_content` for DeepSeek/vLLM, `reasoning` for Ollama's OpenAI-compatible stream, `thinking` for some proxies, Anthropic thinking) |
 | ✅ | `tool_call` | `{id, name, args}` | the model proposed a tool call, before any sandbox decision |
 | ✅ | `tool_result` | `{id, name, status, seconds, output, truncated}` | that call finished; `id` is the pairing key (two calls to the same tool is the normal case). `status` is the kernel's `ok`/`failed`/`unknown`/`exception`/`blocked`, and `output` is capped at 16 KiB with `truncated` set — the full text is in the transcript |
-| ✅ | `usage` | `{in_tokens, out_tokens, total_tokens, cached_tokens, prompt_tokens, request_ms, decode_ms}` | one measurement per LLM request (a turn with tool calls has several). `decode_ms` runs from the first token, so `out_tokens / decode_ms` is a decode rate rather than a flattered one |
+| ✅ | `usage` | `{in_tokens, out_tokens, total_tokens, cached_tokens, prompt_tokens, request_ms, decode_ms, context_window, context_tokens, context_pct}` | one measurement per LLM request (a turn with tool calls has several). `decode_ms` runs from the first token, so `out_tokens / decode_ms` is a decode rate rather than a flattered one. `context_window` is the resolved model window (0 = unknown), `context_tokens` this request's prompt size, and `context_pct` its occupancy (the reference harness's contextWindow / contextPressure) |
 | ✅ | `interrupt` | `{partial_chars}` | a cancel was observed: the partial answer is final, not still arriving |
 | ✅ | `notice` | `{id, session, from, topic, body, created_at}` | a notice posted for the session that stream belongs to. Notices are still queued for `GET /v1/notices` (the CLI polls); the event is the shell's way of seeing one arrive. A notice for another session is dropped by the stream's sink |
 
