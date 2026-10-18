@@ -181,7 +181,7 @@ class Serve:
             return json.loads(r.read().decode())["id"]
 
     def turn(self, sid, text="hi"):
-        out, errors, done = [], [], None
+        errors, done = [], None
         self.usage = None
         self.tokens, self.reasoning, self.stdout = [], [], []
         with self.api("POST", f"/sessions/{sid}/turn", {"text": text}, stream=True) as r:
