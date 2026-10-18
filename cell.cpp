@@ -6373,7 +6373,13 @@ namespace cell
             std::string base;             // api base url
             std::string key_id;           // vault map key for the api key (optional)
             std::string proxy;            // http(s) proxy url, e.g. http://user:pass@host:port (optional)
-            long long context_window = 0; // model context window in tokens; 0 = auto-detect
+            // Manual context windows keyed by MODEL: one provider can serve models
+            // with very different windows (a 4k gemma next to a 128k qwen), so a
+            // provider-wide value would be wrong. Absent = auto-detect that model.
+            std::unordered_map<std::string, long long> model_context_windows;
+            // transient: the pre-0.1.12 provider-wide "context_window", migrated to
+            // model_context_windows[current_model] at load and never written back
+            long long legacy_context_window = 0;
 
             // derive api_style from legacy style field; called after construction when api_style is not set
             void normalize_api_style()
@@ -6487,8 +6493,15 @@ namespace cell
                     j["key"] = key_id;
                 if (!proxy.empty())
                     j["proxy"] = proxy;
-                if (context_window > 0)
-                    j["context_window"] = context_window;
+                if (!model_context_windows.empty())
+                {
+                    nlohmann::json wins = nlohmann::json::object();
+                    for (auto &[m, v] : model_context_windows)
+                        if (!m.empty() && v > 0)
+                            wins[m] = v;
+                    if (!wins.empty())
+                        j["model_context_windows"] = std::move(wins);
+                }
                 return j;
             }
             static provider_entry from_json(const nlohmann::json &j)
@@ -6500,7 +6513,13 @@ namespace cell
                 e.base = json_str(j, "base", "");
                 e.key_id = json_str(j, "key", "");
                 e.proxy = json_str(j, "proxy", "");
-                e.context_window = num_arg(j, "context_window", 0);
+                // legacy provider-wide value: settings::load migrates it to the
+                // active model once current_model is known
+                e.legacy_context_window = num_arg(j, "context_window", 0);
+                if (j.contains("model_context_windows") && j["model_context_windows"].is_object())
+                    for (auto &[m, v] : j["model_context_windows"].items())
+                        if (!m.empty() && v.is_number_integer() && v.get<long long>() > 0)
+                            e.model_context_windows[m] = v.get<long long>();
                 if (e.api_style.empty())
                     e.normalize_api_style();
                 return e;
@@ -6746,6 +6765,13 @@ namespace cell
                         s.current_model = json_str(j, "model", "");
                     }
                 }
+                // migrate the pre-0.1.12 provider-wide context_window to the model
+                // that was active when it was written (it was set per current model
+                // via /context N); never apply it to every model on the provider
+                if (!s.current_model.empty())
+                    for (auto &p : s.providers)
+                        if (p.legacy_context_window > 0 && p.model_context_windows.empty())
+                            p.model_context_windows[s.current_model] = p.legacy_context_window;
                 s.system_prompt = json_str(j, "system", s.system_prompt);
                 s.session_id = json_str(j, "session", s.session_id);
                 s.teamwork_max_children = std::clamp(num_arg(j, "teamwork_max_children", 5), (size_t)1, (size_t)100);
@@ -6825,6 +6851,12 @@ namespace cell
                 return 0;
             long long pct = (tokens * 100 + window - 1) / window; // ceil, so 3969/4096 reads 97
             return (int)(pct > 100 ? 100 : pct);
+        }
+        // Manual window for one model; 0 = no override (auto-detect that model).
+        static long long model_context_window(const provider_entry &p, const std::string &model)
+        {
+            auto it = p.model_context_windows.find(model);
+            return it != p.model_context_windows.end() ? it->second : 0;
         }
         // Parse a capacity as the settings plane quotes it: "4096", "8k", "1m"
         // (decimal suffixes, 1m = 1000k). Returns 0 on malformed input. Using
@@ -7730,7 +7762,8 @@ namespace cell
         // reports whether the cause is context-window overflow so the caller can
         // auto-compact and retry instead of failing the turn.
         static std::string empty_completion_diagnostic(const std::string &finish_reason,
-                                                        const nlohmann::json &usage, bool &ctx_pressure)
+                                                        const nlohmann::json &usage, bool &ctx_pressure,
+                                                        long long compact_threshold = 3072)
         {
             long long pt = -1;
             if (usage.contains("prompt_tokens") && usage["prompt_tokens"].is_number_integer())
@@ -7743,10 +7776,12 @@ namespace cell
                 diag += std::format("; prompt_tokens={}", pt);
             if (finish_reason == "content_filter")
                 diag += " — the response was filtered by the provider";
-            // finish_reason=length is the definitive overflow signal; for local
-            // models a large prompt with no content is almost always the same
-            // cause, so compact and retry rather than report a dead end.
-            ctx_pressure = (finish_reason == "length") || (pt > 0 && pt >= 3072);
+            // finish_reason=length means the provider stopped at a limit, but with a
+            // KNOWN small prompt on a large window it is an output max_tokens limit:
+            // compacting cannot fix that and would discard context for nothing. With
+            // no usage at all, keep the conservative length-means-pressure behaviour.
+            // The caller passes the model's 75% threshold (3072 is the 4k default).
+            ctx_pressure = pt > 0 ? (pt >= compact_threshold) : (finish_reason == "length");
             return diag;
         }
         // Auto-detect the runtime context window of a local Ollama server. Ollama's
@@ -8120,7 +8155,7 @@ namespace cell
                 }
             }
 
-            bool chat_stream(const encrypt::secure_string &api_key, const std::string &model, const nlohmann::json &messages, const nlohmann::json &tools, net::StreamCallback on_token, net::StreamCallback on_reason, nlohmann::json &reply, nlohmann::json &tool_calls, nlohmann::json &usage, std::string &err, net::XferCallback on_xfer = nullptr, void *xfer_data = nullptr, long *http_status = nullptr)
+            bool chat_stream(const encrypt::secure_string &api_key, const std::string &model, const nlohmann::json &messages, const nlohmann::json &tools, net::StreamCallback on_token, net::StreamCallback on_reason, nlohmann::json &reply, nlohmann::json &tool_calls, nlohmann::json &usage, std::string &err, net::XferCallback on_xfer = nullptr, void *xfer_data = nullptr, long *http_status = nullptr, long long compact_threshold = 3072)
             {
                 tool_calls = nlohmann::json::array();
                 usage = nlohmann::json::object();
@@ -8299,7 +8334,7 @@ namespace cell
                     if (text.empty() && reasoning.empty())
                     {
                         bool ctx_pressure = false;
-                        std::string diag = empty_completion_diagnostic(finish_reason, usage, ctx_pressure);
+                        std::string diag = empty_completion_diagnostic(finish_reason, usage, ctx_pressure, compact_threshold);
                         if (ctx_pressure)
                         {
                             err = diag + " — the conversation likely exceeded the model context window; auto-compacting and retrying";
@@ -8324,7 +8359,7 @@ namespace cell
                         pt = (long long)usage["prompt_tokens"];
                     else if (usage.contains("input_tokens") && usage["input_tokens"].is_number_integer())
                         pt = (long long)usage["input_tokens"];
-                    if (pt >= 3072)
+                    if (pt >= compact_threshold)
                     {
                         err = std::format("provider stopped at the context window limit (finish_reason=length, prompt_tokens={}) — the reply was truncated; auto-compacting and retrying", pt);
                         ok = false; // run_turn's is_context_overflow(err) compacts + retries
@@ -8659,7 +8694,7 @@ namespace cell
                 }
             }
 
-            bool chat_stream(const encrypt::secure_string &api_key, const std::string &model, const nlohmann::json &messages, const nlohmann::json &tools, net::StreamCallback on_token, net::StreamCallback on_reason, nlohmann::json &reply, nlohmann::json &tool_calls, nlohmann::json &usage, std::string &err, net::XferCallback on_xfer = nullptr, void *xfer_data = nullptr, long *http_status = nullptr)
+            bool chat_stream(const encrypt::secure_string &api_key, const std::string &model, const nlohmann::json &messages, const nlohmann::json &tools, net::StreamCallback on_token, net::StreamCallback on_reason, nlohmann::json &reply, nlohmann::json &tool_calls, nlohmann::json &usage, std::string &err, net::XferCallback on_xfer = nullptr, void *xfer_data = nullptr, long *http_status = nullptr, long long compact_threshold = 3072)
             {
                 (void)on_reason; // Responses API uses encrypted reasoning, not plaintext deltas
                 tool_calls = nlohmann::json::array();
@@ -8904,7 +8939,7 @@ namespace cell
                         pt = (long long)usage["prompt_tokens"];
                     else if (usage.contains("input_tokens") && usage["input_tokens"].is_number_integer())
                         pt = (long long)usage["input_tokens"];
-                    if (pt >= 3072)
+                    if (pt >= compact_threshold)
                     {
                         err = std::format("provider stopped at the context window limit (finish_reason=length, prompt_tokens={}) — the reply was truncated; auto-compacting and retrying", pt);
                         ok = false; // run_turn's is_context_overflow(err) compacts + retries
@@ -8917,7 +8952,7 @@ namespace cell
                 if (ok && text.empty() && reasoning.empty() && tool_calls.empty())
                 {
                     bool ctx_pressure = false;
-                    std::string diag = empty_completion_diagnostic(finish_reason, usage, ctx_pressure);
+                    std::string diag = empty_completion_diagnostic(finish_reason, usage, ctx_pressure, compact_threshold);
                     if (ctx_pressure)
                     {
                         err = diag + " — the conversation likely exceeded the model context window; auto-compacting and retrying";
@@ -9157,7 +9192,7 @@ namespace cell
                 }
             }
 
-            bool chat_stream(const encrypt::secure_string &api_key, const std::string &model, const nlohmann::json &messages, const nlohmann::json &tools, net::StreamCallback on_token, net::StreamCallback on_reason, nlohmann::json &reply, nlohmann::json &tool_calls, nlohmann::json &usage, std::string &err, int think_level = 0, net::XferCallback on_xfer = nullptr, void *xfer_data = nullptr, long *http_status = nullptr)
+            bool chat_stream(const encrypt::secure_string &api_key, const std::string &model, const nlohmann::json &messages, const nlohmann::json &tools, net::StreamCallback on_token, net::StreamCallback on_reason, nlohmann::json &reply, nlohmann::json &tool_calls, nlohmann::json &usage, std::string &err, int think_level = 0, net::XferCallback on_xfer = nullptr, void *xfer_data = nullptr, long *http_status = nullptr, long long compact_threshold = 3072)
             {
                 tool_calls = nlohmann::json::array();
                 usage = nlohmann::json::object();
@@ -9325,7 +9360,7 @@ namespace cell
                         pt = (long long)usage["prompt_tokens"];
                     else if (usage.contains("input_tokens") && usage["input_tokens"].is_number_integer())
                         pt = (long long)usage["input_tokens"];
-                    if (pt >= 3072)
+                    if (pt >= compact_threshold)
                     {
                         err = std::format("provider stopped at the context window limit (finish_reason=length, prompt_tokens={}) — the reply was truncated; auto-compacting and retrying", pt);
                         ok = false; // run_turn's is_context_overflow(err) compacts + retries
@@ -9348,7 +9383,7 @@ namespace cell
                 if (ok && !anthropic_has_content && tool_calls.empty())
                 {
                     bool ctx_pressure = false;
-                    std::string diag = empty_completion_diagnostic(finish_reason, usage, ctx_pressure);
+                    std::string diag = empty_completion_diagnostic(finish_reason, usage, ctx_pressure, compact_threshold);
                     if (ctx_pressure)
                     {
                         err = diag + " — the conversation likely exceeded the model context window; auto-compacting and retrying";
@@ -21247,13 +21282,33 @@ static int run_selftest()
         R.expect(cell::config::parse_token_count("0") == 0, "context: zero is rejected");
         R.expect(cell::config::parse_token_count("") == 0, "context: empty is rejected");
         {
-            // manual context_window survives a config round-trip
+            // per-model windows survive a config round-trip and stay independent:
+            // one provider can serve a 4k model next to a 128k one
             cell::config::provider_entry pe;
             pe.name = "ctx-test";
             pe.base = "http://127.0.0.1:1/v1";
-            pe.context_window = 32768;
+            pe.model_context_windows["gemma4:e2b-it-qat"] = 4096;
+            pe.model_context_windows["qwen3:32b"] = 32768;
             auto back = cell::config::provider_entry::from_json(pe.to_json());
-            R.expect(back.context_window == 32768, "context: manual context_window round-trips through config.json");
+            R.expect(back.model_context_windows.size() == 2 &&
+                         cell::config::model_context_window(back, "gemma4:e2b-it-qat") == 4096 &&
+                         cell::config::model_context_window(back, "qwen3:32b") == 32768,
+                     "context: per-model windows round-trip and stay independent");
+            R.expect(cell::config::model_context_window(back, "unlisted:1b") == 0,
+                     "context: an unlisted model has no manual override (auto-detect)");
+        }
+        {
+            // the empty-completion diagnostic must use the model's threshold, not a
+            // fixed 3072: a 4k prompt on a 32k window is not context pressure
+            bool cp = false;
+            cell::llm::empty_completion_diagnostic("stop", {{"prompt_tokens", 4000}}, cp, 24576);
+            R.expect(!cp, "context: 4k prompt on a 32k window is not pressure");
+            cell::llm::empty_completion_diagnostic("stop", {{"prompt_tokens", 4000}}, cp, 3072);
+            R.expect(cp, "context: 4k prompt on a 4k window is pressure");
+            cell::llm::empty_completion_diagnostic("length", {{"prompt_tokens", 4000}}, cp, 24576);
+            R.expect(!cp, "context: length with a small prompt on a 32k window is an output limit");
+            cell::llm::empty_completion_diagnostic("length", nlohmann::json::object(), cp, 24576);
+            R.expect(cp, "context: length with no usage stays conservative (pressure)");
         }
         {
             nlohmann::json parts = nlohmann::json::array({
@@ -22342,8 +22397,8 @@ int repl::run()
                                   const std::string &model,
                                   bool refresh = false) -> std::pair<long long, std::string>
     {
-        if (p.context_window > 0)
-            return {p.context_window, "manual"};
+        if (long long manual = cell::config::model_context_window(p, model); manual > 0)
+            return {manual, "manual"};
         std::string src;
         long long v = cell::llm::detect_context_window(p.base, model, p.proxy, src, refresh);
         return {v > 0 ? v : 0, v > 0 ? src : "unknown"};
@@ -22366,7 +22421,7 @@ int repl::run()
                        nlohmann::json &tc, nlohmann::json &usage, std::string &err,
                        bool with_tools = true, int think_level = 0,
                        cell::net::XferCallback on_xfer = nullptr, void *xfer_data = nullptr,
-                       long *http_status = nullptr) -> bool
+                       long *http_status = nullptr, long long compact_threshold = 3072) -> bool
     {
         nlohmann::json no_tools = nlohmann::json::array();
         if (p.api_style == "anthropic")
@@ -22375,7 +22430,7 @@ int repl::run()
             auto &client = cache.a(p.base);
             client.set_proxy(p.proxy);
             if (stream)
-                return client.chat_stream(key, model, msgs, tools, std::move(on_tok), std::move(on_reason), reply, tc, usage, err, think_level, on_xfer, xfer_data, http_status);
+                return client.chat_stream(key, model, msgs, tools, std::move(on_tok), std::move(on_reason), reply, tc, usage, err, think_level, on_xfer, xfer_data, http_status, compact_threshold);
             return client.chat(key, model, msgs, tools, reply, tc, usage, err, think_level, http_status);
         }
         if (p.api_style == "openai-responses")
@@ -22384,7 +22439,7 @@ int repl::run()
             auto &client = cache.r(p.base);
             client.set_proxy(p.proxy);
             if (stream)
-                return client.chat_stream(key, model, msgs, tools, std::move(on_tok), std::move(on_reason), reply, tc, usage, err, on_xfer, xfer_data, http_status);
+                return client.chat_stream(key, model, msgs, tools, std::move(on_tok), std::move(on_reason), reply, tc, usage, err, on_xfer, xfer_data, http_status, compact_threshold);
             return client.chat(key, model, msgs, tools, reply, tc, usage, err, http_status);
         }
         // default: openai-chat (Chat Completions)
@@ -22392,7 +22447,7 @@ int repl::run()
         auto &client = cache.o(p.base);
         client.set_proxy(p.proxy);
         if (stream)
-            return client.chat_stream(key, model, msgs, tools, std::move(on_tok), std::move(on_reason), reply, tc, usage, err, on_xfer, xfer_data, http_status);
+            return client.chat_stream(key, model, msgs, tools, std::move(on_tok), std::move(on_reason), reply, tc, usage, err, on_xfer, xfer_data, http_status, compact_threshold);
         return client.chat(key, model, msgs, tools, reply, tc, usage, err, http_status);
     };
 
@@ -23468,7 +23523,17 @@ int repl::run()
                     // back from disk) must not leave it behind the conversation
                     cell::chat::fold_system_messages(h.now().msg());
                     http_status = 0;
-                    ok = do_chat(*p, key, cfg.current_model, h.now().msg(), true, std::move(tok_cb), std::move(reason_cb), nullptr, reply, tool_calls, usage, err, cfg.tools, cfg.think_level, xfer_cb, &ui, &http_status);
+                    // Resolve the model's context window once per request (the
+                    // detector caches it): the clients need its 75% compact
+                    // threshold for the empty-completion/truncation checks, and the
+                    // usage frame carries it as the denominator.
+                    long long ctx_window = 0;
+                    std::string ctx_source;
+                    if (p)
+                        std::tie(ctx_window, ctx_source) = resolve_ctx_window(*p, cfg.current_model);
+                    serve_bridge.set_context_window(ctx_window); // /v1/health carries it
+                    long long compact_threshold = cell::config::context_compact_threshold(ctx_window);
+                    ok = do_chat(*p, key, cfg.current_model, h.now().msg(), true, std::move(tok_cb), std::move(reason_cb), nullptr, reply, tool_calls, usage, err, cfg.tools, cfg.think_level, xfer_cb, &ui, &http_status, compact_threshold);
                     if (ui.timer_line || ui.tok_line)
                     {
                         if (cell::sys::detail::color_enabled)
@@ -23480,14 +23545,9 @@ int repl::run()
                         ui.timer_line = false;
                         ui.tok_line = false;
                     }
-                    // Resolve the model's context window once per request (the
-                    // detector caches it) so the usage frame carries the denominator
-                    // the CLI and the GUI render as context occupancy.
-                    long long ctx_window = 0;
-                    std::string ctx_source;
-                    if (p)
-                        std::tie(ctx_window, ctx_source) = resolve_ctx_window(*p, cfg.current_model);
-                    serve_bridge.set_context_window(ctx_window); // /v1/health carries it
+                    // ctx_window / compact_threshold were resolved before the request
+                    // (the clients need the threshold); the usage frame below reuses
+                    // them as the occupancy denominator.
                     // What this request cost. The strip's decode rate and cache
                     // hit come from here; the decoder window is measured from the
                     // first token, not from the request, which also includes the
@@ -23524,10 +23584,10 @@ int repl::run()
                         // Ollama's OpenAI-compatible endpoint reports no usage, so fall
                         // back to the prompt's character count (~4 chars/token) to keep
                         // the 4k-window case on the auto-compact path instead of failing.
-                        // The threshold follows the resolved window (75%), not a fixed
-                        // 3072, so a configured/detected 8k window compacts later.
-                        long long thr = cell::config::context_compact_threshold(ctx_window);
-                        bool ctx_pressure = (pt > 0 && pt >= thr) || (pt < 0 && in_chars >= thr * 4);
+                        // context_compact_threshold(ctx_window) was computed before the
+                        // request, so the empty-completion, truncation and
+                        // reasoning-only paths all share one denominator.
+                        bool ctx_pressure = (pt > 0 && pt >= compact_threshold) || (pt < 0 && in_chars >= compact_threshold * 4);
                         if (ctx_pressure)
                             err = std::format("provider returned reasoning but no answer (prompt_tokens={}) — the conversation likely exceeded the model context window; auto-compacting and retrying", pt > 0 ? std::to_string(pt) : std::string("n/a"));
                         else if (err.empty())
@@ -24042,25 +24102,28 @@ int repl::run()
                     if (toks.size() >= 2)
                     {
                             std::string arg = cell::box::to_lower(cell::text::trim(toks[1]));
-                            long long v = 0;
                             if (arg == "auto")
                             {
                                     refresh = true; // discard the cached probe and ask again
+                                    p->model_context_windows.erase(cfg.current_model);
                             }
                             else
                             {
-                                    v = cell::config::parse_token_count(arg);
+                                    long long v = cell::config::parse_token_count(arg);
                                     if (v <= 0)
                                     {
                                             cell::sys::error("usage: /context [auto|<tokens>]  (e.g. /context 4096, /context 128k)");
                                             return cmd_flow::handled;
                                     }
+                                    // per model: another model on this provider keeps
+                                    // its own window (or its own auto-detection)
+                                    p->model_context_windows[cfg.current_model] = v;
                             }
-                            p->context_window = v;
                             if (!cell::config::save(cfg))
                                     cell::sys::error("cannot save config.json");
                             else
-                                    cell::sys::println("context window: {}", v > 0 ? std::format("{} (manual)", v) : "auto");
+                                    cell::sys::println("context window for {}: {}", cfg.current_model,
+                                                       arg == "auto" ? std::string("auto") : std::format("{} (manual)", p->model_context_windows[cfg.current_model]));
                     }
                     auto [win, src] = resolve_ctx_window(*p, cfg.current_model, refresh);
                     cell::sys::println("model: {}", cfg.model_label());
