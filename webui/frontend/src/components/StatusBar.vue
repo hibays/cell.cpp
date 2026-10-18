@@ -77,7 +77,9 @@ const contextUsage = computed(() => store.live?.usage ?? null)
 // The denominator can come from /v1/health before any request reports usage
 // (Ollama's OpenAI-compatible endpoint reports none): show the window, and leave
 // occupancy as a dash until a real request supplies the numerator.
-const contextWindow = computed(() => contextUsage.value?.contextWindow ?? health.value?.context_window ?? 0)
+// `||`, not `??`: an unknown window is reported as 0, and that must fall back
+// to the window /v1/health knows instead of hiding the known denominator.
+const contextWindow = computed(() => contextUsage.value?.contextWindow || health.value?.context_window || 0)
 const contextTokens = computed(() => contextUsage.value?.contextTokens)
 const contextLabel = computed(() => {
   if (!contextWindow.value) return ''

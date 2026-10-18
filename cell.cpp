@@ -6826,6 +6826,45 @@ namespace cell
             long long pct = (tokens * 100 + window - 1) / window; // ceil, so 3969/4096 reads 97
             return (int)(pct > 100 ? 100 : pct);
         }
+        // Parse a capacity as the settings plane quotes it: "4096", "8k", "1m"
+        // (decimal suffixes, 1m = 1000k). Returns 0 on malformed input. Using
+        // stoll directly would silently read "8k" as 8 (its numeric prefix).
+        static long long parse_token_count(std::string s)
+        {
+            auto space = [](char c)
+            { return c == ' ' || c == '\t' || c == '\r' || c == '\n'; };
+            size_t b = 0, e = s.size();
+            while (b < e && space(s[b]))
+                b++;
+            while (e > b && space(s[e - 1]))
+                e--;
+            s = s.substr(b, e - b);
+            lower_ascii(s);
+            long long mult = 1;
+            if (!s.empty() && s.back() == 'k')
+            {
+                mult = 1000;
+                s.pop_back();
+            }
+            else if (!s.empty() && s.back() == 'm')
+            {
+                mult = 1000000;
+                s.pop_back();
+            }
+            if (s.empty())
+                return 0;
+            long long v = 0;
+            for (char ch : s)
+            {
+                if (ch < '0' || ch > '9')
+                    return 0;
+                v = v * 10 + (ch - '0');
+                if (v > 10000000)
+                    return 0; // absurd input, and keeps the multiply below in range
+            }
+            v *= mult;
+            return (v > 0 && v <= 100000000) ? v : 0;
+        }
     } // namespace config
     // =========================================================================
     //  encrypt — the credential vault: base64, secure_string (sodium_malloc
@@ -7716,23 +7755,27 @@ namespace cell
         // /api/show (the model's maximum). A failed or non-Ollama endpoint is cached
         // as 0, so a turn never pays the probe twice.
         static long long detect_context_window(const std::string &base, const std::string &model,
-                                               const std::string &proxy, std::string &source)
+                                               const std::string &proxy, std::string &source,
+                                               bool refresh = false)
         {
             source.clear();
             if (base.empty() || model.empty())
                 return 0;
-            static std::unordered_map<std::string, std::pair<long long, std::string>> cache;
-            const std::string key = base + "|" + model;
-            if (auto it = cache.find(key); it != cache.end())
-            {
-                source = it->second.second;
-                return it->second.first;
-            }
+            // normalise the base before keying: ".../v1" and ".../v1/" are the same
+            // server and must share one cache entry
             std::string root = base;
             while (!root.empty() && root.back() == '/')
                 root.pop_back();
             if (root.ends_with("/v1"))
                 root.resize(root.size() - 3);
+            static std::unordered_map<std::string, std::pair<long long, std::string>> cache;
+            const std::string key = root + "|" + model;
+            if (!refresh)
+                if (auto it = cache.find(key); it != cache.end())
+                {
+                    source = it->second.second;
+                    return it->second.first;
+                }
             auto remember = [&](long long v, const char *src)
             {
                 source = v > 0 ? src : "";
@@ -8133,8 +8176,9 @@ namespace cell
                                     reasoning.append(t);
                                     if (on_reason)
                                         on_reason(std::span<const char>(t));
+                                    break; // one non-empty field per delta
                                 }
-                                break; // one reasoning field per delta
+                                // an empty placeholder must not hide a later field
                             }
                         if (delta.contains("content") && delta["content"].is_string())
                             [[likely]]
@@ -8237,10 +8281,14 @@ namespace cell
                             for (const char *rf : {"reasoning_content", "reasoning", "thinking"})
                                 if (m.contains(rf) && m[rf].is_string())
                                 {
-                                    reasoning = m[rf].get<std::string>();
-                                    if (!reasoning.empty() && on_reason)
-                                        on_reason(std::span<const char>(reasoning));
-                                    break;
+                                    std::string t = m[rf].get<std::string>();
+                                    if (!t.empty())
+                                    {
+                                        reasoning = std::move(t);
+                                        if (on_reason)
+                                            on_reason(std::span<const char>(reasoning));
+                                        break;
+                                    }
                                 }
                             if (m.contains("tool_calls"))
                                 tool_calls = m["tool_calls"];
@@ -11193,6 +11241,15 @@ details{break-inside:avoid}
                     return false;
             return true;
         }
+        // Whitespace-only output is not an answer: a model that emits a lone "\n"
+        // would otherwise pass the guards and leave the user with a blank turn.
+        static bool has_visible_text(const std::string &s)
+        {
+            for (unsigned char c : s)
+                if (c != ' ' && c != '\t' && c != '\n' && c != '\r' && c != '\v' && c != '\f')
+                    return true;
+            return false;
+        }
         // Whether an assistant reply the model just returned carries anything a
         // human could see: text (string or text block), reasoning, or tool calls.
         // A round that ends "ok" with none of these is a failed round wearing a
@@ -11207,7 +11264,7 @@ details{break-inside:avoid}
             if (it == reply.end() || it->is_null())
                 return false;
             if (it->is_string())
-                return !it->get_ref<const std::string &>().empty();
+                return has_visible_text(it->get_ref<const std::string &>());
             if (!it->is_array())
                 return false;
             for (auto &b : *it)
@@ -11215,10 +11272,11 @@ details{break-inside:avoid}
                 if (!b.is_object())
                     continue;
                 std::string t = b.value("type", "");
-                if (t == "text" && !b.value("text", std::string()).empty())
+                if (t == "text" && has_visible_text(b.value("text", std::string())))
                     return true;
                 if ((t == "reasoning" || t == "thinking") &&
-                    !(b.value("reasoning", std::string()).empty() && b.value("thinking", std::string()).empty()))
+                    (has_visible_text(b.value("reasoning", std::string())) ||
+                     has_visible_text(b.value("thinking", std::string()))))
                     return true;
             }
             return false;
@@ -11237,14 +11295,14 @@ details{break-inside:avoid}
             if (it == reply.end() || it->is_null())
                 return false;
             if (it->is_string())
-                return !it->get_ref<const std::string &>().empty();
+                return has_visible_text(it->get_ref<const std::string &>());
             if (!it->is_array())
                 return false;
             for (auto &b : *it)
             {
                 if (!b.is_object())
                     continue;
-                if (b.value("type", "") == "text" && !b.value("text", std::string()).empty())
+                if (b.value("type", "") == "text" && has_visible_text(b.value("text", std::string())))
                     return true;
             }
             return false;
@@ -21043,6 +21101,10 @@ static int run_selftest()
                      {{"role", "assistant"}, {"content", nlohmann::json::array({{{"type", "reasoning"}, {"reasoning", "hmm"}}})}},
                      nlohmann::json::array()),
                  "answer guard: reasoning alone is not an answer (silent thinking)");
+        R.expect(!cell::chat::reply_carries_answer({{"role", "assistant"}, {"content", "  \n\t"}}, nlohmann::json::array()),
+                 "answer guard: whitespace-only text is not an answer");
+        R.expect(!cell::chat::reply_carries_content({{"role", "assistant"}, {"content", "  \n\t"}}, nlohmann::json::array()),
+                 "empty-reply guard: whitespace-only text is not content");
         R.expect(!cell::chat::reply_carries_answer(
                      {{"role", "assistant"}, {"content", nlohmann::json::array({
                          {{"type", "reasoning"}, {"reasoning", "long thought"}},
@@ -21176,6 +21238,14 @@ static int run_selftest()
         R.expect(cell::config::context_percent(0, 4096) == 0, "context: no tokens -> 0%");
         R.expect(cell::config::context_percent(5000, 4096) == 100, "context: over the window -> clamped to 100%");
         R.expect(cell::config::context_percent(100, 0) == 0, "context: unknown window -> 0%");
+        R.expect(cell::config::parse_token_count("4096") == 4096, "context: plain token count");
+        R.expect(cell::config::parse_token_count("8k") == 8000, "context: 8k -> 8000 (decimal suffix)");
+        R.expect(cell::config::parse_token_count("1m") == 1000000, "context: 1m -> 1000000");
+        R.expect(cell::config::parse_token_count(" 16K ") == 16000, "context: trims and accepts an upper-case suffix");
+        R.expect(cell::config::parse_token_count("8.5k") == 0, "context: decimal points are rejected");
+        R.expect(cell::config::parse_token_count("abc") == 0, "context: garbage is rejected");
+        R.expect(cell::config::parse_token_count("0") == 0, "context: zero is rejected");
+        R.expect(cell::config::parse_token_count("") == 0, "context: empty is rejected");
         {
             // manual context_window survives a config round-trip
             cell::config::provider_entry pe;
@@ -22269,12 +22339,13 @@ int repl::run()
     // contextWindow: a configured value wins, otherwise the provider is asked
     // (Ollama's /api/ps reports its runtime window), and 0 means "unknown".
     auto resolve_ctx_window = [&](const cell::config::provider_entry &p,
-                                  const std::string &model) -> std::pair<long long, std::string>
+                                  const std::string &model,
+                                  bool refresh = false) -> std::pair<long long, std::string>
     {
         if (p.context_window > 0)
             return {p.context_window, "manual"};
         std::string src;
-        long long v = cell::llm::detect_context_window(p.base, model, p.proxy, src);
+        long long v = cell::llm::detect_context_window(p.base, model, p.proxy, src, refresh);
         return {v > 0 ? v : 0, v > 0 ? src : "unknown"};
     };
 
@@ -23267,6 +23338,10 @@ int repl::run()
                 bool ok = false;
                 std::string err;
                 int attempt = 0;
+                // set when the response is deterministic and a retry cannot help
+                // (reasoning-only): skip the retry ladder without pretending that
+                // five attempts were made
+                bool no_retry = false;
                 long http_status = 0;
                 bool compacted_this_round = false;
                 while (attempt < kMaxRetries)
@@ -23458,7 +23533,7 @@ int repl::run()
                         else if (err.empty())
                             err = "the model streamed reasoning but produced no answer (no content or tool call) — likely a context-window cutoff or a local thinking-model quirk";
                         ok = false;
-                        attempt = kMaxRetries - 1; // a reasoning-only response won't improve on retry: fail fast
+                        no_retry = true; // a reasoning-only response won't improve on retry
                     }
                     // context overflow: compress and retry immediately instead of
                     // burning retry attempts on an error that compaction can fix
@@ -23477,6 +23552,8 @@ int repl::run()
                         usage = nlohmann::json{};
                         err.clear();
                         compacted_this_round = true;
+                        // the post-compact attempt gets the normal retry policy
+                        no_retry = false;
                         // the transcript just shrank: re-baseline the per-turn
                         // stats, otherwise the delta below underflows size_t
                         before = h.now().msg().size();
@@ -23522,7 +23599,7 @@ int repl::run()
                     // attempt; transport aborts report 0 here and stay retryable.
                     // A user cancel (Esc / HTTP interrupt) aborts the transfer on
                     // purpose and must never be retried.
-                    bool retryable = !ui.cancelled &&
+                    bool retryable = !ui.cancelled && !no_retry &&
                                      !(http_status >= 400 && http_status < 500 &&
                                        http_status != 408 && http_status != 409 && http_status != 429);
                     if (retryable && attempt < kMaxRetries - 1)
@@ -23961,16 +24038,21 @@ int repl::run()
                             cell::sys::println("no provider configured - add one with /provider first");
                             return cmd_flow::handled;
                     }
+                    bool refresh = false;
                     if (toks.size() >= 2)
                     {
                             std::string arg = cell::box::to_lower(cell::text::trim(toks[1]));
                             long long v = 0;
-                            if (arg != "auto")
+                            if (arg == "auto")
                             {
-                                    try { v = std::stoll(arg); } catch (...) { v = -1; }
+                                    refresh = true; // discard the cached probe and ask again
+                            }
+                            else
+                            {
+                                    v = cell::config::parse_token_count(arg);
                                     if (v <= 0)
                                     {
-                                            cell::sys::error("usage: /context [auto|<tokens>]  (e.g. /context 4096)");
+                                            cell::sys::error("usage: /context [auto|<tokens>]  (e.g. /context 4096, /context 128k)");
                                             return cmd_flow::handled;
                                     }
                             }
@@ -23980,7 +24062,7 @@ int repl::run()
                             else
                                     cell::sys::println("context window: {}", v > 0 ? std::format("{} (manual)", v) : "auto");
                     }
-                    auto [win, src] = resolve_ctx_window(*p, cfg.current_model);
+                    auto [win, src] = resolve_ctx_window(*p, cfg.current_model, refresh);
                     cell::sys::println("model: {}", cfg.model_label());
                     if (win > 0)
                             cell::sys::println("context window: {} tokens ({})", win, src);
