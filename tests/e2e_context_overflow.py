@@ -51,6 +51,9 @@ class MockLLM(BaseHTTPRequestHandler):
         pass
 
     def do_GET(self):
+        if self.path == "/__count":
+            self._json(200, {"count": COUNTER})
+            return
         payload = json.dumps({"data": [{"id": "mock-model"}], "object": "list"}).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
@@ -111,11 +114,18 @@ class MockLLM(BaseHTTPRequestHandler):
                                                            "content": "hello from single json"}}],
                                   "usage": {"prompt_tokens": 12, "completion_tokens": 4}}).encode()
             ctype = "application/json"
-        else:  # empty_overflow: HTTP 200 + empty choices + usage (Ollama 4k cutoff)
+        elif mode == "empty_overflow":  # HTTP 200 + empty choices + usage (Ollama 4k cutoff)
             payload, ctype = sse([
                 {"choices": [{"index": 0, "delta": {"role": "assistant", "content": ""},
                               "finish_reason": "stop"}],
                  "usage": {"prompt_tokens": 3969, "completion_tokens": 0}},
+            ])
+        else:  # empty_big: finish_reason=length at a prompt well inside a 32k window
+            # (an output max_tokens limit, not context pressure: must NOT compact)
+            payload, ctype = sse([
+                {"choices": [{"index": 0, "delta": {"role": "assistant", "content": ""},
+                              "finish_reason": "length"}],
+                 "usage": {"prompt_tokens": 4000, "completion_tokens": 0}},
             ])
         self.send_response(200)
         self.send_header("Content-Type", ctype)
@@ -133,14 +143,16 @@ class MockLLM(BaseHTTPRequestHandler):
 
 
 class Serve:
-    def __init__(self, root):
+    def __init__(self, root, window=4096):
         self.port = free_port()
         self.mock_port = free_port()
         self.mock = ThreadingHTTPServer(("127.0.0.1", self.mock_port), MockLLM)
         threading.Thread(target=self.mock.serve_forever, daemon=True).start()
+        # per-model, not provider-wide: the same provider may serve models with
+        # very different windows
         cfg = {"providers": [{"name": "mock", "style": "openai",
                               "base": f"http://127.0.0.1:{self.mock_port}/v1",
-                              "context_window": 4096}],
+                              "model_context_windows": {"mock-model": window}}],
                "current_provider": "mock", "current_model": "mock-model"}
         (Path(root) / "config.json").write_text(json.dumps(cfg))
         env = dict(os.environ)
@@ -208,6 +220,11 @@ class Serve:
                 elif ev.get("type") == "turn_done":
                     done = ev.get("data")
         return "".join(self.stdout), errors, done
+
+    def count(self):
+        """How many chat-completion requests the mock has served this mode."""
+        with urllib.request.urlopen(f"http://127.0.0.1:{self.mock_port}/__count", timeout=10) as r:
+            return json.loads(r.read().decode())["count"]
 
     def close(self):
         self.proc.terminate()
@@ -325,6 +342,28 @@ def main():
             out3, err3, done3 = srv.turn(sid, "turn three")
             check("multi-turn: turn 3 recovers after a failed turn", done3 and done3.get("rc") == 0, done3)
             check("multi-turn: turn 3 streamed an answer", "hello from mock" in out3, out3)
+
+            # ---- large window: a 4k prompt must NOT auto-compact ----
+            # Same empty reply, but the model declares a 32k window: 4000 prompt
+            # tokens are only 12% of it, so compacting would be premature. The
+            # turn must fail on the empty completion after exactly ONE request.
+            with tempfile.TemporaryDirectory(prefix="cell-e2e-big-") as root2:
+                big = Serve(root2, window=32768)
+                try:
+                    if not big.wait_health():
+                        print("big-window serve did not come up")
+                        return 2
+                    big.set_mode("empty_big")
+                    sid_big = big.new_session()
+                    _, err_big, done_big = big.turn(sid_big)
+                    check("big window: empty completion fails (no silent success)",
+                          done_big and done_big.get("rc") != 0, done_big)
+                    check("big window: diagnostic names the empty completion",
+                          any("empty completion" in (e.get("message") or "") for e in err_big), err_big)
+                    check("big window: a 4k prompt did NOT trigger auto-compact (one request)",
+                          big.count() == 1, big.count())
+                finally:
+                    big.close()
         finally:
             srv.close()
 
