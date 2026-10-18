@@ -363,7 +363,9 @@ export class ApiClient {
 
   private authHeaders(extra?: HeadersInit): Headers {
     const headers = new Headers(extra)
-    headers.set('Content-Type', 'application/json')
+    // preserve a caller's content type (the upload sends application/octet-stream);
+    // default to JSON only when none was supplied
+    if (!headers.has('Content-Type')) headers.set('Content-Type', 'application/json')
     headers.set('Authorization', `Bearer ${this.token}`)
     return headers
   }
