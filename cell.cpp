@@ -16644,10 +16644,16 @@ details{break-inside:avoid}
                 // to this server over fetch(); without CORS headers Chromium
                 // blocks every cross-origin request (health, sessions, chat…),
                 // which surfaces in the GUI as "kernel not ready / offline".
+                // PATCH and DELETE are not optional: the settings plane saves with
+                // PATCH /v1/config, and sessions/providers/teamwork rows are removed
+                // with DELETE. Leaving them out made every one of those preflights
+                // fail, which the browser reports as "failed to fetch" — the GUI
+                // looked like it could not talk to the kernel at all.
                 const std::string kCors =
                     "Access-Control-Allow-Origin: *\r\n"
-                    "Access-Control-Allow-Headers: Authorization, Content-Type\r\n"
-                    "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n";
+                    "Access-Control-Allow-Headers: Authorization, Content-Type, Accept\r\n"
+                    "Access-Control-Allow-Methods: GET, POST, PATCH, PUT, DELETE, OPTIONS\r\n"
+                    "Access-Control-Max-Age: 86400\r\n";
 
                 auto send_error = [&](int status, const std::string &code, const std::string &message)
                 {
@@ -23368,8 +23374,18 @@ int repl::run()
                         else
                             out.append(data.data(), data.size());
                         ui.reason_active = data.back() != '\n';
-                        std::fwrite(out.data(), 1, out.size(), stdout);
-                        std::fflush(stdout);
+                        // In serve mode the chain-of-thought reaches the client as
+                        // `reasoning` events and is rendered in the thinking block.
+                        // Writing it to stdout as well makes the stdout capture emit
+                        // it as `output`, so the GUI shows the thinking text in the
+                        // answer area until the first real token arrives, then moves
+                        // it into the thinking block — the "reasoning leaks into the
+                        // answer" bug.
+                        if (!ui.serve)
+                        {
+                            std::fwrite(out.data(), 1, out.size(), stdout);
+                            std::fflush(stdout);
+                        }
                     };
                     total_llm_requests++;
                     // last line of defence: whatever injected a system message

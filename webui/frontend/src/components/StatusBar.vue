@@ -111,20 +111,29 @@ let elapsedTimer = 0
 // and a manual poll would otherwise all be in flight at once, which is exactly
 // when the kernel is least able to answer.
 let polling = false
+// One missed poll is not "offline": a kernel restarting a worker, a GC pause, or
+// a first poll that races bootstrap finished would flash the red badge. Keep the
+// last health and only declare the kernel down after three consecutive failures
+// (~15s at the 5s interval).
+let healthFails = 0
 
 async function poll(): Promise<void> {
   if (polling) return
   polling = true
   try {
     health.value = (await api.health()) as Health
+    healthFails = 0
     conn.markConnected()
     failure.value = null
   } catch (e) {
-    // route on code, never on message: the same taxonomy the chat surface uses
-    const view = classifyError(e)
-    health.value = null
-    failure.value = view
-    conn.markDisconnected(view.title)
+    healthFails += 1
+    if (healthFails >= 3) {
+      // route on code, never on message: the same taxonomy the chat surface uses
+      const view = classifyError(e)
+      health.value = null
+      failure.value = view
+      conn.markDisconnected(view.title)
+    }
   } finally {
     polling = false
   }
@@ -136,6 +145,9 @@ onMounted(() => {
   unsubscribe = conn.onStateChange((s) => {
     connState.value = s
   })
+  // start as "connecting" rather than a false "offline" flash before the first
+  // successful health poll (the initial state machine value is disconnected)
+  conn.reconnect()
   void poll()
   timer = window.setInterval(() => void poll(), 5000)
   elapsedTimer = window.setInterval(() => {
