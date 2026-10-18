@@ -183,6 +183,7 @@ class Serve:
     def turn(self, sid, text="hi"):
         out, errors, done = [], [], None
         self.usage = None
+        self.tokens, self.reasoning, self.stdout = [], [], []
         with self.api("POST", f"/sessions/{sid}/turn", {"text": text}, stream=True) as r:
             for raw in r:
                 line = raw.decode("utf-8", "replace").strip()
@@ -195,14 +196,18 @@ class Serve:
                 except Exception:
                     continue
                 if ev.get("type") == "output":
-                    out.append(ev.get("data", {}).get("text", ""))
+                    self.stdout.append(ev.get("data", {}).get("text", ""))
+                elif ev.get("type") == "token":
+                    self.tokens.append(ev.get("data", {}).get("text", ""))
+                elif ev.get("type") == "reasoning":
+                    self.reasoning.append(ev.get("data", {}).get("text", ""))
                 elif ev.get("type") == "error":
                     errors.append(ev.get("data", {}))
                 elif ev.get("type") == "usage":
                     self.usage = ev.get("data", {})
                 elif ev.get("type") == "turn_done":
                     done = ev.get("data")
-        return "".join(out), errors, done
+        return "".join(self.stdout), errors, done
 
     def close(self):
         self.proc.terminate()
@@ -233,6 +238,23 @@ def main():
                 print("serve did not come up")
                 return 2
 
+            # CORS preflight: the settings plane saves with PATCH and rows are
+            # removed with DELETE. A browser rejects the real request when the
+            # preflight does not name the method — surfacing as "failed to fetch"
+            # on most of the UI's endpoints.
+            for method in ("PATCH", "DELETE"):
+                req = urllib.request.Request(
+                    f"http://127.0.0.1:{srv.port}/v1/config",
+                    method="OPTIONS",
+                    headers={"Origin": "http://localhost:5173",
+                             "Access-Control-Request-Method": method,
+                             "Access-Control-Request-Headers": "authorization,content-type"})
+                with urllib.request.urlopen(req, timeout=10) as r:
+                    allow = r.headers.get("Access-Control-Allow-Methods", "")
+                    check(f"preflight allows {method}", method in allow, allow)
+                    check(f"preflight allows Authorization header ({method})",
+                          "authorization" in r.headers.get("Access-Control-Allow-Headers", "").lower(), r.headers)
+
             # ---- single-turn: normal answer ----
             srv.set_mode("normal")
             sid = srv.new_session()
@@ -245,6 +267,8 @@ def main():
             check("usage frame carries context_tokens + context_pct",
                   bool(srv.usage) and srv.usage.get("context_tokens") is not None
                   and srv.usage.get("context_pct") is not None, srv.usage)
+            check("single-turn normal: answer streamed as token events",
+                  "hello from mock" in "".join(srv.tokens), srv.tokens)
 
             # ---- single-turn: reasoning-only (Ollama delta.reasoning) ----
             srv.set_mode("reasoning_only")
@@ -254,6 +278,10 @@ def main():
             check("reasoning-only (delta.reasoning): diagnostic names the cause",
                   any("reasoning but produced no answer" in (e.get("message") or "") for e in errors), errors)
             check("reasoning-only (delta.reasoning): not a silent success", bool(errors))
+            check("reasoning-only: thinking arrives as reasoning events",
+                  "thinking 1" in "".join(srv.reasoning), srv.reasoning)
+            check("reasoning-only: thinking does NOT leak into the output stream",
+                  "thinking 1" not in "".join(srv.stdout), srv.stdout)
 
             # ---- single-turn: reasoning-only (DeepSeek delta.reasoning_content) ----
             srv.set_mode("reasoning_content_only")
