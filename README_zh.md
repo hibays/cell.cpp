@@ -744,7 +744,8 @@ JSON 无法抹掉提示或伪造一次批准。当**autoallow 模式**开启时�
 {
   "providers": [
     { "name": "openai", "style": "openai", "api_style": "openai-chat", "base": "https://api.openai.com/v1",
-      "key": "provider:openai", "proxy": "http://user:pass@host:8080" },
+      "key": "provider:openai", "proxy": "http://user:pass@host:8080",
+      "model_context_windows": { "gpt-4o": 128000 } },
     { "name": "claude", "style": "anthropic", "api_style": "anthropic", "base": "https://api.anthropic.com" }
   ],
   "current_provider": "openai",
@@ -766,7 +767,7 @@ JSON 无法抹掉提示或伪造一次批准。当**autoallow 模式**开启时�
 
 | 字段 | 默认值 | 含义 |
 | --- | --- | --- |
-| `providers[]` | *（空）* | 每个端点一项：`name`（唯一 id）、`style`（`openai` \| `anthropic`）、`api_style`（`openai-chat` \| `openai-responses` \| `anthropic`）、`base`、`key`（保险库 id，不是密钥本身）、`proxy`。模型**不**存在这里。 |
+| `providers[]` | *（空）* | 每个端点一项：`name`（唯一 id）、`style`（`openai` \| `anthropic`）、`api_style`（`openai-chat` \| `openai-responses` \| `anthropic`）、`base`、`key`（保险库 id，不是密钥本身）、`proxy`，以及可选的 `model_context_windows`（模型名 → tokens）。模型**不**存在这里；上下文窗口**按模型**记录，因为同一个 provider 下的模型窗口可能差别很大；未列出的模型自动探测（Ollama `/api/ps` → `num_ctx` → 默认 4k）。`/context N` 设置当前模型的窗口，`/context auto` 清除它。 |
 | `current_provider` | 第一项 | 为空时表示第一项处于激活状态 |
 | `current_model` | — | 激活的模型名；只要激活 provider 真的发生切换就会被自动清空（见 [`/provide`](#斜杠命令)） |
 | `think_level` | `0` | 思维链档位：0=off、1=low(1024)、2=med(2048)、3=high(4096)、4=max(8192)。旧的 `think: true` 映射为档位 2。 |

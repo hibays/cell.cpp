@@ -799,7 +799,8 @@ never appears in the vault file — the self-test asserts this.
 {
   "providers": [
     { "name": "openai", "style": "openai", "api_style": "openai-chat", "base": "https://api.openai.com/v1",
-      "key": "provider:openai", "proxy": "http://user:pass@host:8080" },
+      "key": "provider:openai", "proxy": "http://user:pass@host:8080",
+      "model_context_windows": { "gpt-4o": 128000 } },
     { "name": "claude", "style": "anthropic", "api_style": "anthropic", "base": "https://api.anthropic.com" }
   ],
   "current_provider": "openai",
@@ -821,7 +822,7 @@ never appears in the vault file — the self-test asserts this.
 
 | Field | Default | Meaning |
 | --- | --- | --- |
-| `providers[]` | *(empty)* | One entry per endpoint: `name` (unique id), `style` (`openai` \| `anthropic`), `api_style` (`openai-chat` \| `openai-responses` \| `anthropic`), `base`, `key` (vault id, not the secret), `proxy`. Models are **not** stored here. |
+| `providers[]` | *(empty)* | One entry per endpoint: `name` (unique id), `style` (`openai` \| `anthropic`), `api_style` (`openai-chat` \| `openai-responses` \| `anthropic`), `base`, `key` (vault id, not the secret), `proxy`, and optional `model_context_windows` (model → tokens). Models are **not** stored here, and a window is keyed by model because one provider can serve models with very different windows; an unlisted model is auto-detected (Ollama `/api/ps` → `num_ctx` → 4k default). `/context N` sets the current model's window, `/context auto` clears it. |
 | `current_provider` | first entry | Active provider when empty |
 | `current_model` | — | Active model name; cleared automatically whenever the active provider actually changes (see [`/provide`](#slash-commands)) |
 | `think_level` | `0` | Chain-of-thought level: 0=off, 1=low(1024), 2=med(2048), 3=high(4096), 4=max(8192). Legacy `think: true` maps to level 2. |
