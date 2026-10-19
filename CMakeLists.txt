@@ -23,7 +23,7 @@
 cmake_minimum_required(VERSION 3.21)
 
 project(cell
-    VERSION 0.1.12
+    VERSION 0.1.13
     DESCRIPTION "A single-file AI coding agent in modern C++26"
     LANGUAGES C CXX) # C for the vendored WebUI / civetweb sources
 
