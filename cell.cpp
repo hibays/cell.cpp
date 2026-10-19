@@ -6899,6 +6899,100 @@ namespace cell
         }
     } // namespace config
     // =========================================================================
+    //  window — remembered desktop geometry for cellui
+    // =========================================================================
+    // DSHL-style: a small JSON next to the config, restored on launch and
+    // clamped into the monitor's work area (a window saved on a display that is
+    // no longer connected must still open visible). The pure helpers live here
+    // so --selftest can cover the clamping rules without a window; the Win32
+    // read/write stays in cellui.cpp.
+    namespace window
+    {
+        struct geometry
+        {
+            long long x = 0, y = 0, width = 0, height = 0;
+            bool valid = false;     // false = nothing remembered / malformed
+            bool maximized = false; // last show state (rcNormalPosition is kept)
+            bool operator==(const geometry &) const = default;
+        };
+
+        inline constexpr long long kMinWidth = 640;
+        inline constexpr long long kMinHeight = 480;
+
+        // Clamp into a work area: enforce the minimum size and keep the whole
+        // window inside it. A position saved on a monitor that is no longer
+        // connected therefore lands on the nearest monitor instead of opening
+        // off-screen. `work.valid == false` means "no monitor information":
+        // leave the geometry alone and let the OS place it.
+        static geometry clamp_geometry(geometry g, const geometry &work)
+        {
+            if (!work.valid || work.width <= 0 || work.height <= 0)
+                return g;
+            g.width = std::clamp(g.width, kMinWidth, work.width);
+            g.height = std::clamp(g.height, kMinHeight, work.height);
+            g.x = std::clamp(g.x, work.x, work.x + work.width - g.width);
+            g.y = std::clamp(g.y, work.y, work.y + work.height - g.height);
+            return g;
+        }
+        static nlohmann::json to_json(const geometry &g)
+        {
+            return nlohmann::json{{"x", g.x},
+                                  {"y", g.y},
+                                  {"width", g.width},
+                                  {"height", g.height},
+                                  {"maximized", g.maximized}};
+        }
+        static geometry from_json(const nlohmann::json &j)
+        {
+            geometry g;
+            if (!j.is_object())
+                return g;
+            auto num = [&](const char *k) -> std::optional<long long>
+            {
+                auto it = j.find(k);
+                if (it == j.end() || !it->is_number_integer())
+                    return std::nullopt;
+                return it->get<long long>();
+            };
+            auto x = num("x"), y = num("y"), w = num("width"), h = num("height");
+            if (!x || !y || !w || !h)
+                return g;
+            // Reject nonsense rather than let the clamp turn it into a "fixed"
+            // window: a zero/negative or absurd size means the file is corrupt.
+            if (*w <= 0 || *h <= 0 || *w > 100000 || *h > 100000)
+                return g;
+            if (*x < -1000000 || *x > 1000000 || *y < -1000000 || *y > 1000000)
+                return g;
+            g.x = *x;
+            g.y = *y;
+            g.width = *w;
+            g.height = *h;
+            g.maximized = j.value("maximized", false);
+            g.valid = true;
+            return g;
+        }
+        static std::filesystem::path file() { return root / "window.json"; }
+        [[maybe_unused]] static geometry load()
+        {
+            std::error_code ec;
+            if (!std::filesystem::exists(file(), ec) || ec)
+                return {};
+            std::ifstream f(file(), std::ios::binary);
+            if (!f)
+                return {};
+            nlohmann::json j = nlohmann::json::parse(f, nullptr, false);
+            return from_json(j);
+        }
+        [[maybe_unused]] static bool save(const geometry &g)
+        {
+            if (!g.valid)
+                return false;
+            std::error_code ec;
+            std::filesystem::create_directories(root, ec);
+            return plat::write_file_atomic(file(), to_json(g).dump(2));
+        }
+    } // namespace window
+    // =========================================================================
     //  encrypt — the credential vault: base64, secure_string (sodium_malloc
     //  buffers, zeroized on destruction) and Argon2id + AES-256-GCM
     //  (XChaCha20-Poly1305 fallback) encryption. The only place in this file
@@ -21309,6 +21403,40 @@ static int run_selftest()
             R.expect(!cp, "context: length with a small prompt on a 32k window is an output limit");
             cell::llm::empty_completion_diagnostic("length", nlohmann::json::object(), cp, 24576);
             R.expect(cp, "context: length with no usage stays conservative (pressure)");
+        }
+        // desktop window geometry memory: clamp into the monitor work area,
+        // enforce a usable minimum, reject malformed files
+        {
+            cell::window::geometry work{0, 0, 1920, 1040, true, false};
+            auto g = cell::window::clamp_geometry({100, 100, 1280, 860, true, false}, work);
+            R.expect(g.x == 100 && g.y == 100 && g.width == 1280 && g.height == 860,
+                     "window: an in-bounds geometry is unchanged");
+            g = cell::window::clamp_geometry({3000, 3000, 1280, 860, true, false}, work);
+            R.expect(g.x == 1920 - 1280 && g.y == 1040 - 860 && g.width == 1280,
+                     "window: an off-screen geometry is clamped inside the work area");
+            g = cell::window::clamp_geometry({-500, -500, 1280, 860, true, false}, work);
+            R.expect(g.x == 0 && g.y == 0, "window: a negative origin is clamped to the work area");
+            g = cell::window::clamp_geometry({10, 10, 100, 100, true, false}, work);
+            R.expect(g.width == cell::window::kMinWidth && g.height == cell::window::kMinHeight,
+                     "window: an undersized geometry is raised to the minimum");
+            g = cell::window::clamp_geometry({0, 0, 5000, 5000, true, false}, work);
+            R.expect(g.width == 1920 && g.height == 1040,
+                     "window: an oversized geometry is limited to the work area");
+            cell::window::geometry left{-1920, 0, 1920, 1040, true, false};
+            g = cell::window::clamp_geometry({-2500, 100, 1280, 860, true, false}, left);
+            R.expect(g.x == -1920 && g.y == 100,
+                     "window: a monitor left of the primary keeps its negative origin");
+        }
+        {
+            cell::window::geometry g{-100, 40, 1111, 777, true, true};
+            auto back = cell::window::from_json(cell::window::to_json(g));
+            R.expect(back.valid && back.x == -100 && back.y == 40 && back.width == 1111 &&
+                         back.height == 777 && back.maximized,
+                     "window: geometry round-trips through window.json");
+            R.expect(!cell::window::from_json({{"x", 0}, {"y", 0}, {"width", 0}, {"height", 600}}).valid,
+                     "window: a zero width is rejected");
+            R.expect(!cell::window::from_json({{"x", 0}, {"y", 0}, {"width", 800}, {"height", "tall"}}).valid,
+                     "window: a non-numeric height is rejected");
         }
         {
             nlohmann::json parts = nlohmann::json::array({

@@ -81,6 +81,50 @@ namespace cellui
     };
     static state g_state;
 
+#ifdef _WIN32
+    // ---- remembered geometry (Win32) -----------------------------------------
+    // GetWindowPlacement returns the NORMAL rect even while maximized, so
+    // un-maximizing later lands on the size/position the user chose.
+    static cell::window::geometry geometry_from_hwnd(HWND h)
+    {
+        WINDOWPLACEMENT wp{};
+        wp.length = sizeof(wp);
+        if (!h || !GetWindowPlacement(h, &wp))
+            return {};
+        RECT &r = wp.rcNormalPosition;
+        cell::window::geometry g;
+        g.x = r.left;
+        g.y = r.top;
+        g.width = r.right - r.left;
+        g.height = r.bottom - r.top;
+        g.maximized = wp.showCmd == SW_SHOWMAXIMIZED;
+        g.valid = g.width > 0 && g.height > 0;
+        return g;
+    }
+    // The work area (screen minus taskbar) of the monitor nearest the saved
+    // rect: a display that is no longer connected cannot strand the window.
+    static cell::window::geometry work_area_for(const cell::window::geometry &g)
+    {
+        RECT r{};
+        r.left = (LONG)g.x;
+        r.top = (LONG)g.y;
+        r.right = r.left + (LONG)g.width;
+        r.bottom = r.top + (LONG)g.height;
+        HMONITOR mon = MonitorFromRect(&r, MONITOR_DEFAULTTONEAREST);
+        MONITORINFO mi{};
+        mi.cbSize = sizeof(mi);
+        if (!mon || !GetMonitorInfoW(mon, &mi))
+            return {};
+        cell::window::geometry work;
+        work.x = mi.rcWork.left;
+        work.y = mi.rcWork.top;
+        work.width = mi.rcWork.right - mi.rcWork.left;
+        work.height = mi.rcWork.bottom - mi.rcWork.top;
+        work.valid = true;
+        return work;
+    }
+#endif
+
     // Where exports land when the caller does not name a file. The process CWD
     // is a trap for a GUI: launched from Explorer it is the executable's
     // directory (often Program Files), launched from a shell it is wherever the
@@ -601,6 +645,7 @@ namespace cellui
         std::string host = "127.0.0.1";
         unsigned width = 1280, height = 860;
         bool force_browser = false;
+        bool size_explicit = false; // --size wins over the remembered size
 
         // cellui accepts a small flag set of its own; everything else is passed
         // through to the agent CLI.
@@ -633,6 +678,7 @@ namespace cellui
                 {
                     width = (unsigned)std::atoi(w.substr(0, x).c_str());
                     height = (unsigned)std::atoi(w.substr(x + 1).c_str());
+                    size_explicit = true;
                 }
             }
             else if (a == "--browser")
@@ -684,6 +730,8 @@ namespace cellui
         // size on 125/150 % displays. Per-monitor-v2 keeps the WebView crisp,
         // and the requested size is then interpreted in physical pixels, so the
         // logical size is scaled by the monitor's factor here.
+        unsigned min_width = (unsigned)cell::window::kMinWidth;
+        unsigned min_height = (unsigned)cell::window::kMinHeight;
 #ifdef _WIN32
         {
             if (HMODULE user32 = GetModuleHandleW(L"user32.dll"))
@@ -714,10 +762,31 @@ namespace cellui
                     // while the WebView lays out at 1.5 — clipped, oversized UI
                     width = (unsigned)(((unsigned long long)width * dpi + 48) / 96);
                     height = (unsigned)(((unsigned long long)height * dpi + 48) / 96);
+                    min_width = (unsigned)(((unsigned long long)min_width * dpi + 48) / 96);
+                    min_height = (unsigned)(((unsigned long long)min_height * dpi + 48) / 96);
                 }
             }
         }
 #endif
+
+        // ---- remembered window geometry --------------------------------------
+        // DSHL-style: window.json next to the config, restored on launch and
+        // clamped into the monitor's work area. Only the WebView2 native window
+        // is ours to move; the browser fallback belongs to the user's browser.
+        cell::window::geometry start = cell::window::load();
+#ifdef _WIN32
+        if (start.valid)
+            start = cell::window::clamp_geometry(start, work_area_for(start));
+#endif
+        if (size_explicit || !start.valid)
+        {
+            // default / explicit --size (already DPI-scaled); a remembered
+            // position, if any, is kept
+            start.width = width;
+            start.height = height;
+        }
+        unsigned win_w = (unsigned)std::max<long long>(1, start.width);
+        unsigned win_h = (unsigned)std::max<long long>(1, start.height);
 
         // ---- the window ------------------------------------------------------
         // WebView2 native window is the product (user's chosen path); the
@@ -727,7 +796,14 @@ namespace cellui
         // below watches for a VISIBLE top-level window of this pid instead.
         size_t w = webui_new_window();
         webui_set_runtime(w, None); // no Deno/Node/Bun needed
-        webui_set_size(w, width, height);
+        webui_set_size(w, win_w, win_h);
+        webui_set_minimum_size(w, min_width, min_height);
+#ifndef _WIN32
+        // webui_set_position takes unsigned coordinates; a negative origin is a
+        // multi-monitor Win32 concept handled by SetWindowPos after show.
+        if (start.valid && start.x >= 0 && start.y >= 0)
+            webui_set_position(w, (unsigned)start.x, (unsigned)start.y);
+#endif
         // NOTE: do NOT call webui_set_hide() — it starts the window in hidden
         // mode and the window would never become visible.
         // no fixed port: if the port is busy, webui would fail to show it
@@ -758,6 +834,99 @@ namespace cellui
 #endif
         // wire the WebUI native bridge (window.cell_bootstrap, …) into the page
         html = with_webui_bridge(std::move(html));
+
+        // ---- window supervisor (DSHL src/ui/browser.rs, condensed) -------------
+        // webui return codes are not ground truth. The invariant that holds:
+        // "the UI is up" ⇔ a VISIBLE top-level window of THIS pid exists. Poll
+        // it; once seen and then gone for 3s, tear webui down so wait() returns
+        // instead of the shell lingering headless (or dying with it).
+        std::atomic<bool> stop_monitor{false};
+        std::thread monitor;
+#ifdef _WIN32
+        monitor = std::thread([&]
+                            {
+            struct Scan
+            {
+                DWORD pid;
+                bool found;
+                HWND hwnd;
+            };
+            int misses = 0;
+            bool seen = false;
+            bool restored_once = false;
+            cell::window::geometry last;
+            while (!stop_monitor.load(std::memory_order_relaxed))
+            {
+                Scan scan{GetCurrentProcessId(), false, nullptr};
+                EnumWindows(
+                    [](HWND h, LPARAM l) -> BOOL
+                    {
+                        auto *s = reinterpret_cast<Scan *>(l);
+                        DWORD pid = 0;
+                        GetWindowThreadProcessId(h, &pid);
+                        if (pid != s->pid)
+                            return TRUE;
+                        wchar_t title[64];
+                        if (IsWindowVisible(h) && GetWindowTextW(h, title, 64) > 0 &&
+                            wcscmp(title, L"cell") == 0)
+                        {
+                            s->found = true;
+                            s->hwnd = h;
+                            return FALSE;
+                        }
+                        return TRUE;
+                    },
+                    reinterpret_cast<LPARAM>(&scan));
+                if (scan.found)
+                {
+                    seen = true;
+                    misses = 0;
+                    // Remember geometry as it changes (500ms poll): a close or a
+                    // kill then leaves the last state on disk. Only the WebView2
+                    // native window is ours; never resize the user's browser.
+                    // A visible top-level window of THIS pid is the native shell.
+                    // WebUI's show() return code is unreliable (the supervisor
+                    // exists for exactly that reason), so g_state.shell can still
+                    // be "unknown" here even though the WebView2 window is up.
+                    if (g_state.shell != "browser")
+                    {
+                        // WebUI may place the window itself after show(); re-apply
+                        // the remembered rect once the real HWND exists. The early
+                        // post-show SetWindowPos can be overwritten (observed on
+                        // WebView2: size stuck, position did not).
+                        if (!restored_once)
+                        {
+                            restored_once = true;
+                            if (start.valid)
+                            {
+                                SetWindowPos(scan.hwnd, nullptr, (int)start.x, (int)start.y,
+                                             (int)start.width, (int)start.height,
+                                             SWP_NOZORDER | SWP_NOACTIVATE);
+                                if (start.maximized)
+                                    ShowWindow(scan.hwnd, SW_SHOWMAXIMIZED);
+                                std::this_thread::sleep_for(std::chrono::milliseconds(250));
+                            }
+                        }
+                        auto g = geometry_from_hwnd(scan.hwnd);
+                        if (g.valid)
+                        {
+                            g = cell::window::clamp_geometry(g, work_area_for(g));
+                            if (!(g == last))
+                            {
+                                last = g;
+                                cell::window::save(g);
+                            }
+                        }
+                    }
+                }
+                else if (seen && ++misses >= 6) // 6 × 500ms without a window
+                {
+                    webui_exit();
+                    return;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            } });
+#endif // _WIN32
 
         bool shown = false;
         if (!force_browser)
@@ -795,6 +964,24 @@ namespace cellui
             return 2;
         }
 
+        // Restore the remembered position/size on the native window (negative
+        // coordinates are legal on a multi-monitor desktop, which
+        // webui_set_position cannot express). Maximize last: SetWindowPos writes
+        // the NORMAL rect, so un-maximizing later returns to it.
+#ifdef _WIN32
+        if (shown && g_state.shell != "browser" && start.valid)
+        {
+            if (HWND hwnd = static_cast<HWND>(webui_win32_get_hwnd(w)))
+            {
+                SetWindowPos(hwnd, nullptr, (int)start.x, (int)start.y,
+                             (int)start.width, (int)start.height,
+                             SWP_NOZORDER | SWP_NOACTIVATE);
+                if (start.maximized)
+                    ShowWindow(hwnd, SW_SHOWMAXIMIZED);
+            }
+        }
+#endif
+
         // The window exists now, so give it the brand mark: without this the
         // titlebar and Alt-Tab show whatever WebView2/webui left behind. The
         // window is already *visible* by the time this runs — it appears ~0.7s
@@ -805,57 +992,6 @@ namespace cellui
         // has a window to apply it to.
         apply_window_icon(w);
 
-        // ---- window supervisor (DSHL src/ui/browser.rs, condensed) -------------
-        // webui return codes are not ground truth. The invariant that holds:
-        // "the UI is up" ⇔ a VISIBLE top-level window of THIS pid exists. Poll
-        // it; once seen and then gone for 3s, tear webui down so wait() returns
-        // instead of the shell lingering headless (or dying with it).
-        std::atomic<bool> stop_monitor{false};
-        std::thread monitor;
-#ifdef _WIN32
-        monitor = std::thread([&]
-                            {
-            struct Scan
-            {
-                DWORD pid;
-                bool found;
-            };
-            int misses = 0;
-            bool seen = false;
-            while (!stop_monitor.load(std::memory_order_relaxed))
-            {
-                Scan scan{GetCurrentProcessId(), false};
-                EnumWindows(
-                    [](HWND h, LPARAM l) -> BOOL
-                    {
-                        auto *s = reinterpret_cast<Scan *>(l);
-                        DWORD pid = 0;
-                        GetWindowThreadProcessId(h, &pid);
-                        if (pid != s->pid)
-                            return TRUE;
-                        wchar_t title[64];
-                        if (IsWindowVisible(h) && GetWindowTextW(h, title, 64) > 0 &&
-                            wcscmp(title, L"cell") == 0)
-                        {
-                            s->found = true;
-                            return FALSE;
-                        }
-                        return TRUE;
-                    },
-                    reinterpret_cast<LPARAM>(&scan));
-                if (scan.found)
-                {
-                    seen = true;
-                    misses = 0;
-                }
-                else if (seen && ++misses >= 6) // 6 × 500ms without a window
-                {
-                    webui_exit();
-                    return;
-                }
-                std::this_thread::sleep_for(std::chrono::milliseconds(500));
-            } });
-#endif // _WIN32
         // POSIX: the X11/Wayland counterpart needs a display connection of its
         // own; there the exit hook (bind_events → disconnected) covers teardown.
 
