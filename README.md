@@ -837,6 +837,12 @@ never appears in the vault file — the self-test asserts this.
 | `thread_pool_size` | `16` (clamped 1–16) | Max concurrent read-only tool workers; the pool spawns lazily and idles with zero workers |
 | `active_sessions` | `{}` | cwd key → last active session id |
 
+The desktop shell keeps its own state beside the config: `window.json` remembers
+the last window position, size and maximized state. It is restored on the next
+launch, clamped to the monitor's work area, so a window saved on a display that
+is no longer connected still opens visible. Delete it to fall back to the
+default window.
+
 **Legacy migration.** A flat `{"provider","base","model","key","proxy"}` object, or a
 `{"models":[…],"current_model":<index>}` array, is rewritten into the provider list on load
 (duplicate endpoints are merged, names are de-duplicated as `style`, `style2`, …).

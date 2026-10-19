@@ -782,6 +782,8 @@ JSON 无法抹掉提示或伪造一次批准。当**autoallow 模式**开启时�
 | `thread_pool_size` | `16`（限制在 1–16） | 并发只读工具 worker 上限；线程池惰性创建，空闲时零 worker |
 | `active_sessions` | `{}` | cwd key → 最近活动的会话 id |
 
+桌面壳会在配置旁边维护自己的状态：`window.json` 记住上次的窗口位置、大小与最大化状态。下次启动会恢复它，并按当前显示器的工作区做钳制——保存在已断开显示器上的窗口仍会出现在可见区域。删除该文件即可回到默认窗口。
+
 **旧配置迁移。** 扁平的 `{"provider","base","model","key","proxy"}` 对象，或
 `{"models":[…],"current_model":<index>}` 数组，都会在加载时被改写成 provider 列表
 （重复端点会被合并，重名按 `style`、`style2`……去重）。
