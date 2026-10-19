@@ -287,6 +287,11 @@ def main():
     print(f"run 2 restored at {restored} (expected {target})")
     if any(abs(a - b) > 2 for a, b in zip(restored, target)):
         fails.append(f"restore mismatch: {restored} != {target}")
+    # Regression guard: the old server closed the window ~4.5s after the WebView2
+    # client dropped. The host owns the window now; 6s later it must still exist.
+    time.sleep(6.0)
+    if find_window(p2.pid) is None:
+        fails.append("window vanished after the client dropped (lifetime regression)")
     shot2 = out / "run2.png"
     if not screenshot(h2, restored, shot2):
         fails.append("run2 screenshot failed")
