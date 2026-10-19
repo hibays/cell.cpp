@@ -542,7 +542,14 @@ namespace cellui
     {
         if (html.find("/webui.js") != std::string::npos)
             return html; // already wired (defensive against double-injection)
-        constexpr const char *kTag = "\n<script src=\"/webui.js\"></script>\n";
+        // The native shell owns the window's lifetime. WebUI's bridge closes the
+        // page itself when its websocket drops (webui.ts release-close path),
+        // which took the whole window down a second later; a page-initiated close
+        // must not do that. An app exit still closes the window: webui_wait()
+        // returns and the process exits.
+        constexpr const char *kTag =
+            "\n<script>window.close=function(){};</script>\n"
+            "<script src=\"/webui.js\"></script>\n";
         size_t pos = html.find("</head>");
         if (pos != std::string::npos)
             html.insert(pos, kTag);

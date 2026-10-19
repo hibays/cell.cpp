@@ -93,7 +93,11 @@
 #define WEBUI_STDOUT_BUF     (10240) // Command STDOUT output buffer size
 #define WEBUI_DEFAULT_PATH   "."     // Default root path
 #define WEBUI_DEF_TIMEOUT    (15)    // Default startup timeout in seconds
-#define WEBUI_RELOAD_TIMEOUT (1500)  // Default reload page timeout in milliseconds
+#define WEBUI_RELOAD_TIMEOUT (15000) // Reconnect grace after the first client drops.
+                                     // 1500ms was shorter than a WebView2 renderer
+                                     // suspension/resume on a busy desktop: the
+                                     // server gave up and closed the window while
+                                     // the page was still alive.
 #define WEBUI_MAX_TIMEOUT    (60)    // Maximum startup timeout in seconds the user can set
 #define WEBUI_MIN_WIDTH      (100)   // Minimal window width
 #define WEBUI_MIN_HEIGHT     (100)   // Minimal window height
@@ -1292,6 +1296,12 @@ size_t webui_new_window_id(size_t num) {
 
     // Create a new window
     _webui_window_t* win = (_webui_window_t* ) _webui_malloc(sizeof(_webui_window_t));
+    // `_webui_malloc` is not zeroing. Every flag that is not assigned below
+    // (`transparent`, `frameless`, ...) would otherwise start as heap garbage;
+    // a stray `transparent` adds WS_EX_NOREDIRECTIONBITMAP and the WebView2
+    // surface renders blank white.
+    if (win != NULL)
+        memset(win, 0, sizeof(_webui_window_t));
     _webui_mutex_lock(&_webui.mutex_allocator);
     _webui.wins[num] = win;
     _webui_mutex_unlock(&_webui.mutex_allocator);
@@ -12041,8 +12051,16 @@ static WEBUI_THREAD_SERVER_START {
                                 } while(win->wait && !_webui_mutex_is_connected(win, WEBUI_MUTEX_GET_STATUS));
 
                                 if (!_webui_mutex_is_connected(win, WEBUI_MUTEX_GET_STATUS)) {
-                                    stop = true;
-                                    break;
+                                    // The client DID connect and then dropped: a
+                                    // page refresh, a suspended renderer, or a slow
+                                    // resume. The window belongs to the host, not to
+                                    // the page — keep the server serving so the
+                                    // bridge can reconnect. Only a user close
+                                    // (`is_closed`) or an exit ends the cycle; those
+                                    // are handled by `_webui_window_cycle_end()`
+                                    // above and the `is_closed` branch below.
+                                    // (Previously `stop = true` here closed the
+                                    // whole window ~1.5s after any transient drop.)
                                 }
                             }
                             else {
@@ -13938,7 +13956,12 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpReserved) {
                 // and loaded WebView successfully
                 break;
             }
-            if (_webui_timer_is_end(&timer, 500)) {
+            // 500ms was a race on cold WebView2 starts: environment creation can
+            // take seconds (first run, antivirus, slow disk), and a false return
+            // makes the host fall back to the browser, which tears the WebView
+            // window down a few seconds later. Give a cold start room to finish;
+            // a genuinely broken runtime still fails after this wait.
+            if (_webui_timer_is_end(&timer, 5000)) {
                 // Timeout. WebView thread failed.
                 break;
             }

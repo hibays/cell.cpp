@@ -171,6 +171,11 @@ public:
                 if (instance->hwnd)
                     GetClientRect(instance->hwnd, &bounds);
                 controller->put_Bounds(bounds);
+                // The controller's visibility is not guaranteed to be TRUE after
+                // CreateCoreWebView2Controller here: the page loads (it sets the
+                // window title) while the client area stays blank. Make the
+                // composition surface visible explicitly.
+                controller->put_IsVisible(TRUE);
 
                 auto titleHandler = Make<TitleChangedHandler>(instance);
                 EventRegistrationToken token;
@@ -235,6 +240,11 @@ public:
                 if (instance->hwnd)
                     GetClientRect(instance->hwnd, &bounds);
                 controller->put_Bounds(bounds);
+                // The controller's visibility is not guaranteed to be TRUE after
+                // CreateCoreWebView2Controller here: the page loads (it sets the
+                // window title) while the client area stays blank. Make the
+                // composition surface visible explicitly.
+                controller->put_IsVisible(TRUE);
 
                 TitleChangedHandler* titleHandler = new TitleChangedHandler(instance);
                 EventRegistrationToken token;
